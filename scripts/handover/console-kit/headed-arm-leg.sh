@@ -56,9 +56,9 @@
 # --lane (HIMMEL-2782): native (default) or claudex. --lane claudex (or
 # LEG_LANE=claudex in the launching shell - the flag wins if both are
 # given) routes the leg through scripts/claude-codex on the codex weekly
-# bank instead of the Claude subscription bank: it sets headed-arm.sh's
-# HEADED_ARM_LAUNCHER to the claudex binary (seam: HEADED_ARM_LEG_CLAUDEX_BIN,
-# default ../../claude-codex next to this script), turns on the `script`
+# bank instead of the Claude subscription bank: it routes headed-arm.sh's
+# HEADED_ARM_LAUNCHER through the preface shim to the claudex binary (seam:
+# HEADED_ARM_LEG_CLAUDEX_BIN, default ../../claude-codex), turns on the `script`
 # tty recorder (HEADED_ARM_RECORDER=1 - load-bearing: konsole -e output is
 # otherwise lost and a silent claudex death is undiagnosable), and exports
 # CLAUDEX_LANE_OK=1 + CLAUDE_CODE_EFFORT_LEVEL=${LEG_EFFORT:-medium} into the
@@ -104,10 +104,9 @@
 # roster-shaped (~40k of a 74.3k first-turn floor is tool + MCP schemas), so a
 # second or third "profile by skill set" would resolve to the same manifest -
 # see the _comment in plugin-profiles.json.
-# --profile is REFUSED with exit 2 on --lane claudex: that lane replaces the
-# launcher binary with scripts/claude-codex, so both cannot own
-# HEADED_ARM_LAUNCHER. Silently letting one win would produce a leg that is
-# neither lean nor on the codex bank.
+# --profile composes with --lane claudex (HIMMEL-2962): the shim prepends
+# profile flags, then execs scripts/claude-codex via LEG_CLAUDE_BIN. The
+# backend and its guarded argument screen remain in the launch path.
 # Seams: HEADED_ARM_LEG_PROFILES overrides the plugin-profiles.mjs resolver
 # path, HEADED_ARM_LEG_PREFACE the preface file, HEADED_ARM_LEG_SHIM the
 # launcher shim - all script-relative by default, all so the suite can drive
@@ -156,15 +155,6 @@ case "$LANE" in
         exit 2
         ;;
 esac
-
-# --profile and --lane claudex both want to own HEADED_ARM_LAUNCHER (see the
-# header). Refuse rather than pick a winner: either outcome is a leg the
-# operator did not ask for.
-if [ -n "$PROFILE" ] && [ "$LANE" = "claudex" ]; then
-    usage
-    echo "headed-arm-leg: --profile is not available on --lane claudex: both replace headed-arm.sh's launcher binary (the profile shim vs scripts/claude-codex), so only one can apply. Drop --profile, or run this leg on the native lane." >&2
-    exit 2
-fi
 
 if [ "$#" -lt 5 ]; then
     usage
@@ -284,13 +274,38 @@ if [ -n "$PROFILE" ]; then
     fi
 fi
 
+# HIMMEL-2953: every claudex leg gets its document-channel coordination
+# rules, even without a profile. Claude accepts one preface file, so a
+# profiled leg gets its own concatenation, with the lane override last.
+if [ "$LANE" = "claudex" ]; then
+    CLAUDEX_PREFACE="$HERE/../../../docs/handover/leg-preface-claudex.md"
+    export HEADED_ARM_LAUNCHER="${HEADED_ARM_LEG_SHIM:-$HERE/../../lanes/leg-claude-launcher.sh}"
+    export LEG_CLAUDE_BIN="$CLAUDEX_BIN"
+    for _leg_need in "$CLAUDEX_PREFACE" "$HEADED_ARM_LAUNCHER"; do
+        if [ ! -f "$_leg_need" ]; then
+            echo "headed-arm-leg: --lane claudex: required file missing: $_leg_need" >&2
+            exit 2
+        fi
+    done
+    if [ -n "$PROFILE" ]; then
+        LEG_PROFILE_PREFACE="$(dirname "$LOG")/$NAME.leg-preface.md"
+        export LEG_PROFILE_PREFACE
+    else
+        export LEG_PROFILE_PREFACE="$CLAUDEX_PREFACE"
+    fi
+fi
+
 if [ "$DRY_RUN" -eq 1 ]; then
     printf 'headed-arm-leg: would exec: %s %s %s %s %s %s %s %s\n' \
         "$HEADED_ARM" "$NAME" "$DOC" "$SIGNAL" "$DEADLINE" "$LOG" "$MODEL" "$CONTEXT"
     printf 'headed-arm-leg: env IMPL_GUARD_OK=%s INLINE_IMPL_OK=%s HIMMEL_CONSOLE_LEG=%s HEADED_ARM_REPO=%s\n' \
         "$IMPL_GUARD_OK" "$INLINE_IMPL_OK" "$HIMMEL_CONSOLE_LEG" "${HEADED_ARM_REPO:-<derived by headed-arm.sh>}"
-    printf 'headed-arm-leg: lane=%s launcher=%s launcher-env=%s\n' \
+    printf 'headed-arm-leg: lane=%s launcher=%s launcher-env=%s' \
         "$LANE" "${HEADED_ARM_LAUNCHER:-claude (native default)}" "${HEADED_ARM_LAUNCHER_ENV:-<none>}"
+    if [ "$LANE" = "claudex" ]; then
+        printf ' exec-target=%s preface=%s' "$LEG_CLAUDE_BIN" "$LEG_PROFILE_PREFACE"
+    fi
+    printf '\n'
     # Printed ONLY under --profile: with the flag omitted this whole line is
     # absent and the dry-run report is byte-identical to the pre-HIMMEL-2830
     # one, matching the argv guarantee it describes.
@@ -309,6 +324,13 @@ if [ -n "$PROFILE" ]; then
         exit 2
     fi
     chmod 600 "$PROFILE_SETTINGS" 2>/dev/null || true
+    if [ "$LANE" = "claudex" ]; then
+        if ! cat "$LEG_PREFACE" "$CLAUDEX_PREFACE" > "$LEG_PROFILE_PREFACE"; then
+            echo "headed-arm-leg: --lane claudex: cannot write preface to $LEG_PROFILE_PREFACE" >&2
+            exit 2
+        fi
+        chmod 600 "$LEG_PROFILE_PREFACE" 2>/dev/null || true
+    fi
     if [ -n "${LEG_PROFILE_MCP_CONFIG:-}" ]; then
         if ! printf '%s\n' "$MCP_CONFIG_JSON" > "$LEG_PROFILE_MCP_CONFIG"; then
             echo "headed-arm-leg: --profile $PROFILE: cannot write mcp config to $LEG_PROFILE_MCP_CONFIG" >&2

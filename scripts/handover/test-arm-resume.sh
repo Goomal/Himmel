@@ -218,6 +218,14 @@ ARM="$(cd "$(dirname "$0")" && pwd)/arm-resume.sh"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# Fleet-census shield (HIMMEL-2968): all real arms use scheduler stubs, so
+# the host's live session count must not refuse them at the fleet preflight.
+# Match test-arm-resume-queue-lock.sh's empty process-table fixture.
+FLEET_PS_STUB="$TMP/no-fleet-ps.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'true' > "$FLEET_PS_STUB"
+chmod +x "$FLEET_PS_STUB"
+export FLEET_PS_CMD="$FLEET_PS_STUB"
+
 # Global telemetry shield (HIMMEL-236): arm-resume emits to
 # ~/.claude/telemetry/skill-usage.jsonl by default, so without a
 # suite-level override every invocation below individually relies on
@@ -475,13 +483,30 @@ case "\$cmd" in
     *) exit 0 ;;
 esac
 EOF
-cat > "$SCHED_STUB_T17/atq" <<'EOF'
+# HIMMEL-2968: the POSIX backend must also report the jobs it accepted.
+# Match ARMED_STUB's stateful at pair; an empty atq after create correctly
+# refuses at arm-resume.sh's post-arm existence verify (W5/W8 on Linux).
+cat > "$SCHED_STUB_T17/atq" <<EOF
 #!/usr/bin/env bash
+d="$TMP/sched-stub-t17.atdir"; [ -d "\$d" ] || exit 0
+for f in "\$d"/job-*; do
+    [ -f "\$f" ] || continue
+    printf '%s\\tThu Jun 11 09:00:00 2026 a user\\n' "\${f##*/job-}"
+done
 exit 0
 EOF
-cat > "$SCHED_STUB_T17/at" <<'EOF'
+cat > "$SCHED_STUB_T17/at" <<EOF
 #!/usr/bin/env bash
-exit 0
+d="$TMP/sched-stub-t17.atdir"; mkdir -p "\$d"
+case "\${1:-}" in
+    -c) cat "\$d/job-\${2:-}" 2>/dev/null; exit 0 ;;
+    -t)
+        n=\$(cat "\$d/.counter" 2>/dev/null || echo 0); n=\$((n + 1))
+        printf '%s' "\$n" > "\$d/.counter"
+        cat > "\$d/job-\$n"
+        exit 0 ;;
+    *) cat > /dev/null 2>&1 || true; exit 0 ;;
+esac
 EOF
 # HIMMEL-938: schtasks /create above is a stateless "always succeeds" fake —
 # it never actually registers anything with the real OS scheduler. On an
@@ -2833,7 +2858,16 @@ cat > "$WINBIN/schtasks" <<'EOF'
 #!/usr/bin/env bash
 exit 0
 EOF
-chmod +x "$WINBIN/claude" "$WINBIN/cygpath" "$WINBIN/schtasks"
+# HIMMEL-2968: a deliberately unavailable verify probe only fail-opens when
+# locale detection works (V5). Model that default here; V8/V8b override reg
+# to keep exercising the dual-safeguard refusal explicitly.
+cat > "$WINBIN/reg" <<'EOF'
+#!/usr/bin/env bash
+echo "HKEY_CURRENT_USER\\Control Panel\\International"
+echo "    sShortDate    REG_SZ    M/d/yyyy"
+exit 0
+EOF
+chmod +x "$WINBIN/claude" "$WINBIN/cygpath" "$WINBIN/schtasks" "$WINBIN/reg"
 win_env() {
     local _dir="$1"; shift
     # schtasks via the SCHTASKS_CMD seam (HIMMEL-1610): pin the stub by absolute
@@ -4451,6 +4485,8 @@ assert_rc "1330 ARM_VAULT_CWD_OK=1 overrides the vault refusal" 0 "$rc"
 # scheduler, which is what "a fresh box" meant back when /create registered
 # nothing.
 : > "$TMP/armed-stub.tasks"
+# The Linux scheduler stores jobs separately from the Windows task list.
+rm -f "$TMP/armed-stub.atdir"/job-*
 out=$(GH_CMD=/nonexistent/gh TMPDIR="$TMP" SCHTASKS_CMD="$ARMED_STUB/schtasks" PATH="$ARMED_STUB:$PATH" \
     bash "$ARM" --time "$(future_time)" --handover "$HO_1330" --cwd "$WORK_REPO" 2>&1)
 rc=$?
@@ -4559,7 +4595,7 @@ EOF
 chmod +x "$FAST1337/schtasks" "$FAST1337/powershell"
 
 HO_1337=$(make_handover "$WORK_REPO")
-out=$(env -u SCHTASKS_CMD PATH="$FAST1337:$PATH" OSTYPE=msys \
+out=$(env -u SCHTASKS_CMD PATH="$FAST1337:$WINBIN:$PATH" OSTYPE=msys \
     bash "$ARM" --time "$(future_time)" --handover "$HO_1337" --dedup-any --dry-run 2>&1)
 rc=$?
 assert_rc "1337 dedup-any dry-run sees the powershell-sourced job (rc=3)" 3 "$rc"
@@ -4574,7 +4610,7 @@ fi
 # Regression: with SCHTASKS_CMD explicitly pinned (the pattern every OTHER
 # test in this suite uses), the fast path must NOT intercept — the schtasks
 # stub's own CSV is what gets read, byte-identical to pre-1337 behavior.
-out=$(SCHTASKS_CMD="$FAST1337/schtasks" PATH="$FAST1337:$PATH" OSTYPE=msys \
+out=$(SCHTASKS_CMD="$FAST1337/schtasks" PATH="$FAST1337:$WINBIN:$PATH" OSTYPE=msys \
     bash "$ARM" --time "$(future_time)" --handover "$(make_handover "$WORK_REPO")" --dedup-any --dry-run 2>&1)
 rc=$?
 assert_rc "1337 pinned SCHTASKS_CMD arms cleanly (its stub CSV is empty)" 0 "$rc"
@@ -4791,7 +4827,7 @@ if _sec_selected "T1287"; then
 HOSTILE_DIR="$TMP/hostile-cwd-$RANDOM/some&dir^100%"
 mkdir -p "$HOSTILE_DIR"
 HO=$(make_handover "$WORK_REPO")
-out=$(SCHTASKS_CMD="$SCHED_STUB_T17/schtasks" PATH="$SCHED_STUB_T17:$PATH" \
+out=$(win_env "$SCHED_STUB_T17" \
     bash "$ARM" --time "$(future_time)" --handover "$HO" --cwd "$HOSTILE_DIR" --force --dry-run 2>&1)
 rc=$?
 assert_rc "T1287a hostile --cwd dry-run exits 0" 0 "$rc"
@@ -4804,7 +4840,7 @@ assert_not_contains "T1287a no caret doubled for literal ^" '^^100' "$out"
 # carrying the same Windows-legal hostile subset exercises the prompt escape.
 HOSTILE_HO="$HANDOVER_DIR/note&caret^100%.md"
 printf -- '---\nsession_kind: test\n---\n# hostile prompt handover\n' > "$HOSTILE_HO"
-out=$(SCHTASKS_CMD="$SCHED_STUB_T17/schtasks" PATH="$SCHED_STUB_T17:$PATH" \
+out=$(win_env "$SCHED_STUB_T17" \
     bash "$ARM" --time "$(future_time)" --handover "$HOSTILE_HO" --cwd "$WORK_REPO" --force --dry-run 2>&1)
 rc=$?
 assert_rc "T1287b hostile prompt dry-run exits 0" 0 "$rc"
@@ -4818,7 +4854,7 @@ assert_not_contains "T1287b no caret doubled for literal ^" '^^100' "$out"
 # ARM_BRIDGE_LIVE=0 is the existing test seam that keeps the unrelated
 # live-Telegram-bridge refusal (HIMMEL-225) out of the way.
 HO=$(make_handover "$WORK_REPO")
-out=$(ARM_BRIDGE_LIVE=0 SCHTASKS_CMD="$SCHED_STUB_T17/schtasks" PATH="$SCHED_STUB_T17:$PATH" \
+out=$(ARM_BRIDGE_LIVE=0 win_env "$SCHED_STUB_T17" \
     bash "$ARM" --time "$(future_time)" --handover "$HO" --channels 'a%b&c^d<e>f|g' --force --dry-run 2>&1)
 rc=$?
 assert_rc "T1287c hostile --channels dry-run exits 0" 0 "$rc"
@@ -4871,7 +4907,7 @@ fi
 
 # The built artifact: a Windows dry-run .bat must carry the full prompt —
 # trigger phrase AND pointer clause — as ONE line.
-out=$(SCHTASKS_CMD="$SCHED_STUB_T17/schtasks" PATH="$SCHED_STUB_T17:$PATH" \
+out=$(win_env "$SCHED_STUB_T17" \
     bash "$ARM" --time "$(future_time)" --handover "$HO" --cwd "$WORK_REPO" --force --dry-run 2>&1)
 rc=$?
 assert_rc "1719d pointer-clause dry-run exits 0" 0 "$rc"
@@ -5861,7 +5897,7 @@ HO_2199_PCT="$HANDOVER_DIR/handover-100%.md"
     printf '# Test handover\n'
 } > "$HO_2199_PCT"
 
-out=$(env PATH="$CRONBIN2199:$PATH" OSTYPE="darwin23" bash "$ARM" --time "$(future_time)" --handover "$HO_2199_PCT" --channels 'a%b' --long-gap --dry-run 2>&1)
+out=$(env ARM_BRIDGE_LIVE=0 PATH="$CRONBIN2199:$PATH" OSTYPE="darwin23" bash "$ARM" --time "$(future_time)" --handover "$HO_2199_PCT" --channels 'a%b' --long-gap --dry-run 2>&1)
 rc=$?
 assert_rc "2199 crontab %-in-prompt/channels dry-run exits 0" 0 "$rc"
 # Content AFTER the escaped % in each field proves the entry was not
@@ -5968,6 +6004,10 @@ fi
 #   leaking the arming session's id.
 # ---------------------------------------------------------------------------
 if _sec_selected "2545" "HIMMEL-2545"; then
+# These payload previews use --dedup-any, so earlier real-arm fixtures must
+# not leave either backend's shared scheduler populated (HIMMEL-2968).
+: > "$TMP/sched-stub-t17.tasks"
+rm -f "$TMP/sched-stub-t17.atdir"/job-*
 _2545_UNSET='unset ARMAUTOMERGE CR_MERGE_GATE_OK ARM_RESUME_SAFETY_ARM CLAUDE_CODE_CHILD_SESSION CLAUDE_PID CLAUDE_CODE_SESSION_ID'
 _2545_EXPORT='export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1'
 

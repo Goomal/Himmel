@@ -1045,13 +1045,46 @@ _arm_profile_report() {
     # shellcheck disable=SC2317  # Invoked indirectly by the EXIT trap.
     echo "PROFILE arm-resume: ${_ARM_PROFILE_LOG[*]}" >&2
 }
+# HIMMEL-2774: releases this arm's own fleet reservation on EVERY exit,
+# success included. codex-4 (4th panel round): this reservation is keyed by
+# the flattened handover path (below), which cannot match the `-n` name the
+# scheduled task will eventually launch under -- so it can never be consumed
+# by a live-session census entry, only expire by TTL. Earlier this was left
+# held on success on the theory that it "reserves the slot" for that future
+# launch, but the reservation exists only to cover the immediate race right
+# here in arm-resume.sh's own admission decision (its default 1800s TTL
+# cannot meaningfully reserve a slot for a launch that may fire hours later
+# anyway -- the scheduled task runs its OWN bank-preflight, under its OWN
+# name, at ITS time). Held past this process's own exit it only
+# double-counts against the cap for up to 30 minutes AND wrongly refuses a
+# legitimate retry of the same handover in that window as a "duplicate".
+# Releasing here unconditionally removes both false positives; nothing else
+# in the fleet count relies on it staying reserved after arm-resume.sh exits.
+# shellcheck disable=SC2329  # Invoked indirectly by the EXIT trap below.
+_arm_fleet_release_pending() {
+    # shellcheck disable=SC2317  # Invoked indirectly by the EXIT trap.
+    [ -n "${_ARM_FLEET_RESERVED_LEG:-}" ] || return 0
+    # shellcheck disable=SC2317  # Invoked indirectly by the EXIT trap.
+    _arm_fleet_resv="${_ARM_FLEET_SLOTS:?}/$_ARM_FLEET_RESERVED_LEG"
+    # codex-3 (this round): bank-preflight.sh returning non-SKIPPED-FLEET
+    # does not guarantee IT created this reservation (the admission-lock-
+    # failure bypass under FLEET_CAP_OK=1 proceeds without creating one) —
+    # if a reservation for this same name already existed from an unrelated
+    # concurrent arm, deleting it unconditionally on our own refusal would
+    # release THEIR still-needed slot out from under them. Only release a
+    # reservation this process itself is recorded as the owner of.
+    # shellcheck disable=SC2317  # Invoked indirectly by the EXIT trap.
+    [ "$(cat "$_arm_fleet_resv/pid" 2>/dev/null)" = "$$" ] || return 0
+    # shellcheck disable=SC2317  # Invoked indirectly by the EXIT trap.
+    rm -rf "$_arm_fleet_resv" 2>/dev/null
+}
 # On an EXIT trap so a REFUSAL (rc=7/9/11/13/19/...) still emits the timings --
 # those are exactly the paths where "which phase burned the time" matters most,
 # and the two hand-picked print sites this replaced only fired on the two
 # success exits. The worker-census block below (DRY_RUN=0) registers its OWN
 # EXIT trap (bash allows only one) -- it chains to this same function rather
 # than clobbering it, so both cleanups still run post-census.
-trap _arm_profile_report EXIT
+trap '_arm_fleet_release_pending; _arm_profile_report' EXIT
 
 # CodeRabbit #1911 (security): a stderr capture at a PREDICTABLE path
 # (/tmp/arm-resume.<label>.$$) lets a local process pre-create a symlink there
@@ -1075,6 +1108,27 @@ _arm_mktemp_or_fail() {
 # check and falls through — arm-resume.sh does not otherwise consult the
 # bank guard. FLEET_CAP_OK=1 in the LAUNCHING shell bypasses (registered in
 # scripts/chokepoints.json so a per-call prefix cannot forge it).
+#
+# HIMMEL-2774 refinements (disclosed in the PR body):
+#   - CADENCE_BANK_LEG must be a bare name (bank-preflight.sh's reservation
+#     directory is `mkdir "$SLOTS/$LEG"`) — HANDOVER_PATH almost always
+#     contains '/', which the pre-fix caller passed straight through. Under
+#     the fixed script that would hit its defensive `*/*` guard and proceed
+#     WITHOUT creating a reservation, leaving arm-resume's own concurrent
+#     calls exactly as racy as before. Sanitized below by collapsing '/' to
+#     '-'.
+#   - No FLEET_RESERVE_TTL export here: this call fires before TARGET_EPOCH
+#     is resolved (below), so there is no deadline yet to derive a TTL from,
+#     and moving the call to after resolution would mean restructuring
+#     arm-resume's scheduling flow, which the brief marks out of scope. The
+#     reservation instead falls back to the design's default 1800s TTL —
+#     ample for the immediate-arm race this ticket targets, and this
+#     sanitized name will not match any later live session's `-n` name, so
+#     it is released by TTL expiry rather than live-session consumption --
+#     UNLESS this run itself later refuses (see _arm_fleet_release_pending
+#     above): most of arm-resume.sh's own refusal exits run AFTER this block,
+#     so on any of them there is no future launch coming and the reservation
+#     is released immediately rather than sitting for the full TTL.
 if [ "$DRY_RUN" -eq 0 ]; then
     _arm_phase_t0 "fleet-preflight"
     _ARM_BANK_PREFLIGHT="$SCRIPT_DIR/../lib/bank-preflight.sh"
@@ -1085,11 +1139,20 @@ if [ "$DRY_RUN" -eq 0 ]; then
         # HIMMEL-2789: this call arms a new leg, so it declares launch intent
         # — the fleet cap must be able to actually refuse it, unlike a plain
         # bank-status READ.
-        _arm_fleet_token="$(CADENCE_BANK_LEG="${HANDOVER_PATH:-arm-resume}" CADENCE_BANK_LAUNCH=1 bash "$_ARM_BANK_PREFLIGHT" </dev/null)"
+        _arm_fleet_leg="${HANDOVER_PATH:-arm-resume}"
+        _arm_fleet_leg="${_arm_fleet_leg//\//-}"
+        _arm_fleet_token="$(CADENCE_BANK_LEG="$_arm_fleet_leg" CADENCE_BANK_LAUNCH=1 CADENCE_BANK_CALLER_PID="$$" bash "$_ARM_BANK_PREFLIGHT" </dev/null)"
         if [ "$_arm_fleet_token" = SKIPPED-FLEET ]; then
             echo "ERR arm-resume: fleet-size cap reached (bank-preflight: SKIPPED-FLEET) — refusing to arm another leg. Override with FLEET_CAP_OK=1 in the LAUNCHING shell." >&2
             exit 22
         fi
+        # Not SKIPPED-FLEET: bank-preflight.sh either created a reservation
+        # for $_arm_fleet_leg or (rarely, an admission-lock failure under
+        # FLEET_CAP_OK=1) created none -- either way `rm -rf` on a name that
+        # was never created is a safe no-op, so track it unconditionally
+        # rather than trying to distinguish the two from the token alone.
+        _ARM_FLEET_SLOTS="${HIMMEL_FLEET_SLOTS:-${XDG_RUNTIME_DIR:-/tmp}/himmel-fleet-$(id -u)}"
+        _ARM_FLEET_RESERVED_LEG="$_arm_fleet_leg"
     fi
     _arm_phase_done "fleet-preflight"
 fi
@@ -1465,10 +1528,11 @@ if [ "$DRY_RUN" -eq 0 ]; then
     _worker_census_err=""
     # Chained, not a bare `trap _arm_worker_stderr_cleanup EXIT` -- bash keeps
     # only ONE handler per signal, and that would silently drop the top-of-
-    # script `trap _arm_profile_report EXIT` (HIMMEL-2113 Ask B) for the rest
-    # of this run, exactly the "PROFILE line missing on a real-arm refusal"
-    # bug this chain fixes.
-    trap '_arm_worker_stderr_cleanup; _arm_profile_report' EXIT
+    # script `trap '_arm_fleet_release_pending; _arm_profile_report' EXIT`
+    # (HIMMEL-2113 Ask B; fleet release added HIMMEL-2774) for the rest of
+    # this run, exactly the "PROFILE line / fleet release missing on a real-
+    # arm refusal" bug this chain fixes.
+    trap '_arm_worker_stderr_cleanup; _arm_fleet_release_pending; _arm_profile_report' EXIT
     _worker_census_err=$(_arm_worker_stderr_file census) || exit 2
 
     set +e

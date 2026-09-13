@@ -53,9 +53,9 @@ STUB
 cat > "$W/bin/pgrep" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' \
-  '101 claude --model x -n HIMMEL-111-legN61 work' \
-  '102 claude --model x -n LUNA-222-legN9 work' \
-  '103 claude --model x -n HIMMEL-next-console work'
+  '101 claude --model claude-sonnet-5 -n HIMMEL-111-legN61 work' \
+  '102 claude --model claude-opus-5 -n LUNA-222-legN9 work' \
+  '103 claude --model claude-sonnet-5 -n HIMMEL-next-console work'
 STUB
 cat > "$W/bin/atq" <<'STUB'
 #!/usr/bin/env bash
@@ -94,7 +94,7 @@ export TICK_TMPDIR="$W"
 export TICK_BANK_CACHE_FILE="$W/bank.json"
 
 out="$(bash "$SUT")"; rc=$?
-expected='TICK 12:34 hb=ok legs=N61:FRESH,N65:FREE procs=2 atq=2 suites=1alive/0dead prs=#2247,#2250 bank=5h30/wk28/codex=5h12/wk34 fill=28 tails=N61:LIVE,N65:READY inbox=N61:10/4,N65:8/8'
+expected='TICK 12:34 hb=ok legs=N61:FRESH,N65:FREE procs=2 models=sonnet:1,opus:1 atq=2 suites=1alive/0dead prs=#2247,#2250 bank=5h30/wk28/codex=5h12/wk34 fill=28 tails=N61:LIVE,N65:READY inbox=N61:10/4,N65:8/8'
 lines="$(printf '%s\n' "$out" | wc -l | tr -d '[:space:]')"
 if [ "$rc" -eq 0 ] && [ "$lines" = 1 ] && [ "$out" = "$expected" ]; then
     pass 'default run emits exactly the expected one batched line'
@@ -111,6 +111,21 @@ else
 fi
 contains '--verbose labels leg locks' "$verbose" 'leg locks: N61:FRESH,N65:FREE'
 contains '--verbose labels context fill' "$verbose" 'fill: 28'
+contains '--verbose labels leg models (HIMMEL-2976)' "$verbose" 'leg models: sonnet:1,opus:1'
+
+# codex-2 (HIMMEL-2976 round 1 CR): a leg process matched by the leg filter
+# but with no --model token at all must still show up (an "unknown" bucket),
+# never silently fall out of every bucket while still counted in procs=.
+mkdir -p "$W/bin-nomodel"
+cat > "$W/bin-nomodel/pgrep" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' \
+  '101 claude --model claude-sonnet-5 -n HIMMEL-111-legN61 work' \
+  '104 claude -n HIMMEL-444-legN70 work'
+STUB
+chmod +x "$W/bin-nomodel/pgrep"
+nomodel_out="$(PATH="$W/bin-nomodel:$PATH" bash "$SUT" --legs 'HIMMEL-111-legN61 HIMMEL-444-legN70')"
+contains 'a leg with no --model token buckets as unknown, not dropped' "$nomodel_out" 'models=sonnet:1,unknown:1'
 
 rm -f "$W/handover/HIMMEL-222-legN65.md"
 out="$(FILL_STALE=1 bash "$SUT" --legs 'HIMMEL-111-legN61 HIMMEL-333-legN66')"; rc=$?

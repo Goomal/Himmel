@@ -13,7 +13,10 @@
 #                     HANDOFF skeleton, print the launch line.
 #
 # Env seams: HANDOVER_DIR / USER_SLUG / JIRA_PROJECT_KEY (via .env, see
-# load-dotenv.sh); CONSOLE_BUCKET, CONSOLE_DOC, CONSOLE_MODEL,
+# load-dotenv.sh); CONSOLE_BUCKET, CONSOLE_DOC, CONSOLE_MODEL, CONSOLE_ROLE
+# (HIMMEL-2975: judge|relay, forwarded to headed-arm.sh as --role on --arm;
+# headed-arm.sh itself refuses relay -- a relay is a leg, armed via
+# headed-arm-leg.sh --relay, never through this console path),
 # CONSOLE_FILL_PERCENT, CONSOLE_TEMPLATE_DIR, CONSOLE_WORK_DIR (default:
 # $XDG_RUNTIME_DIR/himmel-console when set and owned by this uid, else
 # ${TMPDIR:-/tmp}/himmel-console-<uid>; an override is validated the same as
@@ -183,14 +186,33 @@ find_free_letter() {
 # (constant for the whole invocation), not passed positionally.
 do_arm() {
     local session="$1" doc="$2" fill_signal="$3" log="$4" arm
+    local -a role_args=()
+    # HIMMEL-2975: CONSOLE_ROLE (judge) is forwarded to headed-arm.sh as a
+    # leading --role, ONLY when set. `relay` and any other value are refused
+    # HERE, before the detached launch -- headed-arm.sh itself also refuses
+    # --role relay (a relay is a leg, never armed through this console path),
+    # but that refusal happens in a background process the caller cannot see,
+    # so validating up front is what keeps a bad role from printing armed:.
+    case "${CONSOLE_ROLE:-}" in
+        "") ;;
+        judge) role_args=(--role judge) ;;
+        relay)
+            err "relay consoles must use headed-arm-leg.sh --relay"
+            return 2
+            ;;
+        *)
+            err "CONSOLE_ROLE must be judge, got: $CONSOLE_ROLE"
+            return 2
+            ;;
+    esac
     mkdir -p "$(dirname "$log")"
     arm="${CONSOLE_HEADED_ARM:-$HERE/../headed-arm.sh}"
     if [ "${CONSOLE_ARM_FOREGROUND:-0}" = "1" ]; then
-        bash "$arm" "$session" "$doc" "$fill_signal" "$deadline_epoch" "$log" "$model"
+        bash "$arm" "${role_args[@]}" "$session" "$doc" "$fill_signal" "$deadline_epoch" "$log" "$model"
     elif command -v setsid >/dev/null 2>&1; then
-        setsid nohup bash "$arm" "$session" "$doc" "$fill_signal" "$deadline_epoch" "$log" "$model" >/dev/null 2>&1 &
+        setsid nohup bash "$arm" "${role_args[@]}" "$session" "$doc" "$fill_signal" "$deadline_epoch" "$log" "$model" >/dev/null 2>&1 &
     else
-        nohup bash "$arm" "$session" "$doc" "$fill_signal" "$deadline_epoch" "$log" "$model" >/dev/null 2>&1 &
+        nohup bash "$arm" "${role_args[@]}" "$session" "$doc" "$fill_signal" "$deadline_epoch" "$log" "$model" >/dev/null 2>&1 &
     fi
     echo "armed: name=$session doc=$doc signal=$fill_signal deadline=$deadline_epoch log=$log"
     echo "arm-log: $log"

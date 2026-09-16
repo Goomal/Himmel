@@ -26,6 +26,11 @@ QL="$SCRIPT_DIR/queue-lock.sh"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
+# arm-resume-macos-cron fix (round 2): real arms take the macOS/crontab
+# backend on this Mac and write generated runner files under
+# ${ARM_RUNNER_DIR:-$HOME/.claude/handover/arm-runners} -- redirect to a
+# throwaway dir so this suite never writes into the operator's real $HOME.
+export ARM_RUNNER_DIR="$TMP/arm-runners"
 
 # HIMMEL-2765: arm-resume.sh now calls scripts/lib/bank-preflight.sh's
 # fleet-size cap before every real (non-dry-run) arm. Without this, this

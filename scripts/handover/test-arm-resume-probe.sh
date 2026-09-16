@@ -46,6 +46,11 @@ done
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/arm-resume-probe.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
+# arm-resume-macos-cron fix (round 2): the real (stubbed) arm this probe
+# times takes the macOS/crontab backend on this Mac and writes generated
+# runner files under ${ARM_RUNNER_DIR:-$HOME/.claude/handover/arm-runners} --
+# redirect to a throwaway dir so this probe never writes into the real $HOME.
+export ARM_RUNNER_DIR="$TMP/arm-runners"
 
 # --- hermetic environment (mirrors test-arm-resume-identity.sh) -------------
 HANDOVER_DIR="$TMP/statedocs/handovers"

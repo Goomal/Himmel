@@ -421,6 +421,14 @@ EOF
 
 STUB="$TMP/stub-bin"
 make_stub "$STUB"
+# arm-resume-macos-cron fix: every non-dry-run arm in this suite runs for
+# real on the macOS/crontab backend when this suite executes on a real Mac
+# (OSTYPE falls back to `uname -s` = Darwin), which now writes a generated
+# runner (+ .command) file under ${ARM_RUNNER_DIR:-$HOME/.claude/handover/arm-runners}.
+# Without this override every one of those arms would write into the
+# operator's REAL $HOME -- export it once, globally, so every invocation in
+# this file (none of which use `env -i`) inherits a throwaway location.
+export ARM_RUNNER_DIR="$TMP/arm-runners"
 
 # Per-test fresh scheduler state. $1 -> SCHED_DB; SCHED_DB_DIR alongside.
 new_db() {

@@ -155,7 +155,8 @@ T1287|T1287
 2192|2192 HIMMEL-2192
 2199|2199 HIMMEL-2199
 2177|2177 HIMMEL-2177
-2545|2545 HIMMEL-2545'
+2545|2545 HIMMEL-2545
+774|774 arm-macos-cron'
 
 _section_alias_known() {
     local _candidate="$1" _label _aliases _alias
@@ -217,6 +218,14 @@ ARM="$(cd "$(dirname "$0")" && pwd)/arm-resume.sh"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
+# arm-resume-macos-cron fix (round 2): every real (non-dry-run) arm below
+# takes the macOS/crontab backend on this Mac (bash auto-sets $OSTYPE unless
+# a section overrides it), which writes generated runner (+.command) files
+# under ${ARM_RUNNER_DIR:-$HOME/.claude/handover/arm-runners} -- point it at
+# a throwaway dir so this suite never writes into the operator's real $HOME.
+# Per-section overrides below (e.g. mac_env, awkfail_env) further scope it;
+# this global covers every OTHER real arm in the file (T28d/T28e and friends).
+export ARM_RUNNER_DIR="$TMP/arm-runners"
 
 # Fleet-census shield (HIMMEL-2968): all real arms use scheduler stubs, so
 # the host's live session count must not refuse them at the fleet preflight.
@@ -2686,6 +2695,12 @@ MACBIN="$TMP/macbin"; mkdir -p "$MACBIN"
 CRON_STORE="$TMP/cron.store"; : > "$CRON_STORE"
 printf '#!/bin/sh\necho "at MUST NOT be called on macOS" >&2; exit 1\n' > "$MACBIN/at";  chmod +x "$MACBIN/at"
 printf '#!/bin/sh\nexit 0\n' > "$MACBIN/atq"; chmod +x "$MACBIN/atq"
+# arm-resume-macos-cron fix: _crontab_schedule now resolves `claude` via
+# `command -v` at arm time (rc 2 if missing) even under --dry-run -- every
+# macOS/crontab-backend invocation needs a stub on PATH, or this section
+# only passes today because the REAL claude on this Mac's PATH happens to
+# resolve (a CI runner with no claude binary would fail every case below).
+printf '#!/bin/sh\nexit 0\n' > "$MACBIN/claude"; chmod +x "$MACBIN/claude"
 cat > "$MACBIN/crontab" <<CRONEOF
 #!/bin/sh
 case "\$1" in
@@ -2697,7 +2712,13 @@ CRONEOF
 chmod +x "$MACBIN/crontab"
 
 MAC_HO="$(make_handover "$WORK_REPO")"
-mac_env() { env PATH="$MACBIN:$PATH" OSTYPE="darwin23" "$@"; }
+# arm-resume-macos-cron fix: a real (non-dry-run) arm on the macOS/crontab
+# backend now writes a generated runner (+ .command) file under
+# ${ARM_RUNNER_DIR:-$HOME/.claude/handover/arm-runners} -- without this
+# override, case (b)/(c)/(d) below (real arms, not --dry-run) would write
+# into the operator's REAL $HOME.
+MAC_RUNNER_DIR="$TMP/mac-arm-runners"
+mac_env() { env PATH="$MACBIN:$PATH" OSTYPE="darwin23" ARM_RUNNER_DIR="$MAC_RUNNER_DIR" ARM_TERMINAL_APP=none "$@"; }
 
 # (a) schedule emits a crontab entry, not at -t
 out="$(mac_env bash "$ARM" --time "$(future_time)" --handover "$MAC_HO" --dry-run 2>&1)"; rc=$?
@@ -2783,6 +2804,9 @@ AWKFAIL_MACBIN="$TMP/awkfail-macbin"; mkdir -p "$AWKFAIL_MACBIN"
 AWKFAIL_CRON_STORE="$TMP/awkfail-cron.store"; : > "$AWKFAIL_CRON_STORE"
 printf '#!/bin/sh\nexit 1\n' > "$AWKFAIL_MACBIN/at"; chmod +x "$AWKFAIL_MACBIN/at"
 printf '#!/bin/sh\nexit 0\n' > "$AWKFAIL_MACBIN/atq"; chmod +x "$AWKFAIL_MACBIN/atq"
+# arm-resume-macos-cron fix: claude stub (see the "macOS" section's comment
+# above for why every crontab-backend invocation needs one now).
+printf '#!/bin/sh\nexit 0\n' > "$AWKFAIL_MACBIN/claude"; chmod +x "$AWKFAIL_MACBIN/claude"
 cat > "$AWKFAIL_MACBIN/crontab" <<CRONEOF3
 #!/bin/sh
 case "\$1" in
@@ -2792,7 +2816,13 @@ case "\$1" in
 esac
 CRONEOF3
 chmod +x "$AWKFAIL_MACBIN/crontab"
-awkfail_env() { env PATH="$AWKFAIL_DIR:$AWKFAIL_MACBIN:$PATH" OSTYPE="darwin23" "$@"; }
+# arm-resume-macos-cron fix: this section's arms are real (non-dry-run), so
+# ARM_RUNNER_DIR must point at a throwaway dir (see the "macOS" section's
+# comment above) and ARM_TERMINAL_APP=none keeps the runner headless/simple
+# since this section is about the awk-failure recovery path, not the headed
+# launch.
+AWKFAIL_RUNNER_DIR="$TMP/awkfail-arm-runners"
+awkfail_env() { env PATH="$AWKFAIL_DIR:$AWKFAIL_MACBIN:$PATH" OSTYPE="darwin23" ARM_RUNNER_DIR="$AWKFAIL_RUNNER_DIR" ARM_TERMINAL_APP=none "$@"; }
 
 AWKFAIL_HO="$(make_handover "$WORK_REPO")"
 awkfail_env bash "$ARM" --time "$(future_time)" --handover "$AWKFAIL_HO" >/dev/null 2>&1   # seed (real awk; no ENVIRON["MARKER"] call yet)
@@ -5666,6 +5696,9 @@ MACBIN_812="$TMP/macbin-812"; mkdir -p "$MACBIN_812"
 CRON_STORE_812="$TMP/cron-812.store"; : > "$CRON_STORE_812"
 printf '#!/bin/sh\nexit 1\n' > "$MACBIN_812/at"; chmod +x "$MACBIN_812/at"
 printf '#!/bin/sh\nexit 0\n' > "$MACBIN_812/atq"; chmod +x "$MACBIN_812/atq"
+# arm-resume-macos-cron fix: claude resolution now happens even under
+# --dry-run (see the "macOS" section's comment above).
+printf '#!/bin/sh\nexit 0\n' > "$MACBIN_812/claude"; chmod +x "$MACBIN_812/claude"
 cat > "$MACBIN_812/crontab" <<CRONEOF812
 #!/bin/sh
 case "\$1" in
@@ -5753,6 +5786,10 @@ CRON_STORE_1636="$TMP/cron-1636.store"; : > "$CRON_STORE_1636"
 # loud-failing `at` proves it, exactly as the macOS section's stub does.
 printf '#!/bin/sh\necho "at MUST NOT be called on macOS" >&2; exit 1\n' > "$MACBIN_1636/at"; chmod +x "$MACBIN_1636/at"
 printf '#!/bin/sh\nexit 0\n' > "$MACBIN_1636/atq"; chmod +x "$MACBIN_1636/atq"
+# arm-resume-macos-cron fix: claude stub (needed even under --dry-run) --
+# this section's cron arms are real, so this also needs ARM_RUNNER_DIR
+# below (see the "macOS" section's comment above).
+printf '#!/bin/sh\nexit 0\n' > "$MACBIN_1636/claude"; chmod +x "$MACBIN_1636/claude"
 cat > "$MACBIN_1636/crontab" <<CRONEOF1636
 #!/bin/sh
 case "\$1" in
@@ -5766,6 +5803,7 @@ _a1636_cron() {
     local ho="$1"; shift
     out=$(TMPDIR="$TMP" GH_CMD=/nonexistent/gh HIMMEL_FLOW_RUNS_LEDGER="$TMP/1636-cron.jsonl" \
         PATH="$MACBIN_1636:$PATH" OSTYPE=darwin23 \
+        ARM_RUNNER_DIR="$TMP/1636-arm-runners" ARM_TERMINAL_APP=none \
         bash "$ARM" --time "$(future_time)" --handover "$ho" "$@" 2>&1)
 }
 _a1636_cron "$HO_1636_A"; rc=$?
@@ -5814,6 +5852,8 @@ assert_not_contains "2192 no --model token for a console-named handover (ruling 
 # crontab coverage.
 CRONBIN2192="$TMP/cronbin2192"; mkdir -p "$CRONBIN2192"
 CRON_STORE_2192="$TMP/cron2192.store"; : > "$CRON_STORE_2192"
+# arm-resume-macos-cron fix: claude stub (needed even under --dry-run).
+printf '#!/bin/sh\nexit 0\n' > "$CRONBIN2192/claude"; chmod +x "$CRONBIN2192/claude"
 cat > "$CRONBIN2192/crontab" <<CRONEOF
 #!/bin/sh
 case "\$1" in
@@ -5824,10 +5864,15 @@ esac
 CRONEOF
 chmod +x "$CRONBIN2192/crontab"
 HO_2192_PCT=$(make_handover "$WORK_REPO")
-out=$(env PATH="$CRONBIN2192:$PATH" OSTYPE="darwin23" bash "$ARM" --time "$(future_time)" --handover "$HO_2192_PCT" --model 'a%b' --dry-run 2>&1)
+out=$(env PATH="$CRONBIN2192:$PATH" OSTYPE="darwin23" ARM_TERMINAL_APP=none bash "$ARM" --time "$(future_time)" --handover "$HO_2192_PCT" --model 'a%b' --dry-run 2>&1)
 rc=$?
 assert_rc "2192 crontab --model with percent dry-run exits 0" 0 "$rc"
-assert_contains "2192 crontab entry escapes percent in --model" '--model a\%b' "$out"
+# arm-resume-macos-cron fix: --model now lands in the RUNNER FILE (parsed by
+# /bin/sh, not crontab), so a literal % is no longer \%-escaped there -- only
+# a % in the runner PATH itself (still on the crontab line) needs it. See the
+# ARM_RUNNER_DIR case right below for that half.
+assert_contains "2192 runner body leaves percent UNescaped in --model (parsed by sh, not crontab)" '--model a%b' "$out"
+assert_not_contains "2192 runner body does NOT backslash-escape --model's percent" '--model a\%b' "$out"
 
 # Value-less --model must ERROR, not consume the next option as the model
 # name (CR finding codex-1: `--model --dry-run` would otherwise swallow
@@ -5887,6 +5932,8 @@ fi
 if _sec_selected "2199" "HIMMEL-2199"; then
 CRONBIN2199="$TMP/cronbin2199"; mkdir -p "$CRONBIN2199"
 CRON_STORE_2199="$TMP/cron2199.store"; : > "$CRON_STORE_2199"
+# arm-resume-macos-cron fix: claude stub (needed even under --dry-run).
+printf '#!/bin/sh\nexit 0\n' > "$CRONBIN2199/claude"; chmod +x "$CRONBIN2199/claude"
 cat > "$CRONBIN2199/crontab" <<CRONEOF
 #!/bin/sh
 case "\$1" in
@@ -5906,26 +5953,48 @@ HO_2199_PCT="$HANDOVER_DIR/handover-100%.md"
     printf '# Test handover\n'
 } > "$HO_2199_PCT"
 
-out=$(env ARM_BRIDGE_LIVE=0 PATH="$CRONBIN2199:$PATH" OSTYPE="darwin23" bash "$ARM" --time "$(future_time)" --handover "$HO_2199_PCT" --channels 'a%b' --long-gap --dry-run 2>&1)
+out=$(env ARM_BRIDGE_LIVE=0 PATH="$CRONBIN2199:$PATH" OSTYPE="darwin23" ARM_TERMINAL_APP=none bash "$ARM" --time "$(future_time)" --handover "$HO_2199_PCT" --channels 'a%b' --long-gap --dry-run 2>&1)
 rc=$?
 assert_rc "2199 crontab %-in-prompt/channels dry-run exits 0" 0 "$rc"
-# Content AFTER the escaped % in each field proves the entry was not
-# truncated there -- a bare (unescaped) % would have dropped everything
-# past it when crontab actually parsed the real entry.
-assert_contains "2199 crontab entry escapes percent in the prompt (from the %-bearing handover path)" 'handover-100\%.md\ overnight\ mode' "$out"
-assert_contains "2199 crontab entry escapes percent in --channels" '--channels a\%b' "$out"
-assert_contains "2199 crontab entry's trailing marker survives past both escapes (nothing truncated)" '# HIMMEL-Resume-handover-100' "$out"
+# arm-resume-macos-cron fix: q_prompt/q_channels now land in the RUNNER FILE
+# (parsed by /bin/sh, not crontab), so a literal % is no longer \%-escaped
+# there -- %q still escapes the spaces, just not the percent. Content AFTER
+# the (now-bare) % in each field still proves nothing truncated the runner
+# body mid-field.
+assert_contains "2199 runner body leaves percent UNescaped in the prompt (from the %-bearing handover path)" 'handover-100%.md\ overnight\ mode' "$out"
+assert_not_contains "2199 runner body does NOT backslash-escape the prompt's percent" 'handover-100\%.md' "$out"
+assert_contains "2199 runner body leaves percent UNescaped in --channels" '--channels a%b' "$out"
+assert_not_contains "2199 runner body does NOT backslash-escape --channels' percent" '--channels a\%b' "$out"
+assert_contains "2199 crontab entry's trailing marker survives (nothing truncated)" '# HIMMEL-Resume-handover-100' "$out"
 
 # CR round on this ticket (critic-panel [codex-1]): q_cwd sits in the SAME
-# crontab entry (`cd $q_cwd && ...`) as q_prompt/q_channels but was missed by
+# launch body (`cd $q_cwd && ...`) as q_prompt/q_channels but was missed by
 # the first pass -- a % in RESUME_CWD (the git-toplevel-derived working
-# directory) truncates the entry exactly the same way.
+# directory) is the same "now inside a runner file" case as prompt/channels
+# above.
 CWD_PCT="$TMP/work%repo"; mkdir -p "$CWD_PCT"
 HO_2199_CWD=$(make_handover "$CWD_PCT")
-out=$(env PATH="$CRONBIN2199:$PATH" OSTYPE="darwin23" bash "$ARM" --time "$(future_time)" --handover "$HO_2199_CWD" --long-gap --dry-run 2>&1)
+out=$(env PATH="$CRONBIN2199:$PATH" OSTYPE="darwin23" ARM_TERMINAL_APP=none bash "$ARM" --time "$(future_time)" --handover "$HO_2199_CWD" --long-gap --dry-run 2>&1)
 rc=$?
 assert_rc "2199 crontab %-in-cwd dry-run exits 0" 0 "$rc"
-assert_contains "2199 crontab entry escapes percent in cwd" 'work\%repo && unset' "$out"
+assert_contains "2199 runner body leaves percent UNescaped in cwd" 'work%repo && unset' "$out"
+assert_not_contains "2199 runner body does NOT backslash-escape cwd's percent" 'work\%repo' "$out"
+
+# arm-resume-macos-cron fix (design item A): the ONE value still living on
+# the crontab LINE itself is the runner PATH -- a % in ARM_RUNNER_DIR is the
+# one case that still needs the \%-escape, and it's crontab (not /bin/sh)
+# that reads a bare % as end-of-command + stdin, so the trailing `# <marker>`
+# surviving intact is the same "nothing truncated" proof the old prompt/
+# channels/cwd assertions made, just relocated to the field that still
+# carries the hazard.
+RUNNERDIR_PCT="$TMP/arm%runners"
+HO_2199_RUNNERDIR=$(make_handover "$WORK_REPO")
+out=$(env PATH="$CRONBIN2199:$PATH" OSTYPE="darwin23" ARM_TERMINAL_APP=none ARM_RUNNER_DIR="$RUNNERDIR_PCT" \
+    bash "$ARM" --time "$(future_time)" --handover "$HO_2199_RUNNERDIR" --long-gap --dry-run 2>&1)
+rc=$?
+assert_rc "2199 crontab %-in-ARM_RUNNER_DIR dry-run exits 0" 0 "$rc"
+assert_contains "2199 crontab LINE escapes percent in the runner path" 'arm\%runners/' "$out"
+assert_contains "2199 crontab entry's trailing marker survives past the runner-path escape (nothing truncated)" '# HIMMEL-Resume-' "$out"
 fi
 
 # ---------------------------------------------------------------------------
@@ -6047,6 +6116,8 @@ assert_not_contains "2545a body never grants CLAUDE_CODE_CHILD_SESSION=1" "CLAUD
 # the multi-line POSIX twin.
 CRONBIN2545="$TMP/cronbin2545"; mkdir -p "$CRONBIN2545"
 CRON_STORE_2545="$TMP/cron2545.store"; : > "$CRON_STORE_2545"
+# arm-resume-macos-cron fix: claude stub (needed even under --dry-run).
+printf '#!/bin/sh\nexit 0\n' > "$CRONBIN2545/claude"; chmod +x "$CRONBIN2545/claude"
 cat > "$CRONBIN2545/crontab" <<CRONEOF
 #!/bin/sh
 case "\$1" in
@@ -6057,7 +6128,7 @@ esac
 CRONEOF
 chmod +x "$CRONBIN2545/crontab"
 HO_2545_CRON=$(make_handover "$WORK_REPO")
-out=$(env PATH="$CRONBIN2545:$PATH" OSTYPE="darwin23" \
+out=$(env PATH="$CRONBIN2545:$PATH" OSTYPE="darwin23" ARM_TERMINAL_APP=none \
     bash "$ARM" --time "$(future_time)" --handover "$HO_2545_CRON" --dry-run 2>&1)
 rc=$?
 assert_rc "2545b cron dry-run exits 0" 0 "$rc"
@@ -6081,7 +6152,7 @@ assert_contains "2545c .bat FORCES session persistence" 'set "CLAUDE_CODE_FORCE_
 # this branch still handing the relaunch the arming session's stale id.
 HO_2545_CRON_HP=$(make_handover "$WORK_REPO")
 : > "$CRON_STORE_2545"
-out=$(HIMMEL_HEADROOM_PROXY=1 env PATH="$CRONBIN2545:$PATH" OSTYPE="darwin23" \
+out=$(HIMMEL_HEADROOM_PROXY=1 env PATH="$CRONBIN2545:$PATH" OSTYPE="darwin23" ARM_TERMINAL_APP=none \
     bash "$ARM" --time "$(future_time)" --handover "$HO_2545_CRON_HP" --dry-run 2>&1)
 rc=$?
 assert_rc "2545d cron headroom-proxy dry-run exits 0" 0 "$rc"
@@ -6104,6 +6175,228 @@ case "${OSTYPE:-$(uname -s 2>/dev/null)}" in
         assert_contains "2545e at headroom-proxy body forces session persistence" "$_2545_EXPORT" "$out"
         ;;
 esac
+fi
+
+# ---------------------------------------------------------------------------
+# 774 (arm-macos-cron, upstream issue yotamleo/Himmel#774) -- the crontab
+# runner-file split, headed macOS launch, arm-time `claude` resolution (rc 2
+# if missing), and the HIMMEL_ARMED_RELAUNCH=1 self-exit grant. See
+# _crontab_schedule's own header comment for the full defect writeup.
+# ---------------------------------------------------------------------------
+if _sec_selected "774" "arm-macos-cron"; then
+echo "--- 774 (arm-macos-cron) ---"
+
+# Shared stub bin: crontab is STATEFUL (file-backed, `-l` fails like the real
+# binary when empty so the `2>/dev/null || true` guards are exercised), `at`
+# loud-fails (must never be reached on macOS), `claude` is a plain exit-0 stub.
+CRONBIN774="$TMP/cronbin774"; mkdir -p "$CRONBIN774"
+CRON_STORE_774="$TMP/cron774.store"; : > "$CRON_STORE_774"
+cat > "$CRONBIN774/crontab" <<CRONEOF774
+#!/bin/sh
+case "\$1" in
+  -l) if [ -s "$CRON_STORE_774" ]; then cat "$CRON_STORE_774"; else exit 1; fi ;;
+  -) cat > "$CRON_STORE_774.tmp" && mv "$CRON_STORE_774.tmp" "$CRON_STORE_774" ;;
+  *) exit 0 ;;
+esac
+CRONEOF774
+chmod +x "$CRONBIN774/crontab"
+printf '#!/bin/sh\necho "at MUST NOT be called on macOS" >&2; exit 1\n' > "$CRONBIN774/at"; chmod +x "$CRONBIN774/at"
+printf '#!/bin/sh\nexit 0\n' > "$CRONBIN774/atq"; chmod +x "$CRONBIN774/atq"
+printf '#!/bin/sh\nexit 0\n' > "$CRONBIN774/claude"; chmod +x "$CRONBIN774/claude"
+RUNNER_774="$TMP/arm-runners-774"
+FAKEAPPS774="$TMP/fake-apps-774"; mkdir -p "$FAKEAPPS774/Terminal.app"
+
+# --- 774a: claude missing at arm time -> rc 2 -------------------------------
+# PATH stripped of every directory that resolves a REAL claude -- the exact
+# shape a claude-less CI runner sees -- plus a crontab/at/atq stub with NO
+# claude alongside it, so the failure is proven, not accidental.
+NOCLAUDE774="$TMP/noclaude774"; mkdir -p "$NOCLAUDE774"
+cp "$CRONBIN774/crontab" "$CRONBIN774/at" "$CRONBIN774/atq" "$NOCLAUDE774/"
+chmod +x "$NOCLAUDE774"/*
+_path_no_claude774="$PATH"
+while _found774=$(PATH="$_path_no_claude774" command -v claude 2>/dev/null); [ -n "$_found774" ]; do
+    _d774=$(dirname "$_found774")
+    _path_no_claude774=$(printf '%s\n' "$_path_no_claude774" | tr ':' '\n' | grep -vFx "$_d774" | tr '\n' ':')
+    _path_no_claude774="${_path_no_claude774%:}"
+done
+HO_774A=$(make_handover "$WORK_REPO")
+out=$(env PATH="$NOCLAUDE774:$_path_no_claude774" OSTYPE="darwin23" ARM_RUNNER_DIR="$RUNNER_774/a" ARM_TERMINAL_APP=none \
+    bash "$ARM" --time "$(future_time)" --handover "$HO_774A" --dry-run 2>&1)
+rc=$?
+assert_rc "774a claude missing at arm time exits rc=2" 2 "$rc"
+assert_contains "774a rc=2 ERR names the missing tool" "'claude' not on PATH at arm time" "$out"
+
+# --- 774b: non-dry-run macOS arm -- runner + .command files on disk --------
+EXECBIN774B="$TMP/execbin774b"; mkdir -p "$EXECBIN774B"
+cp "$CRONBIN774/crontab" "$CRONBIN774/at" "$CRONBIN774/atq" "$CRONBIN774/claude" "$EXECBIN774B/"
+chmod +x "$EXECBIN774B"/*
+OPENLOG_774B="$TMP/open-774b.log"
+cat > "$EXECBIN774B/open" <<OPENEOF774B
+#!/bin/sh
+echo "\$@" >> "$OPENLOG_774B"
+exit 0
+OPENEOF774B
+chmod +x "$EXECBIN774B/open"
+
+: > "$CRON_STORE_774"
+printf '0 9 * * * /bin/sh /nonexistent # HIMMEL-Resume-774b-sibling\n' > "$CRON_STORE_774"
+RUNNERDIR_774B="$RUNNER_774/b"
+HO_774B=$(make_handover "$WORK_REPO")
+out=$(env PATH="$EXECBIN774B:$PATH" OSTYPE="darwin23" ARM_RUNNER_DIR="$RUNNERDIR_774B" ARM_APP_DIRS="$FAKEAPPS774" TERM_PROGRAM= \
+    bash "$ARM" --time "$(future_time)" --handover "$HO_774B" 2>&1)
+rc=$?
+assert_rc "774b non-dry-run macOS arm exits 0" 0 "$rc"
+CRON_LINE_774B=$(grep 'HIMMEL-Resume-' "$CRON_STORE_774" | grep -v 774b-sibling | head -1)
+TASK_NAME_774B=$(printf '%s' "$CRON_LINE_774B" | sed 's/.*# //')
+RUNNER_PATH_774B="$RUNNERDIR_774B/$TASK_NAME_774B.sh"
+COMMAND_PATH_774B="$RUNNERDIR_774B/$TASK_NAME_774B.command"
+if [ -n "$TASK_NAME_774B" ]; then
+    echo "PASS 774b crontab fixture carries a marker for the new arm"
+else
+    echo "FAIL 774b could not find the new arm's crontab line"
+    FAILED=$((FAILED + 1))
+fi
+assert_contains "774b crontab fixture line is /bin/sh <runner> # <TASK_NAME>" "/bin/sh $RUNNER_PATH_774B # $TASK_NAME_774B" "$CRON_LINE_774B"
+
+_mode774() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null; }
+[ -f "$RUNNER_PATH_774B" ] && echo "PASS 774b runner file exists" || { echo "FAIL 774b runner file missing: $RUNNER_PATH_774B"; FAILED=$((FAILED + 1)); }
+[ -f "$COMMAND_PATH_774B" ] && echo "PASS 774b .command file exists" || { echo "FAIL 774b .command file missing: $COMMAND_PATH_774B"; FAILED=$((FAILED + 1)); }
+[ "$(_mode774 "$RUNNER_PATH_774B")" = "700" ] && echo "PASS 774b runner file mode 700" || { echo "FAIL 774b runner mode=$(_mode774 "$RUNNER_PATH_774B")"; FAILED=$((FAILED + 1)); }
+[ "$(_mode774 "$COMMAND_PATH_774B")" = "700" ] && echo "PASS 774b .command file mode 700" || { echo "FAIL 774b .command mode=$(_mode774 "$COMMAND_PATH_774B")"; FAILED=$((FAILED + 1)); }
+sh -n "$RUNNER_PATH_774B" 2>/dev/null && echo "PASS 774b runner passes sh -n" || { echo "FAIL 774b runner fails sh -n"; FAILED=$((FAILED + 1)); }
+sh -n "$COMMAND_PATH_774B" 2>/dev/null && echo "PASS 774b .command passes sh -n" || { echo "FAIL 774b .command fails sh -n"; FAILED=$((FAILED + 1)); }
+
+RUNNER_BODY_774B=$(cat "$RUNNER_PATH_774B" 2>/dev/null)
+COMMAND_BODY_774B=$(cat "$COMMAND_PATH_774B" 2>/dev/null)
+assert_contains "774b runner carries the PATH stamp" '; export PATH' "$RUNNER_BODY_774B"
+assert_contains "774b runner self-cleans the crontab entry" 'crontab -l' "$RUNNER_BODY_774B"
+assert_contains "774b runner self-clean targets this arm's own marker" "$TASK_NAME_774B" "$RUNNER_BODY_774B"
+assert_not_contains "774b runner does NOT carry the launch body (headed split)" 'HIMMEL_ARMED_RELAUNCH=1' "$RUNNER_BODY_774B"
+assert_contains "774b .command carries the PATH stamp" '; export PATH' "$COMMAND_BODY_774B"
+assert_contains "774b .command carries HIMMEL_ARMED_RELAUNCH=1" 'HIMMEL_ARMED_RELAUNCH=1' "$COMMAND_BODY_774B"
+assert_contains "774b .command launches claude by absolute path" "$EXECBIN774B/claude" "$COMMAND_BODY_774B"
+
+# --- 774c: execute the generated runner for real (stub crontab + open) -----
+# The runner's OWN first line resets PATH to its ARM-TIME snapshot, so the
+# `open` stub it will actually call must be baked in at arm time (774b's
+# EXECBIN774B already is) -- an exec-time-only override would be invisible.
+EXEC_OUT_774C=$(PATH="$EXECBIN774B:$PATH" /bin/sh "$RUNNER_PATH_774B" 2>&1)
+EXEC_RC_774C=$?
+assert_rc "774c executed runner exits 0 (open stub succeeds)" 0 "$EXEC_RC_774C"
+assert_not_contains "774c executed runner prints no ERR" "ERR arm-resume" "$EXEC_OUT_774C"
+POST_STORE_774C=$(cat "$CRON_STORE_774" 2>/dev/null)
+assert_not_contains "774c self-clean removed OUR OWN marker" "$TASK_NAME_774B" "$POST_STORE_774C"
+assert_contains "774c self-clean left the SIBLING marker untouched" "HIMMEL-Resume-774b-sibling" "$POST_STORE_774C"
+OPEN_ARGV_774C=$(cat "$OPENLOG_774B" 2>/dev/null)
+assert_contains "774c open received -a <app>" '-a Terminal' "$OPEN_ARGV_774C"
+assert_contains "774c open received the .command path" "$COMMAND_PATH_774B" "$OPEN_ARGV_774C"
+
+# --- 774c(fail): a failing `open` makes the runner exit nonzero + ERR -------
+FAILEXECBIN_774C="$TMP/failexecbin774c"; mkdir -p "$FAILEXECBIN_774C"
+cp "$CRONBIN774/crontab" "$CRONBIN774/at" "$CRONBIN774/atq" "$CRONBIN774/claude" "$FAILEXECBIN_774C/"
+chmod +x "$FAILEXECBIN_774C"/*
+printf '#!/bin/sh\nexit 1\n' > "$FAILEXECBIN_774C/open"; chmod +x "$FAILEXECBIN_774C/open"
+: > "$CRON_STORE_774"
+RUNNERDIR_774CF="$RUNNER_774/c-failopen"
+HO_774CF=$(make_handover "$WORK_REPO")
+out=$(env PATH="$FAILEXECBIN_774C:$PATH" OSTYPE="darwin23" ARM_RUNNER_DIR="$RUNNERDIR_774CF" ARM_APP_DIRS="$FAKEAPPS774" TERM_PROGRAM= \
+    bash "$ARM" --time "$(future_time)" --handover "$HO_774CF" 2>&1)
+rc=$?
+assert_rc "774c(fail) real macOS arm exits 0" 0 "$rc"
+CRON_LINE_774CF=$(grep 'HIMMEL-Resume-' "$CRON_STORE_774" | head -1)
+TASK_NAME_774CF=$(printf '%s' "$CRON_LINE_774CF" | sed 's/.*# //')
+RUNNER_PATH_774CF="$RUNNERDIR_774CF/$TASK_NAME_774CF.sh"
+EXEC_OUT_774CF=$(PATH="$FAILEXECBIN_774C:$PATH" /bin/sh "$RUNNER_PATH_774CF" 2>&1)
+EXEC_RC_774CF=$?
+assert_rc "774c(fail) executed runner exits nonzero when open fails" 1 "$EXEC_RC_774CF"
+assert_contains "774c(fail) failing open prints an ERR line" "ERR arm-resume: open -a" "$EXEC_OUT_774CF"
+
+# --- 774d: app resolution ---------------------------------------------------
+# none -> headless inline runner, no .command file / open -a anywhere.
+HO_774D1=$(make_handover "$WORK_REPO")
+out=$(env PATH="$CRONBIN774:$PATH" OSTYPE="darwin23" ARM_TERMINAL_APP=none \
+    bash "$ARM" --time "$(future_time)" --handover "$HO_774D1" --dry-run 2>&1)
+rc=$?
+assert_rc "774d ARM_TERMINAL_APP=none dry-run exits 0" 0 "$rc"
+assert_not_contains "774d none: no .command file section printed" "command file (" "$out"
+assert_not_contains "774d none: no open -a anywhere" "open -a" "$out"
+
+# TERM_PROGRAM=iTerm.app + a fake iTerm.app in ARM_APP_DIRS -> open -a iTerm.
+FAKEAPPS_ITERM774="$TMP/fake-apps-iterm-774"; mkdir -p "$FAKEAPPS_ITERM774/iTerm.app"
+HO_774D2=$(make_handover "$WORK_REPO")
+out=$(env PATH="$CRONBIN774:$PATH" OSTYPE="darwin23" TERM_PROGRAM=iTerm.app ARM_APP_DIRS="$FAKEAPPS_ITERM774" \
+    bash "$ARM" --time "$(future_time)" --handover "$HO_774D2" --dry-run 2>&1)
+rc=$?
+assert_rc "774d iTerm dry-run exits 0" 0 "$rc"
+assert_contains "774d iTerm resolved and used for open -a" 'open -a iTerm' "$out"
+assert_not_contains "774d iTerm resolution does not WARN" "not found under ARM_APP_DIRS" "$out"
+
+# Unknown/unresolvable app -> WARN + fallback to Terminal.
+EMPTYAPPS774="$TMP/empty-apps-774"; mkdir -p "$EMPTYAPPS774"
+HO_774D3=$(make_handover "$WORK_REPO")
+out=$(env PATH="$CRONBIN774:$PATH" OSTYPE="darwin23" ARM_TERMINAL_APP=NoSuchApp774 ARM_APP_DIRS="$EMPTYAPPS774" \
+    bash "$ARM" --time "$(future_time)" --handover "$HO_774D3" --dry-run 2>&1)
+rc=$?
+assert_rc "774d unknown app dry-run exits 0" 0 "$rc"
+assert_contains "774d unknown app WARNs" "terminal app 'NoSuchApp774' not found under ARM_APP_DIRS" "$out"
+assert_contains "774d unknown app falls back to Terminal" 'open -a Terminal' "$out"
+
+# --- 774e: Linux `at` body carries HIMMEL_ARMED_RELAUNCH=1 ------------------
+LINBIN774="$TMP/linbin774"; mkdir -p "$LINBIN774"
+printf '#!/bin/sh\nexit 0\n' > "$LINBIN774/atq"; chmod +x "$LINBIN774/atq"
+printf '#!/bin/sh\ncat >/dev/null\nexit 0\n' > "$LINBIN774/at"; chmod +x "$LINBIN774/at"
+# Empty crontab (`-l` rc 1, like "no crontab for user"): the linux collision
+# check also reads `crontab -l`, so without this the case collides (rc 6) with
+# entries earlier sections left behind -- or with a real Mac's crontab.
+printf '#!/bin/sh\nexit 1\n' > "$LINBIN774/crontab"; chmod +x "$LINBIN774/crontab"
+HO_774E=$(make_handover "$WORK_REPO")
+out=$(env PATH="$LINBIN774:$PATH" OSTYPE="linux-gnu" bash "$ARM" --time "$(future_time)" --handover "$HO_774E" --dry-run 2>&1)
+rc=$?
+assert_rc "774e linux/at dry-run exits 0" 0 "$rc"
+assert_contains "774e at body carries HIMMEL_ARMED_RELAUNCH=1" "HIMMEL_ARMED_RELAUNCH=1" "$out"
+
+# --- 774f: entry-length -- a >1000-char launch body stays off the crontab --
+# LINE (design item A's whole point): the runner file absorbs the bulk, so
+# the crontab entry itself stays a small fixed shape regardless.
+LONGCWD774="$TMP/verylongcwd774"
+_d774f="$LONGCWD774"; _i774f=0
+while [ "${#_d774f}" -lt 700 ]; do _d774f="$_d774f/segment-$(printf '%03d' "$_i774f")-abcdefghij"; _i774f=$((_i774f + 1)); done
+mkdir -p "$_d774f"; LONGCWD774="$_d774f"
+LONGHODIR774="$HANDOVER_DIR/verylong774"
+_h774f="$LONGHODIR774"; _i774f=0
+while [ "${#_h774f}" -lt 500 ]; do _h774f="$_h774f/seg$(printf '%03d' "$_i774f")xxxxxxxxxx"; _i774f=$((_i774f + 1)); done
+mkdir -p "$_h774f"
+LONGHO774="$_h774f/handover.md"
+{
+    printf -- '---\n'
+    printf 'session_kind: test\n'
+    printf 'resume_cwd: %s\n' "$LONGCWD774"
+    printf -- '---\n'
+    printf '# Test handover\n'
+} > "$LONGHO774"
+
+: > "$CRON_STORE_774"
+RUNNERDIR_774F="$RUNNER_774/f-entrylen"
+out=$(env PATH="$CRONBIN774:$PATH" OSTYPE="darwin23" ARM_TERMINAL_APP=none ARM_RUNNER_DIR="$RUNNERDIR_774F" \
+    bash "$ARM" --time "$(future_time)" --handover "$LONGHO774" 2>&1)
+rc=$?
+assert_rc "774f real macOS arm with a >1000-char launch body exits 0" 0 "$rc"
+ENTRY_LINE_774F=$(grep 'HIMMEL-Resume-' "$CRON_STORE_774" | head -1)
+ENTRY_LEN_774F=${#ENTRY_LINE_774F}
+if [ "$ENTRY_LEN_774F" -gt 0 ] && [ "$ENTRY_LEN_774F" -lt 1000 ]; then
+    echo "PASS 774f crontab entry is <1000 bytes ($ENTRY_LEN_774F)"
+else
+    echo "FAIL 774f crontab entry is $ENTRY_LEN_774F bytes (expected >0 and <1000)"
+    FAILED=$((FAILED + 1))
+fi
+case "$ENTRY_LINE_774F" in
+    *"# HIMMEL-Resume-"*) echo "PASS 774f entry ends with the marker" ;;
+    *) echo "FAIL 774f entry missing trailing marker: $ENTRY_LINE_774F"; FAILED=$((FAILED + 1)) ;;
+esac
+TASK_NAME_774F=$(printf '%s' "$ENTRY_LINE_774F" | sed 's/.*# //')
+RUNNER_PATH_774F="$RUNNERDIR_774F/$TASK_NAME_774F.sh"
+sh -n "$RUNNER_PATH_774F" 2>/dev/null && echo "PASS 774f generated runner passes sh -n" || { echo "FAIL 774f generated runner fails sh -n: $RUNNER_PATH_774F"; FAILED=$((FAILED + 1)); }
+
 fi
 
 # ---------------------------------------------------------------------------

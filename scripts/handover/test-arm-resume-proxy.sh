@@ -31,6 +31,11 @@ LIB="$SCRIPT_DIR/../lib/headroom-proxy.sh"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
+# arm-resume-macos-cron fix (round 2): real arms take the macOS/crontab
+# backend on this Mac and write generated runner files under
+# ${ARM_RUNNER_DIR:-$HOME/.claude/handover/arm-runners} -- redirect to a
+# throwaway dir so this suite never writes into the operator's real $HOME.
+export ARM_RUNNER_DIR="$TMP/arm-runners"
 
 # Hermetic shields (same as test-arm-resume.sh / test-arm-resume-queue-lock.sh):
 # no real telemetry/trust writes, no operator-shell env bleed.
@@ -316,6 +321,11 @@ esac
 MACBIN="$TMP/macbin"; mkdir -p "$MACBIN"
 printf '#!/bin/sh\necho "at MUST NOT be called on macOS" >&2; exit 1\n' > "$MACBIN/at"; chmod +x "$MACBIN/at"
 printf '#!/bin/sh\nexit 0\n' > "$MACBIN/atq"; chmod +x "$MACBIN/atq"
+# arm-resume-macos-cron fix: _crontab_schedule now resolves `claude` via
+# `command -v` at arm time (rc 2 if missing) even under --dry-run -- every
+# case below (T5a/T5b/T6c) needs a stub, or this only passes today because
+# the REAL claude on this Mac's PATH happens to resolve.
+printf '#!/bin/sh\nexit 0\n' > "$MACBIN/claude"; chmod +x "$MACBIN/claude"
 cat > "$MACBIN/crontab" <<'EOF'
 #!/bin/sh
 case "$1" in
@@ -325,7 +335,11 @@ case "$1" in
 esac
 EOF
 chmod +x "$MACBIN/crontab"
-mac_env() { env PATH="$MACBIN:$PATH" OSTYPE="darwin23" "$@"; }
+# ARM_TERMINAL_APP=none keeps these dry-runs on the headless runner shape
+# these assertions were written against (they check launch-body content,
+# not the headed-launch mechanism, which section 774 in test-arm-resume.sh
+# covers).
+mac_env() { env PATH="$MACBIN:$PATH" OSTYPE="darwin23" ARM_TERMINAL_APP=none "$@"; }
 
 # Expected POSIX curl reference for T5/T6 (CR round): the launchers bake the
 # %q-quoted absolute path resolved at arm time.

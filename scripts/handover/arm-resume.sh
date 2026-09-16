@@ -107,13 +107,37 @@
 #                           auto-detected-cwd refusal (rc 14) -- arms anyway
 #                           into a vault/state repo with no explicit
 #                           --cwd/--worktree/resume_cwd:.
+#   ARM_RUNNER_DIR          Test seam / override for where crontab arms
+#                           (macOS, and the Linux crontab fallback) write
+#                           their generated runner (+ .command) files.
+#                           Default: $HOME/.claude/handover/arm-runners.
+#                           Files are chmod 700; the dir is mkdir -p'd.
+#   ARM_TERMINAL_APP        macOS crontab arms only: which app `open -a`
+#                           launches the relaunch in (cron has no TTY, so a
+#                           headless launch would be invisible). Default:
+#                           inferred from TERM_PROGRAM at arm time
+#                           (iTerm.app -> iTerm, Apple_Terminal -> Terminal,
+#                           else Terminal). "none" opts out to a headless
+#                           inline launch (the Linux crontab fallback's only
+#                           mode). A bad app name WARNs and falls back to
+#                           Terminal rather than refusing the arm.
+#   ARM_APP_DIRS            Test seam / override for the colon-separated list
+#                           of directories arm-time app resolution searches
+#                           for "<ARM_TERMINAL_APP resolved name>.app" (macOS
+#                           crontab arms only). Default:
+#                           /Applications:/Applications/Utilities:/System/Applications:/System/Applications/Utilities:$HOME/Applications
+#                           (the last entry is where an operator's own
+#                           user-installed iTerm typically lives). A miss
+#                           WARNs and falls back to Terminal, same as an
+#                           unknown ARM_TERMINAL_APP.
 #
 # Exit codes:
 #   0  scheduler armed (or printed under --dry-run)
 #   1  usage / input error
-#   2  required tool missing or env unusable (no schtasks/at/crontab;
-#      no platform match; dedup-check tool itself errored — fail-closed
-#      rather than risk a duplicate)
+#   2  required tool missing or env unusable (no schtasks/at/crontab; no
+#      `claude` on PATH at arm time for a POSIX crontab arm; no platform
+#      match; dedup-check tool itself errored — fail-closed rather than
+#      risk a duplicate)
 #   3  dedup block — a same-handover HIMMEL-Resume job exists (or, under
 #      --dedup-any, any HIMMEL-Resume job exists); pass --force to replace
 #   4  scheduler invocation failed (job NOT armed; stderr above)
@@ -2249,7 +2273,11 @@ _infer_ticket() {
     # identity comes from its PARENT DIR (src-4), never its own H1.
     _stem=$(basename "${_ho//\\//}"); _stem="${_stem%.md}"
     if ! printf '%s' "$_stem" | grep -qE '^next-session-[0-9]+$'; then
-        _raw=$(sed -n '/^# /{p;q}' "$_ho")
+        # `{p;q;}` (trailing `;` before the closing brace) is required for
+        # BSD sed (macOS): GNU accepts `{p;q}` but BSD rejects it with
+        # "extra characters at the end of q command", so this silently
+        # yielded no ticket on macOS before this fix.
+        _raw=$(sed -n '/^# /{p;q;}' "$_ho")
         _raw=$(printf '%s\n' "$_raw" | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | head -1) || true
         _key=$(_validate_key "$_raw")
         if [ -n "$_key" ]; then printf '%s' "$_key"; return 0; fi
@@ -4415,14 +4443,32 @@ fi
 # globals RESUME_TIME/RESUME_PROMPT/RESUME_CWD/CHANNELS/TASK_NAME/DRY_RUN only.
 # A `return 0` here (dry-run) returns to the schedule_arm case, which then ends
 # and returns 0 — equivalent to the pre-extraction inline `return 0`.
+#
+# arm-resume-macos-cron fix: the crontab ENTRY used to inline the whole launch
+# command on one line. That broke three ways on a real macOS box: (1) cron's
+# PATH is the minimal /usr/bin:/bin, so a bare `claude` (installed under
+# ~/.local/bin) is "command not found"; (2) macOS/Vixie cron truncates a
+# crontab command at ~1000 bytes (MAX_COMMAND) and a real entry runs
+# 1400-1600 -- past that cap `/bin/sh -c` chokes with "unexpected EOF" and,
+# because the self-clean line is part of the truncated text, the entry never
+# self-removes either (it just re-fires daily); (3) cron gives no TTY, so
+# even a complete entry launched claude headless and invisible. The fix:
+# install a tiny FIXED-SHAPE crontab line (`/bin/sh <runner> # <TASK_NAME>`,
+# always well under the cap) that execs a generated runner FILE carrying the
+# real launch body, with claude resolved to an absolute path at arm time
+# (same shape as the Windows branch's claude_cmd_posix / the HEADROOM_CURL
+# resolution above), and on macOS opens that body in a real terminal window
+# (see ARM_TERMINAL_APP below) so the relaunch runs on a real tty.
 _crontab_schedule() {
     # crontab fallback — crontab entries are RECURRING, so the
     # entry SELF-REMOVES as its first action (the cron analogue of
     # the schtasks .bat self-/delete above): it rewrites the
     # crontab without its own marker line before running cd+claude,
-    # turning the recurring entry into a one-shot. The running
-    # /bin/sh -c continues after the rewrite, so claude still
-    # launches. The marker match is ANCHORED at end-of-line
+    # turning the recurring entry into a one-shot. This now happens
+    # INSIDE the runner file rather than on the crontab line itself
+    # (see the runner-file comment above), but the running /bin/sh
+    # still continues past the rewrite, so claude still launches.
+    # The marker match is ANCHORED at end-of-line
     # (grep -vE '# <TASK_NAME>$'), mirroring the dedup detector's
     # crontab branch in list_existing so a sibling slot whose
     # TASK_NAME is a strict PREFIX of this one is not cross-matched
@@ -4432,55 +4478,60 @@ _crontab_schedule() {
     # entry RECURRING (a daily relaunch loop) while we told the
     # operator it is one-shot, so let cron surface the failure
     # (mail/log) — the manual-prune hint printed below is the
-    # backstop. printf '%q' shell-quotes the prompt so cron's
-    # /bin/sh -c can't re-interpret $/backticks/etc in a handover
+    # backstop. printf '%q' shell-quotes the prompt so the runner's
+    # own /bin/sh can't re-interpret $/backticks/etc in a handover
     # path.
     local hh="${RESUME_TIME%:*}" mm="${RESUME_TIME#*:}"
     local q_prompt q_cwd q_channels="" q_name="" q_model="" q_autocompact=""
-    # HIMMEL-2199: \%-escape AFTER %q-quoting, same shape as q_model below --
-    # a handover path, cwd, or prompt containing % otherwise survives %q
-    # untouched and crontab (unlike /bin/sh) reads an unescaped % as
-    # end-of-command + stdin, silently truncating the entry at fire time.
-    # q_cwd needs it too (CR round on this ticket): it sits in the SAME
-    # `cd $q_cwd && ...` entry as q_prompt/q_channels, so a % anywhere in
-    # RESUME_CWD (the git-toplevel-derived working directory) truncates the
-    # entry exactly like an unescaped prompt/channels would. q_name is
-    # exempt: SESSION_NAME only ever comes from _compose_arm_name(), whose
-    # "title" surface sanitizes to [A-Za-z0-9._ -], which cannot contain %.
+    # arm-resume-macos-cron fix: the \%-escape HIMMEL-2199/2192 added here no
+    # longer applies -- it existed ONLY because these values sat on the
+    # crontab LINE itself, and crontab (unlike /bin/sh) reads a bare % as
+    # end-of-command + stdin. Now they land in the RUNNER FILE, which is
+    # parsed by /bin/sh, not cron, so a literal % is just a literal %; %q
+    # already gives the runner's /bin/sh everything it needs. The \%-escape
+    # moves to q_runner below, the one value that still sits on the crontab
+    # line.
     q_prompt=$(printf '%q' "$RESUME_PROMPT")
-    q_prompt=${q_prompt//%/\\%}
     q_cwd=$(printf '%q' "$RESUME_CWD")
-    q_cwd=${q_cwd//%/\\%}
-    [ -n "$CHANNELS" ] && q_channels="--channels $(printf '%q' "$CHANNELS") " && q_channels=${q_channels//%/\\%}
+    [ -n "$CHANNELS" ] && q_channels="--channels $(printf '%q' "$CHANNELS") "
     # -n <session name> (HIMMEL-702): %q-quote so a space in "<TICKET> <name>"
     # stays ONE arg through the /bin/sh re-parse at fire time. Empty -> omit.
     [ -n "$SESSION_NAME" ] && q_name="-n $(printf '%q' "$SESSION_NAME") "
     # Optional --model passthrough (HIMMEL-2192), same %q-quote shape as
-    # --channels above. %q leaves a literal % untouched, and crontab (unlike
-    # /bin/sh) treats an unescaped % as end-of-command + stdin even inside
-    # shell quoting -- so `\%`-escape AFTER %q-quoting to survive crontab's
-    # own parse before /bin/sh ever sees the line.
-    [ -n "$MODEL" ] && q_model="--model $(printf '%q' "$MODEL") " && q_model=${q_model//%/\\%}
+    # --channels above.
+    [ -n "$MODEL" ] && q_model="--model $(printf '%q' "$MODEL") "
     # --autocompact passthrough (HIMMEL-2658): always non-empty by the time
     # this runs (resolved unconditionally alongside CONTEXT_MODE above) --
-    # same %q-quote + \%-escape shape as q_model, since this is the actual
-    # cost-driving lever and a skipped site here is a silent no-op on this
-    # platform.
-    q_autocompact="--autocompact $(printf '%q' "$AUTOCOMPACT") " && q_autocompact=${q_autocompact//%/\\%}
-    local self_clean="crontab -l 2>/dev/null | grep -vE '# ${TASK_NAME}\$' | crontab -;"
-    # HIMMEL_HEADROOM_PROXY (HIMMEL-901): a crontab entry is ONE line, so the
-    # livez-check-then-launch logic (same shape as the `at` branch's
-    # $launch_lines) has to be a single ';'-joined compound wrapped in its
-    # own `{ ; }` group — `cd ... && { ...; }` keeps `cd` a hard gate (plain
-    # `&&`/`||` chaining without the group would let a failed cd fall
-    # through into starting the proxy, since `&&`/`||` are left-associative
-    # at equal precedence). Inactive -> $tail is byte-identical to the
-    # pre-901 line (zero behavior change).
+    # same %q-quote shape as q_model, since this is the actual cost-driving
+    # lever and a skipped site here is a silent no-op on this platform.
+    q_autocompact="--autocompact $(printf '%q' "$AUTOCOMPACT") "
+
+    # Resolve claude ONCE at arm time to an ABSOLUTE path (arm-resume-macos-cron
+    # fix, bug 1): cron's own minimal PATH never sees ~/.local/bin, so a bare
+    # `claude` in the runner is a guaranteed silent no-op at fire time. Same
+    # arm-time-resolve-or-refuse shape as the Windows branch's claude_cmd_posix
+    # a few hundred lines down -- fail the arm now (rc=2) rather than install
+    # an entry that can never fire.
+    local claude_bin q_claude
+    if ! claude_bin=$(command -v claude 2>/dev/null) || [ -z "$claude_bin" ]; then
+        echo "ERR arm-resume: 'claude' not on PATH at arm time" >&2
+        exit 2
+    fi
+    q_claude=$(printf '%q' "$claude_bin")
+
+    local self_clean="crontab -l 2>/dev/null | grep -vE '# ${TASK_NAME}\$' | crontab -"
+    # HIMMEL_HEADROOM_PROXY (HIMMEL-901): the livez-check-then-launch logic
+    # (same shape as the `at` branch's $launch_lines) is a single ';'-joined
+    # compound wrapped in its own `{ ; }` group — `cd ... && { ...; }` keeps
+    # `cd` a hard gate (plain `&&`/`||` chaining without the group would let a
+    # failed cd fall through into starting the proxy, since `&&`/`||` are
+    # left-associative at equal precedence). Inactive -> $tail is
+    # byte-identical to the pre-901 line (zero behavior change).
     # CR round: absolute curl path ($q_curl) + one mode-marker echo per
     # branch (HIMMEL-897 trail). The marker uses `echo "\$(date) ..."`, NOT
-    # printf: cron treats an unescaped % in the command as end-of-command +
-    # stdin, so a printf format string would truncate the entry. `\$(date)`
-    # lands literally and evaluates at fire time.
+    # printf, kept from the pre-runner-file shape even though the % hazard
+    # that motivated it no longer applies inside a runner file -- `\$(date)`
+    # still needs to land literally and evaluate at FIRE time, not arm time.
     local q_automerge=""
     [ "$AUTOMERGE" -eq 1 ] && q_automerge="ARMAUTOMERGE=1 CR_MERGE_GATE_OK=1 "
     # HIMMEL-1382 fix round: unset both vars unconditionally before the
@@ -4509,14 +4560,18 @@ _crontab_schedule() {
     # the relaunched claude PROCESS's own environ otherwise still carried the
     # ARMING session's stale id, misleading anyone inspecting
     # /proc/<claude pid>/environ, exactly the surface this ticket taught
-    # people to check.
-    local tail="unset ARMAUTOMERGE CR_MERGE_GATE_OK ARM_RESUME_SAFETY_ARM CLAUDE_CODE_CHILD_SESSION CLAUDE_PID CLAUDE_CODE_SESSION_ID && export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 && ${q_automerge}claude ${q_name}$q_prompt $q_channels$q_model$q_autocompact"
+    # people to check. HIMMEL_ARMED_RELAUNCH=1 is a fresh always-set grant
+    # (arm-resume-macos-cron fix, item C): it lets the resumed session know it
+    # IS a POSIX armed relaunch, so it can self-exit with SIGTERM once its
+    # work is done and a successor (if any) is armed -- see
+    # docs/handover/overnight-mode.md's Launch preamble.
+    local tail="unset ARMAUTOMERGE CR_MERGE_GATE_OK ARM_RESUME_SAFETY_ARM CLAUDE_CODE_CHILD_SESSION CLAUDE_PID CLAUDE_CODE_SESSION_ID && export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 HIMMEL_ARMED_RELAUNCH=1 && ${q_automerge}${q_claude} ${q_name}$q_prompt $q_channels$q_model$q_autocompact"
     if [ "$HEADROOM_PROXY_ACTIVE" -eq 1 ]; then
         local q_hb q_log q_curl
         q_hb=$(printf '%q' "$HEADROOM_BIN")
         q_log=$(printf '%q' "$HOME/.headroom-proxy.log")
         q_curl=$(printf '%q' "$HEADROOM_CURL")
-        tail="{ unset ARMAUTOMERGE CR_MERGE_GATE_OK ARM_RESUME_SAFETY_ARM CLAUDE_CODE_CHILD_SESSION CLAUDE_PID CLAUDE_CODE_SESSION_ID; export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; $q_curl -s -m 5 http://127.0.0.1:$HEADROOM_PROXY_PORT/livez >/dev/null 2>&1 || { $q_hb proxy --port $HEADROOM_PROXY_PORT >> $q_log 2>&1 & sleep 3; }; if $q_curl -s -m 5 http://127.0.0.1:$HEADROOM_PROXY_PORT/livez >/dev/null 2>&1; then echo \"\$(date) arm=$TASK_NAME mode=proxied\" >> $q_log; ANTHROPIC_BASE_URL=http://127.0.0.1:$HEADROOM_PROXY_PORT HEADROOM_OFFLINE=1 ${q_automerge}claude ${q_name}$q_prompt $q_channels$q_model$q_autocompact; else echo \"\$(date) arm=$TASK_NAME mode=bare-fallback\" >> $q_log; ${q_automerge}claude ${q_name}$q_prompt $q_channels$q_model$q_autocompact; fi; }"
+        tail="{ unset ARMAUTOMERGE CR_MERGE_GATE_OK ARM_RESUME_SAFETY_ARM CLAUDE_CODE_CHILD_SESSION CLAUDE_PID CLAUDE_CODE_SESSION_ID; export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 HIMMEL_ARMED_RELAUNCH=1; $q_curl -s -m 5 http://127.0.0.1:$HEADROOM_PROXY_PORT/livez >/dev/null 2>&1 || { $q_hb proxy --port $HEADROOM_PROXY_PORT >> $q_log 2>&1 & sleep 3; }; if $q_curl -s -m 5 http://127.0.0.1:$HEADROOM_PROXY_PORT/livez >/dev/null 2>&1; then echo \"\$(date) arm=$TASK_NAME mode=proxied\" >> $q_log; ANTHROPIC_BASE_URL=http://127.0.0.1:$HEADROOM_PROXY_PORT HEADROOM_OFFLINE=1 ${q_automerge}${q_claude} ${q_name}$q_prompt $q_channels$q_model$q_autocompact; else echo \"\$(date) arm=$TASK_NAME mode=bare-fallback\" >> $q_log; ${q_automerge}${q_claude} ${q_name}$q_prompt $q_channels$q_model$q_autocompact; fi; }"
     fi
     _arm_require_leg_autocompact_argv "$tail"
     local q_flow_lib q_task q_note
@@ -4532,13 +4587,169 @@ _crontab_schedule() {
     # be governed by its own text, not by whatever env cron hands it.
     local q_safety_child="unset AUTO_ARM_SAFETY_CHILD && "
     [ "$SAFETY_CHILD" -eq 1 ] && q_safety_child="export AUTO_ARM_SAFETY_CHILD=1 && "
-    local entry="$mm $hh * * * $self_clean cd $q_cwd && ${q_safety_child}$tail # $TASK_NAME"
+    # launch_body is exactly what used to follow the self-clean on the old
+    # one-line crontab entry -- now it lands in a runner file (headless) or a
+    # .command file (macOS headed launch) instead of on the crontab line.
+    local launch_body="cd $q_cwd && ${q_safety_child}$tail"
+
+    # Runner dir + arm-time PATH snapshot (arm-resume-macos-cron fix, item A).
+    # ARM_RUNNER_DIR is the test seam (default: a real per-operator dir under
+    # $HOME, mirroring ~/.claude/handover's other state). Every bare-name tool
+    # the runner still invokes (crontab, grep, open, and anything
+    # flow-run-ledger.sh itself shells out to) is resolved from THIS snapshot,
+    # not cron's own minimal PATH -- same idea as pipeline-cadence.sh's
+    # runner_path_snapshot/emit_runner PATH stamp, reimplemented here rather
+    # than sourced since that file's cadence-runner shape (log rotation, leg
+    # gates) does not apply to arm-resume.
+    local runner_dir
+    runner_dir="${ARM_RUNNER_DIR:-$HOME/.claude/handover/arm-runners}"
+    local runner_path="$runner_dir/$TASK_NAME.sh"
+    # node-dir fold-in (mirrors pipeline-cadence.sh's runner_path_snapshot,
+    # ~:1740-1760, reimplemented inline rather than sourced -- see the comment
+    # above): an npm-installed `claude` is a node shim, so a PATH snapshot that
+    # resolves `claude` but omits node's own directory can still fail at fire
+    # time the moment that shim execs node. Folded in ONLY when node resolves
+    # AND its directory is not already somewhere in PATH (matching
+    # runner_path_snapshot's own guard) -- prepending an already-present dir
+    # would just duplicate it harmlessly, but the guard keeps this identical
+    # in shape to the function it mirrors.
+    local _snap_path="$PATH" _node_bin _node_dir
+    if _node_bin=$(command -v node 2>/dev/null) && [ -n "$_node_bin" ]; then
+        _node_dir=$(dirname "$_node_bin")
+        case ":$PATH:" in
+            *":$_node_dir:"*) ;;
+            *) _snap_path="$_node_dir:$PATH" ;;
+        esac
+    fi
+    local q_path
+    q_path=$(printf '%q' "$_snap_path")
+
+    # Headed launch on macOS (arm-resume-macos-cron fix, item B): cron gives
+    # no TTY, so even a complete/resolvable launch line starts claude headless
+    # and invisible -- the operator wants armed sessions HEADED on macOS
+    # (parity with the Windows branch, where schtasks opens a console window).
+    # Resolved HERE, at arm time, so a bad ARM_TERMINAL_APP or a missing app
+    # is caught before the entry is even installed. ARM_TERMINAL_APP=none
+    # opts out to a headless inline launch -- the same shape the Linux
+    # crontab fallback always uses (no TTY story to fix there; `at` owns
+    # Linux's normal one-shot path and is unaffected).
+    local term_app="" command_path="" q_commandfile=""
+    if [ "$PLATFORM" = macos ] && [ "${ARM_TERMINAL_APP:-}" != "none" ]; then
+        if [ -n "${ARM_TERMINAL_APP:-}" ]; then
+            term_app="$ARM_TERMINAL_APP"
+        else
+            case "${TERM_PROGRAM:-}" in
+                iTerm.app)      term_app="iTerm" ;;
+                Apple_Terminal) term_app="Terminal" ;;
+                *)              term_app="Terminal" ;;
+            esac
+        fi
+        # Existence probe: does <term_app>.app live under one of ARM_APP_DIRS
+        # (defaulting to the standard app locations, incl. $HOME/Applications
+        # where an operator's own user-installed iTerm typically lives)? A
+        # PLAIN filesystem test, not `open -Ra` -- `-R` REVEALS the app in
+        # Finder as a side effect (opens a real Finder window) on every macOS
+        # arm and every test run that exercises this branch, which is not an
+        # acceptable probe. Fail open to Terminal.app (present on every Mac)
+        # rather than refuse the whole arm over a bad app name.
+        local _app_dirs="${ARM_APP_DIRS:-/Applications:/Applications/Utilities:/System/Applications:/System/Applications/Utilities:$HOME/Applications}"
+        local _app_found=0 _app_dir _IFS_SAVE="$IFS"
+        IFS=:
+        for _app_dir in $_app_dirs; do
+            [ -n "$_app_dir" ] || continue
+            [ -d "$_app_dir/$term_app.app" ] && { _app_found=1; break; }
+        done
+        IFS="$_IFS_SAVE"
+        if [ "$_app_found" -ne 1 ]; then
+            echo "WARN arm-resume: terminal app '$term_app' not found under ARM_APP_DIRS; falling back to Terminal" >&2
+            term_app="Terminal"
+        fi
+        command_path="$runner_dir/$TASK_NAME.command"
+        q_commandfile=$(printf '%q' "$command_path")
+    fi
+
+    local runner_body command_body=""
+    if [ -n "$term_app" ]; then
+        local q_term
+        q_term=$(printf '%q' "$term_app")
+        # The runner's job is just: clean up the crontab entry, then hand the
+        # actual launch off to a real terminal window. `open -a` failing (app
+        # uninstalled/renamed between arm and fire time) must be LOUD -- print
+        # to stderr and exit non-zero so cron mail actually shows it, rather
+        # than the entry silently self-cleaning with nothing ever launched.
+        # The ERR line uses $q_term/$q_commandfile (already %q-quoted, same as
+        # the `open -a` line above) as bare, UNQUOTED words -- not interpolated
+        # raw ($term_app/$command_path) inside a double-quoted string, which
+        # would let a literal ", $, or backtick in $HOME/the app name break out
+        # of the intended quoting or get re-evaluated by the runner's /bin/sh.
+        runner_body="#!/bin/sh
+# generated by arm-resume.sh -- crontab runner for $TASK_NAME
+# Headed launch: cron has no TTY, so this opens a real terminal window.
+# Needs the user logged into the GUI and the Mac awake at fire time -- cron
+# skips minutes missed during sleep. ARM_TERMINAL_APP=none opts out.
+PATH=$q_path; export PATH
+$self_clean
+if ! open -a $q_term $q_commandfile; then
+    echo ERR arm-resume: open -a $q_term $q_commandfile failed >&2
+    exit 1
+fi"
+        command_body="#!/bin/sh
+# generated by arm-resume.sh -- headed launch body for $TASK_NAME
+PATH=$q_path; export PATH
+$launch_body"
+    else
+        runner_body="#!/bin/sh
+# generated by arm-resume.sh -- crontab runner for $TASK_NAME
+PATH=$q_path; export PATH
+$self_clean
+$launch_body"
+    fi
+
+    # The crontab LINE itself now carries only a FIXED-SHAPE `/bin/sh
+    # <runner> # <TASK_NAME>` command, always far under macOS/Vixie cron's
+    # ~1000-byte MAX_COMMAND cap (bug 2) regardless of how long the handover
+    # path/prompt/cwd get -- those live in the runner file instead, which cron
+    # never parses. q_runner is the ONE value still on the crontab line, so
+    # it's the one value that still needs the \%-escape: crontab (unlike
+    # /bin/sh) reads a bare % as end-of-command + stdin even inside %q
+    # quoting. TASK_NAME itself is sanitized to [:alnum:]_- (no %), so only a
+    # %-bearing ARM_RUNNER_DIR/$HOME could ever trigger this.
+    local q_runner
+    q_runner=$(printf '%q' "$runner_path")
+    q_runner=${q_runner//%/\\%}
+    local entry="$mm $hh * * * /bin/sh $q_runner # $TASK_NAME"
+
     if [ "$DRY_RUN" -eq 1 ]; then
         echo "DRY arm-resume: would add crontab entry:"
         echo "    $entry"
+        echo "DRY arm-resume: runner ($runner_path):"
+        printf '%s\n' "$runner_body" | sed 's/^/    /'
+        if [ -n "$command_body" ]; then
+            echo "DRY arm-resume: command file ($command_path):"
+            printf '%s\n' "$command_body" | sed 's/^/    /'
+        fi
         echo "DRY arm-resume: NOTE: entry self-removes on first fire (one-shot)."
         return 0
     fi
+
+    mkdir -p "$runner_dir" || {
+        echo "ERR arm-resume: failed to create runner dir $runner_dir" >&2
+        exit 4
+    }
+    chmod 700 "$runner_dir" 2>/dev/null || true
+    printf '%s\n' "$runner_body" > "$runner_path" || {
+        echo "ERR arm-resume: failed to write runner $runner_path" >&2
+        exit 4
+    }
+    chmod 700 "$runner_path"
+    if [ -n "$command_body" ]; then
+        printf '%s\n' "$command_body" > "$command_path" || {
+            echo "ERR arm-resume: failed to write command file $command_path" >&2
+            exit 4
+        }
+        chmod 700 "$command_path"
+    fi
+
     local snap
     snap=$(mktemp -t crontab.snap.XXXXXX)
     if ! crontab -l > "$snap" 2>/dev/null; then
@@ -5471,8 +5682,13 @@ schedule_arm() {
                 # carried the ARMING session's stale id, misleading anyone inspecting
                 # /proc/<claude pid>/environ, exactly the surface this ticket taught
                 # people to check.
+                # HIMMEL_ARMED_RELAUNCH=1 (arm-resume-macos-cron fix, item C):
+                # always-set grant, same shape/rationale as the crontab
+                # runner's twin -- lets the resumed session self-exit with
+                # SIGTERM once its work is done and a successor is armed
+                # (docs/handover/overnight-mode.md's Launch preamble).
                 local launch_lines="unset ARMAUTOMERGE CR_MERGE_GATE_OK ARM_RESUME_SAFETY_ARM CLAUDE_CODE_CHILD_SESSION CLAUDE_PID CLAUDE_CODE_SESSION_ID
-export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1
+export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 HIMMEL_ARMED_RELAUNCH=1
 ${q_automerge}claude ${q_name}$q_prompt $q_channels$q_model$q_autocompact"
                 if [ "$HEADROOM_PROXY_ACTIVE" -eq 1 ]; then
                     local q_hb q_log q_curl
@@ -5480,7 +5696,7 @@ ${q_automerge}claude ${q_name}$q_prompt $q_channels$q_model$q_autocompact"
                     q_log=$(printf '%q' "$HOME/.headroom-proxy.log")
                     q_curl=$(printf '%q' "$HEADROOM_CURL")
                     launch_lines="unset ARMAUTOMERGE CR_MERGE_GATE_OK ARM_RESUME_SAFETY_ARM CLAUDE_CODE_CHILD_SESSION CLAUDE_PID CLAUDE_CODE_SESSION_ID
-export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1
+export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 HIMMEL_ARMED_RELAUNCH=1
 $q_curl -s -m 5 http://127.0.0.1:$HEADROOM_PROXY_PORT/livez >/dev/null 2>&1 || { $q_hb proxy --port $HEADROOM_PROXY_PORT >> $q_log 2>&1 & sleep 3; }
 if $q_curl -s -m 5 http://127.0.0.1:$HEADROOM_PROXY_PORT/livez >/dev/null 2>&1; then
     echo \"\$(date) arm=$TASK_NAME mode=proxied\" >> $q_log

@@ -42,6 +42,11 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/arm-resume-context.XXXXXX") || {
     exit 1
 }
 trap 'rm -rf "$TMP"' EXIT
+# arm-resume-macos-cron fix (round 2): real arms take the macOS/crontab
+# backend on this Mac and write generated runner files under
+# ${ARM_RUNNER_DIR:-$HOME/.claude/handover/arm-runners} -- redirect to a
+# throwaway dir so this suite never writes into the operator's real $HOME.
+export ARM_RUNNER_DIR="$TMP/arm-runners"
 
 # ---------------------------------------------------------------------------
 # Hermetic shields — copied verbatim from test-arm-resume-tier.sh's own

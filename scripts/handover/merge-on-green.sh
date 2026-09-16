@@ -1096,6 +1096,65 @@ record_after_report_pending_marker() {
     return 0
 }
 
+# HIMMEL-374: best-effort Jira auto-transition on merge — structural fix for
+# backlog drift (a ticket left open after its work landed), rather than
+# relying on the periodic reconciler to catch it later. Never fails the
+# merge: every step degrades to a skip/failed result recorded on the audit
+# line, not a non-zero return from this function. Reads the ticket key from
+# the PR title's `[PROJ-N]` tag (conventional-commit convention enforced by
+# check-commit-msg) and the target status from reconcile-config.json, so
+# this and `reconcile-backlog.mjs` share one source of truth for "what
+# status does a closed ticket move to" per project.
+jira_auto_transition_on_merge() {
+    local nwo="$1" pr_num="$2" pr_sha="$3"
+    JIRA_AUTO_TRANSITION_RESULT="not-attempted"
+
+    local title
+    title=$("$GH" pr view "$pr_num" --repo "$nwo" --json title -q .title 2>/dev/null) \
+        || { JIRA_AUTO_TRANSITION_RESULT="skip=no-title"; return 0; }
+
+    local key
+    key=$(printf '%s' "$title" | grep -oE '\[[A-Za-z]+-[0-9]+\]' | head -1 | tr -d '[]')
+    [ -n "$key" ] || { JIRA_AUTO_TRANSITION_RESULT="skip=no-ticket-tag"; return 0; }
+
+    local repo_root
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null) \
+        || { JIRA_AUTO_TRANSITION_RESULT="skip=no-repo-root key=$key"; return 0; }
+    [ -f "$repo_root/scripts/jira/dist/index.js" ] \
+        || { JIRA_AUTO_TRANSITION_RESULT="skip=no-jira-cli-build key=$key"; return 0; }
+
+    local project="${key%-*}"
+    local config_path="$repo_root/scripts/jira/reconcile-config.json"
+    [ -f "$config_path" ] || { JIRA_AUTO_TRANSITION_RESULT="skip=no-config key=$key"; return 0; }
+    local target_status
+    target_status=$(node -e '
+        try {
+            const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+            const t = c[process.argv[2]] && c[process.argv[2]].targetStatus;
+            if (t) process.stdout.write(t);
+        } catch {}
+    ' "$config_path" "$project" 2>/dev/null)
+    [ -n "$target_status" ] || { JIRA_AUTO_TRANSITION_RESULT="skip=no-project-config key=$key project=$project"; return 0; }
+
+    local comment_tmp
+    comment_tmp=$(mktemp) || { JIRA_AUTO_TRANSITION_RESULT="skip=no-tmpfile key=$key"; return 0; }
+    printf 'Auto-transitioned by scripts/handover/merge-on-green.sh on merge of PR #%s (%s) @ %s.\n' \
+        "$pr_num" "$nwo" "$pr_sha" >"$comment_tmp"
+    ( cd "$repo_root" && node scripts/jira/dist/index.js comment "$key" --comment-file "$comment_tmp" ) \
+        >/dev/null 2>&1
+    rm -f "$comment_tmp"
+
+    local transition_out transition_rc=0
+    transition_out=$(cd "$repo_root" && node scripts/jira/dist/index.js transition "$key" "$target_status" 2>&1) \
+        || transition_rc=$?
+    if [ "$transition_rc" -eq 0 ]; then
+        JIRA_AUTO_TRANSITION_RESULT="ok key=$key status=$target_status"
+    else
+        JIRA_AUTO_TRANSITION_RESULT="failed key=$key status=$target_status rc=$transition_rc out=${transition_out//$'\n'/ }"
+    fi
+    return 0
+}
+
 # The merge is pinned to the same resolved identity. No --delete-branch
 # (HIMMEL-1679): every branch here is worktree-held, so gh's local-branch
 # delete failed on every real merge and turned a landed merge into a
@@ -1158,7 +1217,8 @@ if [ "$merge_rc" -ne 0 ]; then
     if [ "$post_state" = "MERGED" ]; then
         prune_merged_worktree "$head_branch" "$sha"
         record_after_report_pending_marker "$head_branch" "$pr_num" "$sha"
-        audit "MERGED repo=$nwo pr=#$pr_num sha=$sha gate=check-ci:0 gh-exit=$merge_rc prune=$PRUNE_RESULT branch=$PRUNE_BRANCH marker=$MARKER_RESULT after-report=$AFTER_REPORT_RESULT cr=$CR_STATE"
+        jira_auto_transition_on_merge "$nwo" "$pr_num" "$sha"
+        audit "MERGED repo=$nwo pr=#$pr_num sha=$sha gate=check-ci:0 gh-exit=$merge_rc prune=$PRUNE_RESULT branch=$PRUNE_BRANCH marker=$MARKER_RESULT after-report=$AFTER_REPORT_RESULT cr=$CR_STATE jira-transition=$JIRA_AUTO_TRANSITION_RESULT"
         echo "merge-on-green: merged PR #$pr_num @ $sha (repo $nwo, squash); MERGED at the certified sha/base although gh exited $merge_rc: ${merge_out:-<no output>}"
         exit 0
     fi
@@ -1231,7 +1291,8 @@ if [ "$merge_rc" -eq 0 ]; then
     if [ "$final_state" = "MERGED" ]; then
         prune_merged_worktree "$head_branch" "$sha"
         record_after_report_pending_marker "$head_branch" "$pr_num" "$sha"
-        audit "MERGED repo=$nwo pr=#$pr_num sha=$sha gate=check-ci:0 prune=$PRUNE_RESULT branch=$PRUNE_BRANCH marker=$MARKER_RESULT after-report=$AFTER_REPORT_RESULT cr=$CR_STATE"
+        jira_auto_transition_on_merge "$nwo" "$pr_num" "$sha"
+        audit "MERGED repo=$nwo pr=#$pr_num sha=$sha gate=check-ci:0 prune=$PRUNE_RESULT branch=$PRUNE_BRANCH marker=$MARKER_RESULT after-report=$AFTER_REPORT_RESULT cr=$CR_STATE jira-transition=$JIRA_AUTO_TRANSITION_RESULT"
         echo "merge-on-green: merged PR #$pr_num @ $sha (repo $nwo, squash). ${merge_out:-}"
         exit 0
     fi

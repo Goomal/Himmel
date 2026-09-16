@@ -131,9 +131,12 @@ export function loadCommits(commitsFile) {
 
 async function loadBacklog({ jiraCli, project, limit }) {
   const distDir = dirname(jiraCli);
-  const { searchAllIssues } = await import(join(distDir, 'commands', 'list.js'));
-  const { request } = await import(join(distDir, 'client.js'));
-  const jql = `project=${project} AND status in ("To Do","In Progress","In Review") ORDER BY created ASC`;
+  const { searchAllIssues } = await import(pathToFileURL(join(distDir, 'commands', 'list.js')).href);
+  const { request } = await import(pathToFileURL(join(distDir, 'client.js')).href);
+  // statusCategory (not a hardcoded open-status allow-list) so a project-specific
+  // status like this backlog's own "Backlog" isn't silently excluded from
+  // reconciliation just because it wasn't named here.
+  const jql = `project=${project} AND statusCategory != Done ORDER BY created ASC`;
   const issues = await searchAllIssues(jql, limit, request);
   return issues.map((issue) => ({
     key: issue.key,
@@ -150,8 +153,8 @@ async function loadBacklog({ jiraCli, project, limit }) {
 // ticket.
 async function loadCommentBodies({ jiraCli, key }) {
   const distDir = dirname(jiraCli);
-  const { request } = await import(join(distDir, 'client.js'));
-  const { adfToPlainText } = await import(join(distDir, 'adf-render.js'));
+  const { request } = await import(pathToFileURL(join(distDir, 'client.js')).href);
+  const { adfToPlainText } = await import(pathToFileURL(join(distDir, 'adf-render.js')).href);
   const bodies = [];
   let startAt = 0;
   for (;;) {
@@ -166,8 +169,8 @@ async function loadCommentBodies({ jiraCli, key }) {
 
 async function loadDescription({ jiraCli, key }) {
   const distDir = dirname(jiraCli);
-  const { request } = await import(join(distDir, 'client.js'));
-  const { adfToPlainText } = await import(join(distDir, 'adf-render.js'));
+  const { request } = await import(pathToFileURL(join(distDir, 'client.js')).href);
+  const { adfToPlainText } = await import(pathToFileURL(join(distDir, 'adf-render.js')).href);
   const issue = await request('GET', `/issue/${key}?fields=description`);
   return adfToPlainText(issue.fields?.description) ?? '';
 }
@@ -206,6 +209,7 @@ async function main() {
 
   const counts = { CLOSE: 0, RESCOPE: 0, 'STALE-PREMISE': 0, LEAVE: 0 };
   const acted = [];
+  let failed = 0;
 
   for (const ticket of backlog) {
     if (opts.only && !opts.only.has(ticket.key)) continue;
@@ -263,6 +267,7 @@ async function main() {
           // the whole backlog run — every other candidate still needs its
           // own disposition recorded.
           record.applied = 'failed';
+          failed += 1;
           process.stderr.write(`reconcile-backlog: ${ticket.key} apply failed: ${err.message}\n`);
         }
       }
@@ -278,8 +283,13 @@ async function main() {
       total: backlog.length,
       counts,
       acted: acted.length,
+      failed,
     }),
   );
+
+  // A run where every apply attempt failed must not report success —
+  // automation watching only the exit code needs a non-zero signal here.
+  if (failed > 0) process.exitCode = 1;
 }
 
 // Guarded so vitest can import the pure helpers above (parseArgs, loadConfig,

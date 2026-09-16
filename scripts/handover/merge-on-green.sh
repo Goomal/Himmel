@@ -1137,7 +1137,7 @@ jira_auto_transition_on_merge() {
     [ -n "$target_status" ] || { JIRA_AUTO_TRANSITION_RESULT="skip=no-project-config key=$key project=$project"; return 0; }
 
     local comment_tmp
-    comment_tmp=$(mktemp) || { JIRA_AUTO_TRANSITION_RESULT="skip=no-tmpfile key=$key"; return 0; }
+    comment_tmp=$(mktemp "${TMPDIR:-/tmp}/merge-on-green-jira-comment.XXXXXX") || { JIRA_AUTO_TRANSITION_RESULT="skip=no-tmpfile key=$key"; return 0; }
     printf 'Auto-transitioned by scripts/handover/merge-on-green.sh on merge of PR #%s (%s) @ %s.\n' \
         "$pr_num" "$nwo" "$pr_sha" >"$comment_tmp"
     ( cd "$repo_root" && node scripts/jira/dist/index.js comment "$key" --comment-file "$comment_tmp" ) \

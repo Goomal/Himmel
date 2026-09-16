@@ -260,7 +260,7 @@ jira_auto_transition_on_merge() {
     ' "$config_path" "$project" 2>/dev/null)
     [ -n "$target_status" ] || return 0
 
-    comment_tmp=$(mktemp) || return 0
+    comment_tmp=$(mktemp "${TMPDIR:-/tmp}/pr-merge-jira-comment.XXXXXX") || return 0
     printf 'Auto-transitioned by scripts/handover/pr-merge.sh on merge of PR #%s.\n' "$pr" >"$comment_tmp"
     ( cd "$repo_root" && node scripts/jira/dist/index.js comment "$key" --comment-file "$comment_tmp" ) \
         >/dev/null 2>&1 || true

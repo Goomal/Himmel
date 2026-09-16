@@ -111,8 +111,16 @@ describe('loadHygieneKeys', () => {
     expect(loadHygieneKeys(null)).toEqual(new Set());
   });
 
-  it('returns an empty set when the path does not exist', () => {
-    expect(loadHygieneKeys('/nonexistent/hygiene.md')).toEqual(new Set());
+  it('exits 1 when an explicitly-given path does not exist (does not silently treat it as un-swept)', () => {
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {
+      throw new Error('exit');
+    });
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    expect(() => loadHygieneKeys('/nonexistent/hygiene.md')).toThrow('exit');
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('/nonexistent/hygiene.md'));
+    exitSpy.mockRestore();
+    errSpy.mockRestore();
   });
 
   it('extracts ticket keys from every markdown table, including LEFT ALONE rows', () => {

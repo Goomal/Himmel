@@ -1117,8 +1117,10 @@ jira_auto_transition_on_merge() {
     key=$(printf '%s' "$title" | grep -oE '\[[A-Za-z]+-[0-9]+\]' | head -1 | tr -d '[]')
     [ -n "$key" ] || { JIRA_AUTO_TRANSITION_RESULT="skip=no-ticket-tag"; return 0; }
 
-    local repo_root
-    repo_root=$(git rev-parse --show-toplevel 2>/dev/null) \
+    local common repo_root
+    common=$(git rev-parse --git-common-dir 2>/dev/null) \
+        || { JIRA_AUTO_TRANSITION_RESULT="skip=no-repo-root key=$key"; return 0; }
+    repo_root=$(cd "$(dirname "$common")" 2>/dev/null && pwd) \
         || { JIRA_AUTO_TRANSITION_RESULT="skip=no-repo-root key=$key"; return 0; }
     [ -f "$repo_root/scripts/jira/dist/index.js" ] \
         || { JIRA_AUTO_TRANSITION_RESULT="skip=no-jira-cli-build key=$key"; return 0; }
@@ -1138,8 +1140,8 @@ jira_auto_transition_on_merge() {
 
     local comment_tmp
     comment_tmp=$(mktemp "${TMPDIR:-/tmp}/merge-on-green-jira-comment.XXXXXX") || { JIRA_AUTO_TRANSITION_RESULT="skip=no-tmpfile key=$key"; return 0; }
-    printf 'Auto-transitioned by scripts/handover/merge-on-green.sh on merge of PR #%s (%s) @ %s.\n' \
-        "$pr_num" "$nwo" "$pr_sha" >"$comment_tmp"
+    printf 'PR #%s (%s) merged @ %s. scripts/handover/merge-on-green.sh is attempting to auto-transition this ticket to '"'"'%s'"'"'.\n' \
+        "$pr_num" "$nwo" "$pr_sha" "$target_status" >"$comment_tmp"
     ( cd "$repo_root" && node scripts/jira/dist/index.js comment "$key" --comment-file "$comment_tmp" ) \
         >/dev/null 2>&1
     rm -f "$comment_tmp"

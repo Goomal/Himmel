@@ -238,18 +238,25 @@ fi
 jira_auto_transition_on_merge() {
     [ "$forge" = "github" ] || return 0
     local pr="$1" title key project config_path target_status comment_tmp transition_out transition_rc=0
+    local jira_common jira_repo_root
 
     title=$("${GH_CMD:-gh}" pr view "$pr" --json title -q .title 2>/dev/null) || return 0
     key=$(printf '%s' "$title" | grep -oE '\[[A-Za-z]+-[0-9]+\]' | head -1 | tr -d '[]') || true
     [ -n "$key" ] || return 0
 
-    [ -f "$repo_root/scripts/jira/dist/index.js" ] || {
+    # Resolve the PRIMARY checkout, not this process's own (possibly-worktree)
+    # toplevel: scripts/jira/dist/ is an untracked build artifact that only
+    # exists there (project convention — see scripts/jira/CLAUDE.md).
+    jira_common=$(git rev-parse --git-common-dir 2>/dev/null) || return 0
+    jira_repo_root=$(cd "$(dirname "$jira_common")" 2>/dev/null && pwd) || return 0
+
+    [ -f "$jira_repo_root/scripts/jira/dist/index.js" ] || {
         echo "pr-merge: PR #$pr merged but Jira CLI is not built — not auto-transitioning $key." >&2
         return 0
     }
 
     project="${key%-*}"
-    config_path="$repo_root/scripts/jira/reconcile-config.json"
+    config_path="$jira_repo_root/scripts/jira/reconcile-config.json"
     [ -f "$config_path" ] || return 0
     target_status=$(node -e '
         try {
@@ -261,12 +268,13 @@ jira_auto_transition_on_merge() {
     [ -n "$target_status" ] || return 0
 
     comment_tmp=$(mktemp "${TMPDIR:-/tmp}/pr-merge-jira-comment.XXXXXX") || return 0
-    printf 'Auto-transitioned by scripts/handover/pr-merge.sh on merge of PR #%s.\n' "$pr" >"$comment_tmp"
-    ( cd "$repo_root" && node scripts/jira/dist/index.js comment "$key" --comment-file "$comment_tmp" ) \
+    printf 'PR #%s merged. scripts/handover/pr-merge.sh is attempting to auto-transition this ticket to '"'"'%s'"'"'.\n' \
+        "$pr" "$target_status" >"$comment_tmp"
+    ( cd "$jira_repo_root" && node scripts/jira/dist/index.js comment "$key" --comment-file "$comment_tmp" ) \
         >/dev/null 2>&1 || true
     rm -f "$comment_tmp"
 
-    transition_out=$(cd "$repo_root" && node scripts/jira/dist/index.js transition "$key" "$target_status" 2>&1) \
+    transition_out=$(cd "$jira_repo_root" && node scripts/jira/dist/index.js transition "$key" "$target_status" 2>&1) \
         || transition_rc=$?
     if [ "$transition_rc" -ne 0 ]; then
         echo "pr-merge: PR #$pr merged but Jira transition of $key to '$target_status' failed (rc=$transition_rc): ${transition_out//$'\n'/ }" >&2

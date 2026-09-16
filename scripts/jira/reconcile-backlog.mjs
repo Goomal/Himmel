@@ -79,7 +79,11 @@ export function loadConfig(path) {
 // comment at all (the gap this reconciler must not blindly re-close).
 // All of the report's tables share one markdown shape: `| HIMMEL-1234 | ...`.
 export function loadHygieneKeys(path) {
-  if (!path || !existsSync(path)) return new Set();
+  if (!path) return new Set();
+  if (!existsSync(path)) {
+    process.stderr.write(`reconcile-backlog: --hygiene-doc path not found: ${path}\n`);
+    process.exit(1);
+  }
   const text = readFileSync(path, 'utf8');
   const keys = new Set();
   for (const m of text.matchAll(/^\|\s*([A-Za-z]+-\d+)\s*\|/gm)) keys.add(m[1]);
@@ -218,22 +222,23 @@ async function main() {
       reason: result.reason,
       evidence: result.evidence ? { sha: result.evidence.sha, date: result.evidence.date, subject: result.evidence.subject } : null,
     };
-    console.log(JSON.stringify(record));
 
-    if (result.disposition === 'LEAVE') continue;
-
-    acted.push(record);
-    if (opts.apply) {
-      const commentBody = buildEvidenceComment({ key: ticket.key, ...result });
-      const applied = await applyDisposition({
-        key: ticket.key,
-        disposition: result.disposition,
-        targetStatus,
-        commentBody,
-        jiraClient,
-      });
-      record.applied = applied.action;
+    if (result.disposition !== 'LEAVE') {
+      acted.push(record);
+      if (opts.apply) {
+        const commentBody = buildEvidenceComment({ key: ticket.key, ...result });
+        const applied = await applyDisposition({
+          key: ticket.key,
+          disposition: result.disposition,
+          targetStatus,
+          commentBody,
+          jiraClient,
+        });
+        record.applied = applied.action;
+      }
     }
+
+    console.log(JSON.stringify(record));
   }
 
   console.log(

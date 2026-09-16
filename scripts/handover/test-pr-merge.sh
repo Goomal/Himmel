@@ -208,8 +208,16 @@ fi
 case "\$1" in
     */dist/index.js)
         echo "\$*" >> "$jiralog"
+        if [ "\$2" = "get" ]; then
+            printf '{"fields":{"issuetype":{"name":"%s"}}}\n' "\${STUB_JIRA_ISSUE_TYPE:-Task}"
+            exit 0
+        fi
         if [ "\${STUB_JIRA_TRANSITION_FAIL:-0}" = "1" ] && [ "\$2" = "transition" ]; then
             echo "jira transition failed" >&2
+            exit 1
+        fi
+        if [ "\${STUB_JIRA_COMMENT_FAIL:-0}" = "1" ] && [ "\$2" = "comment" ]; then
+            echo "jira comment failed" >&2
             exit 1
         fi
         exit 0
@@ -504,6 +512,23 @@ fi
 if STUB_JIRA_BUILD=1 STUB_JIRA_TRANSITION_FAIL=1 STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" \
     run_case "handover/x-slug" 0 "jira: failed transition does not fail the merge"; then
     assert_err_has "Jira transition of HIMMEL-374" "transition failure is reported on stderr"
+fi
+
+# Never touch Epic/Story (standing project invariant) — the merge hook has no
+# classifyTicket call in its path, so it must check the issue type itself.
+if STUB_JIRA_BUILD=1 STUB_JIRA_ISSUE_TYPE=Epic STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" \
+    run_case "handover/x-slug" 0 "jira: Epic ticket is never transitioned"; then
+    assert_jira_log_lacks "comment" "Epic case makes no jira comment call"
+    assert_jira_log_lacks "transition" "Epic case makes no jira transition call"
+    assert_err_has "never auto-transitioning" "Epic case reports the never-touch skip on stderr"
+fi
+
+# A comment that fails to post leaves no evidence breadcrumb — skip the
+# transition rather than close the ticket silently.
+if STUB_JIRA_BUILD=1 STUB_JIRA_COMMENT_FAIL=1 STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" \
+    run_case "handover/x-slug" 0 "jira: failed comment skips the transition"; then
+    assert_jira_log_lacks "transition" "failed-comment case makes no jira transition call"
+    assert_err_has "not auto-transitioning" "failed-comment case reports the skip on stderr"
 fi
 
 # --- HIMMEL-1977 hermeticity guard (the HIMMEL-1495 shape) -------------------

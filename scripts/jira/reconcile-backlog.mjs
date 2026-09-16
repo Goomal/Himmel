@@ -29,7 +29,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { classifyTicket, findMatches, applyDisposition, buildEvidenceComment } from './reconcile-lib.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -95,7 +95,14 @@ export function loadHygieneKeys(path) {
 // history). Falling back to a live `git log` only covers THIS repo's public
 // history: any ticket whose only evidence lives in the archived private
 // history will read as no-evidence, not as a false CLOSE — a safe direction
-// for a fallback to fail in.
+// for a fallback to fail in. Neither path populates `body`: the --commits-file
+// TSV shape carries subject only (a prior audit's own output format), and the
+// live `git log` format below is subject-only for the same reason — a commit
+// body can contain literal tabs/newlines that would corrupt a single-line
+// TSV/`%x09`-joined record. bodyOnlyCommits matches are therefore unreachable
+// from either loader today; a body-carrying format is possible (e.g. a NUL- or
+// otherwise-delimited stream) but out of scope here since no live ticket in
+// this repo's history has needed it.
 export function loadCommits(commitsFile) {
   if (commitsFile) {
     const lines = readFileSync(commitsFile, 'utf8').split('\n').filter(Boolean);
@@ -135,12 +142,26 @@ async function loadBacklog({ jiraCli, project, limit }) {
   }));
 }
 
+// Paginated (startAt/maxResults/total — the classic Jira REST shape this
+// endpoint uses, distinct from list.ts's cursor-based /search/jql): a ticket
+// with more than one page of comments would otherwise have its later pages
+// — including a prior adjudication or evidence marker — invisible to
+// classifyTicket/hasSkipMarker, risking a re-close of an already-handled
+// ticket.
 async function loadCommentBodies({ jiraCli, key }) {
   const distDir = dirname(jiraCli);
   const { request } = await import(join(distDir, 'client.js'));
   const { adfToPlainText } = await import(join(distDir, 'adf-render.js'));
-  const result = await request('GET', `/issue/${key}/comment`);
-  return (result.comments ?? []).map((c) => adfToPlainText(c.body) ?? '');
+  const bodies = [];
+  let startAt = 0;
+  for (;;) {
+    const result = await request('GET', `/issue/${key}/comment?startAt=${startAt}&maxResults=100`);
+    const comments = result.comments ?? [];
+    for (const c of comments) bodies.push(adfToPlainText(c.body) ?? '');
+    startAt += comments.length;
+    if (comments.length === 0 || startAt >= (result.total ?? startAt)) break;
+  }
+  return bodies;
 }
 
 async function loadDescription({ jiraCli, key }) {
@@ -227,14 +248,23 @@ async function main() {
       acted.push(record);
       if (opts.apply) {
         const commentBody = buildEvidenceComment({ key: ticket.key, ...result });
-        const applied = await applyDisposition({
-          key: ticket.key,
-          disposition: result.disposition,
-          targetStatus,
-          commentBody,
-          jiraClient,
-        });
-        record.applied = applied.action;
+        try {
+          const applied = await applyDisposition({
+            key: ticket.key,
+            disposition: result.disposition,
+            targetStatus,
+            commentBody,
+            jiraClient,
+          });
+          record.applied = applied.action;
+        } catch (err) {
+          // One ticket's comment/transition failure (a missing
+          // transition-screen field, a permissions gap, ...) must not abort
+          // the whole backlog run — every other candidate still needs its
+          // own disposition recorded.
+          record.applied = 'failed';
+          process.stderr.write(`reconcile-backlog: ${ticket.key} apply failed: ${err.message}\n`);
+        }
       }
     }
 
@@ -254,7 +284,9 @@ async function main() {
 
 // Guarded so vitest can import the pure helpers above (parseArgs, loadConfig,
 // loadHygieneKeys, loadCommits) without triggering a live Jira run.
-if (import.meta.url === `file://${process.argv[1]}`) {
+// pathToFileURL (not a manually-built `file://` string) so this comparison
+// also holds on Windows and on paths with URL-reserved characters.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((err) => {
     process.stderr.write(`reconcile-backlog: ${err.stack ?? err.message}\n`);
     process.exit(1);

@@ -1138,13 +1138,35 @@ jira_auto_transition_on_merge() {
     ' "$config_path" "$project" 2>/dev/null)
     [ -n "$target_status" ] || { JIRA_AUTO_TRANSITION_RESULT="skip=no-project-config key=$key project=$project"; return 0; }
 
-    local comment_tmp
+    # Never touch Epic/Story (standing project invariant — reconcile-lib.mjs's
+    # own classifyTicket enforces this for the batch reconciler; this
+    # merge-time hook has no classifyTicket call in its path, so it must
+    # check independently). Fails safe: an unreadable/undetermined type
+    # skips the transition rather than risking one on an Epic or Story.
+    local issue_type_json issue_type
+    issue_type_json=$(cd "$repo_root" && node scripts/jira/dist/index.js get "$key" --json 2>/dev/null)
+    issue_type=$(printf '%s' "$issue_type_json" | node -e '
+        try {
+            const d = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            const t = d.fields && d.fields.issuetype && d.fields.issuetype.name;
+            if (t) process.stdout.write(t);
+        } catch {}
+    ' 2>/dev/null)
+    case "$issue_type" in
+        Epic|Story) JIRA_AUTO_TRANSITION_RESULT="skip=never-touch-type key=$key type=$issue_type"; return 0 ;;
+        "") JIRA_AUTO_TRANSITION_RESULT="skip=cannot-verify-type key=$key"; return 0 ;;
+    esac
+
+    local comment_tmp comment_rc=0
     comment_tmp=$(mktemp "${TMPDIR:-/tmp}/merge-on-green-jira-comment.XXXXXX") || { JIRA_AUTO_TRANSITION_RESULT="skip=no-tmpfile key=$key"; return 0; }
     printf 'PR #%s (%s) merged @ %s. scripts/handover/merge-on-green.sh is attempting to auto-transition this ticket to '"'"'%s'"'"'.\n' \
         "$pr_num" "$nwo" "$pr_sha" "$target_status" >"$comment_tmp"
     ( cd "$repo_root" && node scripts/jira/dist/index.js comment "$key" --comment-file "$comment_tmp" ) \
-        >/dev/null 2>&1
+        >/dev/null 2>&1 || comment_rc=$?
     rm -f "$comment_tmp"
+    # A failed comment means no evidence breadcrumb would exist on the
+    # ticket — skip the transition rather than close it silently.
+    [ "$comment_rc" -eq 0 ] || { JIRA_AUTO_TRANSITION_RESULT="skip=comment-failed key=$key rc=$comment_rc"; return 0; }
 
     local transition_out transition_rc=0
     transition_out=$(cd "$repo_root" && node scripts/jira/dist/index.js transition "$key" "$target_status" 2>&1) \

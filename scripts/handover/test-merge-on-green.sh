@@ -441,8 +441,16 @@ fi
 case "\$1" in
     */dist/index.js)
         echo "\$*" >> "\$JIRA_LOG"
+        if [ "\$2" = "get" ]; then
+            printf '{"fields":{"issuetype":{"name":"%s"}}}\n' "\${STUB_JIRA_ISSUE_TYPE:-Task}"
+            exit 0
+        fi
         if [ "\${STUB_JIRA_TRANSITION_FAIL:-0}" = "1" ] && [ "\$2" = "transition" ]; then
             echo "jira transition failed" >&2
+            exit 1
+        fi
+        if [ "\${STUB_JIRA_COMMENT_FAIL:-0}" = "1" ] && [ "\$2" = "comment" ]; then
+            echo "jira comment failed" >&2
             exit 1
         fi
         exit 0
@@ -2316,6 +2324,21 @@ fi
 STUB_JIRA_BUILD=1 STUB_JIRA_TRANSITION_FAIL=1 STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" \
     run_mog 0 "jira: failed transition does not fail the merge"
 assert_audit_has "jira: failed-transition case records the failure" "jira-transition=failed key=HIMMEL-374 status=Done"
+
+# Never touch Epic/Story (standing project invariant) — the merge hook has no
+# classifyTicket call in its path, so it must check the issue type itself.
+STUB_JIRA_BUILD=1 STUB_JIRA_ISSUE_TYPE=Epic STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" \
+    run_mog 0 "jira: Epic ticket is never transitioned"
+assert_audit_has "jira: Epic case records the never-touch skip" "jira-transition=skip=never-touch-type key=HIMMEL-374 type=Epic"
+assert_jira_log_lacks "jira: Epic case makes no jira comment call" "comment"
+assert_jira_log_lacks "jira: Epic case makes no jira transition call" "transition"
+
+# A comment that fails to post leaves no evidence breadcrumb — skip the
+# transition rather than close the ticket silently.
+STUB_JIRA_BUILD=1 STUB_JIRA_COMMENT_FAIL=1 STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" \
+    run_mog 0 "jira: failed comment skips the transition"
+assert_audit_has "jira: failed-comment case records the skip" "jira-transition=skip=comment-failed key=HIMMEL-374"
+assert_jira_log_lacks "jira: failed-comment case makes no jira transition call" "transition"
 
 echo
 echo "merge-on-green: $PASS passed, $FAIL failed"

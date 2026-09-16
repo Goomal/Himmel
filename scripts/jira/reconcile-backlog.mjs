@@ -197,6 +197,18 @@ function makeJiraClient(jiraCliPath) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  // A LEFT ALONE hygiene-sweep row carries no Jira comment at all, so
+  // hasSkipMarker cannot protect it — --hygiene-doc is the ONLY guard for
+  // those tickets. Silently running --apply without it would let a real
+  // write run re-disposition tickets a concurrent sweep already adjudicated.
+  if (opts.apply && !opts.hygieneDoc) {
+    process.stderr.write(
+      'reconcile-backlog: --apply requires --hygiene-doc (protects LEFT ALONE tickets the ' +
+        'hygiene sweep already adjudicated but never commented on); pass it explicitly, or ' +
+        '--hygiene-doc /dev/null if none applies.\n',
+    );
+    process.exit(1);
+  }
   const config = loadConfig(opts.config);
   const projectConfig = config[opts.project];
   const targetStatus = projectConfig?.targetStatus;

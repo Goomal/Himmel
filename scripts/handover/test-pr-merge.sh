@@ -86,7 +86,8 @@ case "$verb" in
         #   2. HIMMEL-1058 head-SHA bind read: --json headRefOid --jq .headRefOid
         #   3. HIMMEL-936 CR-gate metadata:    --json number,headRefOid,url (no --jq)
         #   4. HIMMEL-374 jira-transition title read: --json title -q .title
-        if printf ' %s ' "$@" | grep -qE -- '--json[[:space:]]+title'; then
+        title_match=$(printf ' %s ' "$@" | grep -E -- '--json[[:space:]]+title')
+        if [ -n "$title_match" ]; then
             printf '%s' "${STUB_PR_TITLE:-}"
             exit 0
         fi

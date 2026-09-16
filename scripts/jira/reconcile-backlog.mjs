@@ -34,7 +34,7 @@ import { classifyTicket, findMatches, applyDisposition, buildEvidenceComment } f
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const opts = {
     apply: false,
     project: process.env.JIRA_PROJECT_KEY,
@@ -68,7 +68,7 @@ function parseArgs(argv) {
   return opts;
 }
 
-function loadConfig(path) {
+export function loadConfig(path) {
   if (!existsSync(path)) return {};
   return JSON.parse(readFileSync(path, 'utf8'));
 }
@@ -78,7 +78,7 @@ function loadConfig(path) {
 // "already adjudicated" — including the LEFT ALONE rows that carry no Jira
 // comment at all (the gap this reconciler must not blindly re-close).
 // All of the report's tables share one markdown shape: `| HIMMEL-1234 | ...`.
-function loadHygieneKeys(path) {
+export function loadHygieneKeys(path) {
   if (!path || !existsSync(path)) return new Set();
   const text = readFileSync(path, 'utf8');
   const keys = new Set();
@@ -92,7 +92,7 @@ function loadHygieneKeys(path) {
 // history: any ticket whose only evidence lives in the archived private
 // history will read as no-evidence, not as a false CLOSE — a safe direction
 // for a fallback to fail in.
-function loadCommits(commitsFile) {
+export function loadCommits(commitsFile) {
   if (commitsFile) {
     const lines = readFileSync(commitsFile, 'utf8').split('\n').filter(Boolean);
     return lines.map((line) => {
@@ -247,7 +247,11 @@ async function main() {
   );
 }
 
-main().catch((err) => {
-  process.stderr.write(`reconcile-backlog: ${err.stack ?? err.message}\n`);
-  process.exit(1);
-});
+// Guarded so vitest can import the pure helpers above (parseArgs, loadConfig,
+// loadHygieneKeys, loadCommits) without triggering a live Jira run.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => {
+    process.stderr.write(`reconcile-backlog: ${err.stack ?? err.message}\n`);
+    process.exit(1);
+  });
+}

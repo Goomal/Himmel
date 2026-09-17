@@ -6,6 +6,17 @@ Complete checklist for getting a new machine to full working state.
 
 **Setting up a clean Windows machine remotely (over SSH), including the delegation-lane fleet (hermes/codex/…)?** Follow [windows-clean-machine.md](./windows-clean-machine.md) — the ordered walkthrough through this doc plus the remote-drive pattern, lane installs, and always-on hardening (HIMMEL-852).
 
+## Support matrix (HIMMEL-3125)
+
+| Tier | Platforms | What it promises |
+|---|---|---|
+| **Supported** | Linux, macOS | Linux is CI-gated on every PR (required check) — [green `bun-suites` run on `main`](https://github.com/yotamleo/Himmel/actions/runs/35175771338); adopter round trip verified on both. macOS CI runs nightly/dispatch only (same trigger as Alpha below), not yet a per-PR required check. |
+| **Alpha** | Windows (Git Bash), WSL | Code paths present, best effort, not CI-gated per-PR — a nightly `schedule` run, or a manual `workflow_dispatch` with `force_all_os=true` (a plain dispatch alone stays `ubuntu-latest`-only). Bug reports welcome; no round-trip guarantee. |
+
+Windows sections below stay accurate for the alpha tier, but nothing in them
+is CI-verified per-PR. See [`docs/internals/harness-compat.md`](../internals/harness-compat.md)
+for the same tiering applied to hook/skill/agent compatibility.
+
 ---
 
 ## 1. Required environment (HIMMEL-123)

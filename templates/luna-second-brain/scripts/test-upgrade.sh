@@ -462,49 +462,70 @@ assert_eq "T25 --check un-stamped rc" "0" "$rc"
 case "$out" in *"(vault is v0.0.0)"*) pass "T25 --check treats un-stamped vault as v0.0.0 (available)" ;; *) fail "T25 --check treats un-stamped vault as v0.0.0 (available)" "got: $out" ;; esac
 
 # ---------------------------------------------------------------------------
-# T11: ACCEPTANCE — run against a COPY of the real luna vault, never the live one.
-LUNA="$HOME/Documents/luna"
-if [ -d "$LUNA" ] && [ -d "$LUNA/50-Journal" ]; then
-    VC="$TMP/luna-copy"
-    cp -r "$LUNA" "$VC" 2>/dev/null
-    # Remove any nested .git to keep the copy a plain dir (avoid worktree confusion).
-    rm -rf "$VC/.git"
-    REALTMPL="$(cd "$HERE/.." && pwd)"   # this template's own root (scripts/..)
-    journal_before=$(find "$VC/50-Journal" -type f -exec "${SHA256[@]}" {} \; 2>/dev/null | sort)
-    claude_before=$(sha_of "$VC/_CLAUDE.md")
-    claude_title_before=$(head -n 1 "$VC/_CLAUDE.md")
-    bash "$UPGRADE" --template-dir "$REALTMPL" --vault-dir "$VC" --yes >/dev/null 2>&1; rc=$?
-    journal_after=$(find "$VC/50-Journal" -type f -exec "${SHA256[@]}" {} \; 2>/dev/null | sort)
-    assert_eq "T11 acceptance rc" "0" "$rc"
-    assert_eq "T11 journal bodies unchanged" "$journal_before" "$journal_after"
-    # _CLAUDE.md contract depends on whether the vault carries a base snapshot
-    # (HIMMEL-1750): with NO base, ours wins and the file must be byte-stable;
-    # WITH a base, a legitimate template delta MAY merge in — byte-equality
-    # would then fail on every template _CLAUDE.md change (hit live when the
-    # Retrieval Routing section shipped). In that state assert what actually
-    # matters: the merge completed without conflict markers and the vault's
-    # user content (the vault-specific title line) survived.
-    if [ -f "$VC/.vault-template.base/_CLAUDE.md" ]; then
-        if grep -q '^<<<<<<<' "$VC/_CLAUDE.md"; then
-            fail "T11 _CLAUDE.md merged without conflict markers" "conflict markers present"
-        else
-            pass "T11 _CLAUDE.md merged without conflict markers"
-        fi
-        # Full-line equality, not substring (CR codex r5): a modified first
-        # line CONTAINING the old title as a fragment must fail.
-        if [ "$(head -n 1 "$VC/_CLAUDE.md")" = "$claude_title_before" ]; then
-            pass "T11 _CLAUDE.md user content survived the merge (title line intact)"
-        else
-            fail "T11 _CLAUDE.md user content survived the merge (title line intact)" "title line changed"
-        fi
-    else
-        assert_eq "T11 _CLAUDE.md user content unchanged (no base => ours wins)" "$claude_before" "$(sha_of "$VC/_CLAUDE.md")"
-    fi
-    if [ -f "$VC/.vault-template.json" ]; then pass "T11 stamp written on real-vault copy"; else fail "T11 stamp written on real-vault copy" "no stamp"; fi
-    assert_eq "T11 template-owned setup.sh updated to template" "$(sha_of "$REALTMPL/scripts/setup.sh")" "$(sha_of "$VC/scripts/setup.sh")"
+# T11: ACCEPTANCE — upgrade a HERMETIC vault built from this template's own tree.
+# It used to copy the operator's live vault ($HOME/Documents/luna), which is
+# coupled to live state: any locally edited template-owned file is withheld and
+# upgrade.sh exits 1 BY DESIGN (red on the operator's box), while on CI the
+# vault is absent so the case self-skipped and the red never showed (HIMMEL-3171).
+# The fixture is an older-stamped copy of the real template + journal content, so
+# it exercises the real template tree on every host.
+REALTMPL="$(cd "$HERE/.." && pwd)"   # this template's own root (scripts/..)
+VC="$TMP/luna-fixture"
+mkdir -p "$VC"
+(cd "$REALTMPL" && tar -cf - .) | (cd "$VC" && tar -xf -)
+rm -rf "$VC/.git"
+stamp_vault "$VC" "0.0.1"                           # behind the template, no files map
+printf '# stale setup\n' > "$VC/scripts/setup.sh"   # a template-owned file the upgrade must refresh
+mkdir -p "$VC/50-Journal/Daily" "$VC/.vault-template.base"
+printf '# Journal entry\n\nmy private notes\n' > "$VC/50-Journal/Daily/2026-01-01.md"
+printf '# Journal entry two\n\nmore private notes\n' > "$VC/50-Journal/Daily/2026-01-02.md"
+# Base snapshot = the template's _CLAUDE.md minus its last line (the template
+# delta the upgrade merges in); the vault = base with a customised title line.
+sed '$d' "$REALTMPL/_CLAUDE.md" > "$VC/.vault-template.base/_CLAUDE.md"
+{ printf '# My Own Vault Title\n'; tail -n +2 "$VC/.vault-template.base/_CLAUDE.md"; } > "$VC/_CLAUDE.md"
+journal_before=$(find "$VC/50-Journal" -type f -exec "${SHA256[@]}" {} \; 2>/dev/null | sort)
+claude_title_before=$(head -n 1 "$VC/_CLAUDE.md")
+bash "$UPGRADE" --template-dir "$REALTMPL" --vault-dir "$VC" --yes >/dev/null 2>&1; rc=$?
+journal_after=$(find "$VC/50-Journal" -type f -exec "${SHA256[@]}" {} \; 2>/dev/null | sort)
+assert_eq "T11 acceptance rc" "0" "$rc"
+assert_eq "T11 journal bodies unchanged" "$journal_before" "$journal_after"
+# _CLAUDE.md contract (HIMMEL-1750): the vault carries a base snapshot, so a
+# legitimate template delta MAY merge in — byte-equality would fail on every
+# template _CLAUDE.md change (hit live when the Retrieval Routing section
+# shipped). Assert what actually matters: the merge completed without conflict
+# markers and the vault's user content (the vault-specific title line) survived.
+if grep -q '^<<<<<<<' "$VC/_CLAUDE.md"; then
+    fail "T11 _CLAUDE.md merged without conflict markers" "conflict markers present"
 else
-    echo "SKIP T11 acceptance — no real luna vault at $LUNA"
+    pass "T11 _CLAUDE.md merged without conflict markers"
 fi
+# Full-line equality, not substring (CR codex r5): a modified first
+# line CONTAINING the old title as a fragment must fail.
+if [ "$(head -n 1 "$VC/_CLAUDE.md")" = "$claude_title_before" ]; then
+    pass "T11 _CLAUDE.md user content survived the merge (title line intact)"
+else
+    fail "T11 _CLAUDE.md user content survived the merge (title line intact)" "title line changed"
+fi
+if [ -f "$VC/.vault-template.json" ]; then pass "T11 stamp written on fixture vault"; else fail "T11 stamp written on fixture vault" "no stamp"; fi
+assert_eq "T11 template-owned setup.sh updated to template" "$(sha_of "$REALTMPL/scripts/setup.sh")" "$(sha_of "$VC/scripts/setup.sh")"
+# T11 control (the branch the live-vault copy used to hit by accident): a
+# template-owned file the operator edited AFTER that upgrade is withheld and the
+# run exits non-zero. The first upgrade above recorded the content snapshot; a
+# newer template that changes the same file then meets the local edit.
+T11NEW="$TMP/luna-fixture-newer"
+mkdir -p "$T11NEW"
+(cd "$REALTMPL" && tar -cf - .) | (cd "$T11NEW" && tar -xf -)
+printf '{"metadata":{"version":"999.0.0"}}\n' > "$T11NEW/marketplace/.claude-plugin/marketplace.json"
+printf 'gitleaks-incoming-template-change\n' > "$T11NEW/.gitleaks.toml"
+printf '# operator local edit\n' > "$VC/.gitleaks.toml"
+t11_edit_sha=$(sha_of "$VC/.gitleaks.toml")
+t11_out=$(bash "$UPGRADE" --template-dir "$T11NEW" --vault-dir "$VC" --backup-dir "$TMP/t11-backup" --yes 2>&1); t11_rc=$?
+if [ "$t11_rc" -ne 0 ]; then pass "T11 control: a locally edited template-owned file exits non-zero"; else fail "T11 control: a locally edited template-owned file exits non-zero" "rc=0, out: $t11_out"; fi
+case "$t11_out" in
+    *"local edits withheld (not overwritten): "*".gitleaks.toml"*) pass "T11 control: the edited file is named as withheld" ;;
+    *) fail "T11 control: the edited file is named as withheld" "got: $t11_out" ;;
+esac
+assert_eq "T11 control: the edited file is left untouched" "$t11_edit_sha" "$(sha_of "$VC/.gitleaks.toml")"
 
 # ---------------------------------------------------------------------------
 # T26 (HIMMEL-521): the REAL template's two version sources must agree.
@@ -1263,6 +1284,40 @@ case "$(cat "$V/.obsidian/community-plugins.json" 2>/dev/null)" in
     *github-sync*) fail "T49 non-array template: github-sync is not injected" "got: $(cat "$V/.obsidian/community-plugins.json")" ;;
     *) pass "T49 non-array template: github-sync is not injected" ;;
 esac
+
+# T50-T52 (HIMMEL-3189): the add-only plugin merge must validate ITS OWN source.
+# A non-array template community-plugins.json ({"calendar":true}) used to be
+# iterated as its KEYS and written into the vault as ["calendar"], with the run
+# exiting 0. Now the merge warns and leaves the vault's file untouched; the run
+# still exits 0 (like the vault-side non-array guard: one bad plugin list must
+# not block the rest of the upgrade — the warning is the signal).
+# T50: the vault already has a plugin list — it must stay byte-identical.
+T="$TMP/t50-tmpl"; V="$TMP/t50-vault"; make_template "$T" "1.0.0"; mkdir -p "$V/.obsidian"; stamp_vault "$V" "0.1.0"
+printf '%s\n' '["dataview"]' > "$V/.obsidian/community-plugins.json"
+printf '%s\n' '{"calendar":true}' > "$T/.obsidian/community-plugins.json"
+t50_pre_sha=$(sha_of "$V/.obsidian/community-plugins.json")
+t50_out=$(run_upgrade --yes 2>&1); t50_rc=$?
+assert_eq "T50 non-array template: vault plugin list untouched" "$t50_pre_sha" "$(sha_of "$V/.obsidian/community-plugins.json")"
+assert_eq "T50 non-array template: run still exits 0 (warn-and-continue)" "0" "$t50_rc"
+case "$t50_out" in
+    *"template plugin list "*"is not a JSON array; leaving the vault's list untouched"*) pass "T50 non-array template: warns that the template plugin list is not an array" ;;
+    *) fail "T50 non-array template: warns that the template plugin list is not an array" "got: $t50_out" ;;
+esac
+# T51: the vault has NO plugin list yet — none must be created from the bad source.
+T="$TMP/t51-tmpl"; V="$TMP/t51-vault"; make_template "$T" "1.0.0"; add_optional_github_sync "$T"; mkdir -p "$V"; stamp_vault "$V" "0.1.0"
+printf '%s\n' '{"calendar":true}' > "$T/.obsidian/community-plugins.json"
+run_upgrade --yes --with-github-sync >/dev/null 2>&1
+if [ -e "$V/.obsidian/community-plugins.json" ]; then
+    fail "T51 non-array template: no plugin list is created in a vault that lacks one" "got: $(cat "$V/.obsidian/community-plugins.json")"
+else
+    pass "T51 non-array template: no plugin list is created in a vault that lacks one"
+fi
+# T52 (control): a normal list template still merges add-only into the vault's list.
+T="$TMP/t52-tmpl"; V="$TMP/t52-vault"; make_template "$T" "1.0.0"; mkdir -p "$V/.obsidian"; stamp_vault "$V" "0.1.0"
+printf '%s\n' '["dataview"]' > "$V/.obsidian/community-plugins.json"
+run_upgrade --yes >/dev/null 2>&1
+merged=$("$PY" -c 'import json,sys;print(",".join(sorted(json.load(open(sys.argv[1])))))' "$V/.obsidian/community-plugins.json" 2>/dev/null)
+assert_eq "T52 list template: still merges add-only" "calendar,dataview,new" "$merged"
 
 echo
 if [ "$FAILED" -eq 0 ]; then echo "All upgrade tests passed."; else echo "$FAILED test(s) failed."; exit 1; fi

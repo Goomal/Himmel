@@ -52,6 +52,10 @@
 #      `git <read-subcommand>`, `gh <read-subcommand>`, or the dogfooded
 #      Jira CLI (`node …/scripts/jira/dist/index.js …`, operator
 #      allow-listed in .claude/settings.json).
+#   The ONE non-read exception (HIMMEL-3131): a lone `queue-lock.sh` lock verb
+#   (`[HANDOVER_DIR=<root>] bash scripts/handover/queue-lock.sh <verb> …`,
+#   literal args) is approved ONLY as the whole command — see
+#   segment_is_queue_lock. It is never one segment of a compound.
 #   Variable expansion in ARGUMENTS (`cat $f`, `… get $t`) is fine — the
 #   binary (argv[0]) is still a literal so we know what runs. If the binary
 #   ITSELF is a variable (`$cmd …`) it is not in the safe set → falls
@@ -741,6 +745,114 @@ scan_cmd() {
     return 0
 }
 
+# HIMMEL-3131: is this segment EXACTLY one `queue-lock.sh` lock verb?
+#   [HANDOVER_DIR=<root>] bash [<repo>/]scripts/handover/queue-lock.sh
+#       acquire <doc> | release|heartbeat <doc> [<token>] | status <doc>
+#       | status --sweep [<dir>]
+# WHY: the shape is not a merge — it writes one lock dir under the handover
+# root and touches no git ref — but `bash` is not a safe binary and a leading
+# HANDOVER_DIR= is not an innocuous assignment, so it fell through to the
+# auto-mode classifier, which read a just-landed merge in the narrative and
+# denied `release` as [Merge Without Review]. Deliberately NOT wired into
+# segment_is_safe: the caller approves it only when it is the WHOLE command, so
+# a queue-lock segment inside a compound (`x && …`, `x | …`, `… ; …`) still
+# falls through. HANDOVER_DIR is the only env prefix accepted, so
+# QUEUE_LOCK_FORCE_RELEASE=1 (a console action) can never ride along.
+# Every value must be a literal: no expansion, no glob, no `..`, doc absolute
+# and `.md`, doc under HANDOVER_DIR when one is given.
+# The script is the relative `scripts/handover/queue-lock.sh` or an ABSOLUTE
+# path; either way the checkout it resolves into must be a real one of this repo
+# (ql_root_is_own_checkout) — for the relative form that is the payload `cwd`
+# (else $PWD, when the payload has none), since bash resolves it there.
+# ponytail: HANDOVER_DIR is not checked against the registered handover root —
+# a stray root only lets queue-lock write a `.locks/queue/` dir there — and the
+# relative form only accepts a cwd that IS a checkout root: from a sub-directory
+# (where the relative path would not resolve anyway) it falls through to a prompt.
+ql_word_literal() {   # $1 raw word → QW (cooked); fails on any expansion/glob/`..`
+    case "$1" in *'$'*) return 1 ;; esac
+    shell_word_value "$1" || return 1
+    QW="$SW_VALUE"
+    case "$QW" in
+        *'~'*|*'*'*|*'?'*|*'['*|*']'*|*'{'*|*'}'*|*'!'*|*';'*|*'&'*|*'|'*|*'<'*|*'>'*|*'('*|*')'*|*'`'*|*' '*) return 1 ;;
+        ..|../*|*/..|*/../*) return 1 ;;
+    esac
+    [ -n "$QW" ]
+}
+
+# Is <root> a real checkout of THIS repo — the checkout this hook lives in, or
+# one of its `git worktree list` siblings (the primary checkout included) — that
+# actually holds queue-lock.sh? A lookalike `/tmp/x/scripts/handover/queue-lock.sh`
+# (even one that exists) is not, so it falls through.
+ql_root_is_own_checkout() {
+    local real here wt wts
+    real=$(cd "$1" 2>/dev/null && pwd -P) || return 1
+    [ -f "$real/scripts/handover/queue-lock.sh" ] || return 1
+    here=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd -P) || return 1
+    [ "$real" = "$here" ] && return 0
+    wts=$(git -C "$here" worktree list --porcelain 2>/dev/null) || return 1
+    while IFS= read -r wt; do
+        case "$wt" in "worktree "*) ;; *) continue ;; esac
+        wt=$(cd "${wt#worktree }" 2>/dev/null && pwd -P) || continue
+        [ "$wt" = "$real" ] && return 0
+    done <<EOF
+$wts
+EOF
+    return 1
+}
+
+segment_is_queue_lock() {
+    tokenize_seg_words "$1" || return 1
+    local -a a=("${RB_TOKENS[@]}")
+    local n=${#a[@]} i=0 hd="" verb doc ql_cwd
+    [ "$n" -ge 3 ] || return 1
+    case "${a[0]}" in
+        HANDOVER_DIR=*)
+            ql_word_literal "${a[0]#HANDOVER_DIR=}" || return 1
+            case "$QW" in /*) hd="${QW%/}" ;; *) return 1 ;; esac
+            i=1 ;;
+    esac
+    [ "${a[$i]:-}" = "bash" ] || return 1
+    ql_word_literal "${a[$((i + 1))]:-}" || return 1
+    case "$QW" in
+        scripts/handover/queue-lock.sh)
+            # Relative: bash resolves it against the session cwd, so that cwd
+            # must itself be a real checkout. Payload `.cwd`; $PWD only when the
+            # payload has none. Read lazily (this rare path only) so the hot
+            # path keeps its single jq call.
+            ql_cwd=$(jq -r '.cwd // ""' <<<"$input" 2>/dev/null) || return 1
+            ql_cwd="${ql_cwd%$'\r'}"
+            [ -n "$ql_cwd" ] || ql_cwd="$PWD"
+            ql_root_is_own_checkout "$ql_cwd" || return 1 ;;
+        /*/scripts/handover/queue-lock.sh) ql_root_is_own_checkout "${QW%/scripts/handover/queue-lock.sh}" || return 1 ;;
+        *) return 1 ;;
+    esac
+    verb="${a[$((i + 2))]:-}"
+    i=$((i + 3))
+    local rest=$((n - i))
+    if [ "$verb" = "status" ] && [ "${a[$i]:-}" = "--sweep" ]; then
+        [ "$rest" -le 2 ] || return 1
+        if [ "$rest" -eq 2 ]; then
+            ql_word_literal "${a[$((i + 1))]}" || return 1
+            case "$QW" in /*) ;; *) return 1 ;; esac
+        fi
+        return 0
+    fi
+    [ "$rest" -ge 1 ] || return 1
+    ql_word_literal "${a[$i]}" || return 1
+    doc="$QW"
+    case "$doc" in /*.md) ;; *) return 1 ;; esac
+    [ -z "$hd" ] || case "$doc" in "$hd"/*) ;; *) return 1 ;; esac
+    case "$verb" in
+        acquire|status) [ "$rest" -eq 1 ] ;;
+        release|heartbeat)
+            [ "$rest" -le 2 ] || return 1
+            [ "$rest" -eq 1 ] && return 0
+            ql_word_literal "${a[$((i + 1))]}" || return 1
+            case "$QW" in *[!A-Za-z0-9._-]*) return 1 ;; esac ;;
+        *) return 1 ;;
+    esac
+}
+
 emit_allow() {
     local reason
     # HIMMEL-2123: `jq -n --arg r "<text>" '$r'` JSON-encodes the exact string
@@ -848,6 +960,27 @@ case "$rd" in *'>'*) exit 0 ;; esac
 # (`2>&1`, `>&2`, `&>file`) are kept intact, and separators inside quotes are
 # left as literal text. Segment text retains its quotes so the per-binary
 # guards (find -delete, sort -o, …) still see real flag values.
+# HIMMEL-3131: a queue-lock.sh lock verb is approved ONLY as the whole command
+# (exactly one segment) — see segment_is_queue_lock. "Exactly one non-empty
+# segment" is not enough: scan_cmd emits an EMPTY segment after a trailing (or
+# before a leading) separator and the count below skips it, so `… status <doc> &`
+# (which backgrounds the op), `…;`, `… &&`, `… |` and a trailing newline would all
+# pass as a lone command. SCAN_MASK keeps every UNQUOTED separator (quoted spans
+# are blanked), so any of them in it disqualifies the carve-out outright.
+ql_unquoted_sep=0
+case "$SCAN_MASK" in *';'*|*'|'*|*'&'*|*$'\n'*) ql_unquoted_sep=1 ;; esac
+ql_segs=0; ql_only=""
+while IFS= read -r seg; do
+    seg="${seg#"${seg%%[![:space:]]*}"}"   # ltrim
+    [ -z "$seg" ] && continue
+    ql_segs=$((ql_segs + 1)); ql_only="$seg"
+done <<EOF
+$SCAN_SEGS
+EOF
+if [ "$ql_unquoted_sep" -eq 0 ] && [ "$ql_segs" -eq 1 ] && segment_is_queue_lock "$ql_only"; then
+    emit_allow "queue-lock.sh lock verb (HIMMEL-3131): $cmd"
+fi
+
 all_safe=1
 while IFS= read -r seg; do
     seg="${seg#"${seg%%[![:space:]]*}"}"   # ltrim

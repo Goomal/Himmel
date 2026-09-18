@@ -398,6 +398,96 @@ assert "find single-quoted tilde literal" ALLOW "$(decide "$(j_bash "find '~' -n
 assert "find double-quoted tilde literal" ALLOW "$(decide "$(j_bash 'find "~" -name x')")"
 assert "find escaped tilde literal"       ALLOW "$(decide "$(j_bash 'find \~ -name x')")"
 
+# --- HIMMEL-3131: queue-lock.sh verbs are a sanctioned single-segment write ---
+# `bash` is deliberately not a safe binary and a leading HANDOVER_DIR= is not an
+# innocuous assignment, so `HANDOVER_DIR=<root> bash scripts/handover/queue-lock.sh
+# release <doc> <token>` fell through to the auto-mode classifier, which read a
+# just-landed merge in the narrative and denied it [Merge Without Review]. The
+# hook can now approve exactly this shape — ONLY as the whole command (a lone
+# segment), never as one segment of a compound. It cannot prove anything about
+# the real classifier; these cases pin the hook's own decisions.
+QL_R=/home/u/luna/handovers
+QL_DOC="$QL_R/yotamleo/himmel/HIMMEL-1-legN1-2026-09-18.md"
+QL_TOK='cachyos-x8664-pid3377422'
+assert "queue-lock release (HANDOVER_DIR, rel script)" ALLOW "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh release $QL_DOC $QL_TOK")")"
+# An absolute script path is approved only inside a real checkout of THIS repo:
+# the one the hook lives in, or a `git worktree list` sibling (the primary).
+QL_HERE="$(cd "$(dirname "$HOOK")/../.." && pwd -P)"
+QL_PRIMARY="$(git -C "$QL_HERE" worktree list --porcelain | sed -n '1s/^worktree //p')"
+QL_FAKE="$(mktemp -d "${TMPDIR:-/tmp}/ql-fake.XXXXXX")"; mkdir -p "$QL_FAKE/scripts/handover" "$QL_FAKE/.git"; : > "$QL_FAKE/scripts/handover/queue-lock.sh"
+assert "precondition: primary checkout resolved"  ALLOW "$([ -f "$QL_PRIMARY/scripts/handover/queue-lock.sh" ] && echo ALLOW || echo "PASS:$QL_PRIMARY")"
+assert "queue-lock release (abs, own checkout)" ALLOW "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash $QL_HERE/scripts/handover/queue-lock.sh release $QL_DOC $QL_TOK")")"
+assert "queue-lock release (abs, primary)"      ALLOW "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash $QL_PRIMARY/scripts/handover/queue-lock.sh release $QL_DOC $QL_TOK")")"
+assert "ctl: lookalike abs path (absent)"       PASS  "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash /tmp/x-himmel-3131-absent/scripts/handover/queue-lock.sh release $QL_DOC $QL_TOK")")"
+assert "ctl: lookalike abs path (exists + .git)" PASS "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash $QL_FAKE/scripts/handover/queue-lock.sh release $QL_DOC $QL_TOK")")"
+# The RELATIVE script form resolves against the session cwd, so a fake
+# scripts/handover/queue-lock.sh in a lookalike cwd must not be approved: the
+# payload's `cwd` (else $PWD, when the payload has none) has to be a real
+# checkout. j_bash_cwd puts a cwd field in the payload; decide_in runs the hook
+# from a directory with no payload cwd (the $PWD fallback).
+j_bash_cwd() { printf '{"tool_name":"Bash","cwd":%s,"tool_input":{"command":%s}}' "$(printf '%s' "$1" | jq -Rs .)" "$(printf '%s' "$2" | jq -Rs .)"; }
+QL_REL="HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh release $QL_DOC $QL_TOK"
+assert "ctl: rel script, payload cwd = lookalike dir"  PASS  "$(decide "$(j_bash_cwd "$QL_FAKE" "$QL_REL")")"
+assert "ctl: rel script, payload cwd = absent dir"     PASS  "$(decide "$(j_bash_cwd /tmp/x-himmel-3131-absent "$QL_REL")")"
+assert "ctl: rel script, payload cwd = sub-dir"        PASS  "$(decide "$(j_bash_cwd "$QL_HERE/scripts" "$QL_REL")")"
+assert "rel script, payload cwd = own checkout"        ALLOW "$(decide "$(j_bash_cwd "$QL_HERE" "$QL_REL")")"
+assert "rel script, payload cwd = primary checkout"    ALLOW "$(decide "$(j_bash_cwd "$QL_PRIMARY" "$QL_REL")")"
+assert "ctl: rel script, no payload cwd, PWD = lookalike"  PASS  "$(decide_in "$QL_FAKE" "$(j_bash "$QL_REL")")"
+assert "rel script, no payload cwd, PWD = own checkout"    ALLOW "$(decide_in "$QL_HERE" "$(j_bash "$QL_REL")")"
+assert "rel script, no payload cwd, PWD = primary"         ALLOW "$(decide_in "$QL_PRIMARY" "$(j_bash "$QL_REL")")"
+assert "ctl: payload cwd (lookalike) beats PWD (real)" PASS  "$(decide_in "$QL_HERE" "$(j_bash_cwd "$QL_FAKE" "$QL_REL")")"
+assert "payload cwd (real) beats PWD (lookalike)"      ALLOW "$(decide_in "$QL_FAKE" "$(j_bash_cwd "$QL_HERE" "$QL_REL")")"
+rm -rf "$QL_FAKE"
+assert "queue-lock release (no HANDOVER_DIR)"   ALLOW "$(decide "$(j_bash "bash scripts/handover/queue-lock.sh release $QL_DOC $QL_TOK")")"
+assert "queue-lock acquire"                     ALLOW "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh acquire $QL_DOC")")"
+assert "queue-lock heartbeat"                   ALLOW "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh heartbeat $QL_DOC $QL_TOK")")"
+assert "queue-lock status"                      ALLOW "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh status $QL_DOC")")"
+assert "queue-lock status --sweep"              ALLOW "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh status --sweep $QL_R")")"
+# CONTROLS — none of these may be approved. Compound: the carve-out is the whole
+# command only; a queue-lock segment after &&/;/| (or a pipe INTO it) falls through.
+assert "ctl: git log && queue-lock release"     PASS "$(decide "$(j_bash "git log --oneline -1 && HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh release $QL_DOC $QL_TOK")")"
+assert "ctl: queue-lock release && git log"     PASS "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh release $QL_DOC $QL_TOK && git log")")"
+assert "ctl: echo ; queue-lock release"         PASS "$(decide "$(j_bash "echo x; HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh release $QL_DOC $QL_TOK")")"
+assert "ctl: pipe INTO queue-lock"              PASS "$(decide "$(j_bash "cat $QL_DOC | HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh release $QL_DOC $QL_TOK")")"
+assert "ctl: queue-lock | tail"                 PASS "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh status $QL_DOC | tail -1")")"
+assert "ctl: queue-lock > file"                 PASS "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh status $QL_DOC > /tmp/out")")"
+assert "ctl: force-release env prefix"          PASS "$(decide "$(j_bash "QUEUE_LOCK_FORCE_RELEASE=1 bash scripts/handover/queue-lock.sh release $QL_DOC")")"
+assert "ctl: second assignment"                 PASS "$(decide "$(j_bash "HANDOVER_DIR=$QL_R QUEUE_LOCK_FORCE_RELEASE=1 bash scripts/handover/queue-lock.sh release $QL_DOC")")"
+assert "ctl: other script name"                 PASS "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash scripts/handover/other.sh release $QL_DOC $QL_TOK")")"
+assert "ctl: bash flag before script"           PASS "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash -x scripts/handover/queue-lock.sh release $QL_DOC $QL_TOK")")"
+assert "ctl: unknown verb"                      PASS "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh force-release $QL_DOC")")"
+assert "ctl: doc outside HANDOVER_DIR"          PASS "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh release /etc/passwd.md $QL_TOK")")"
+assert "ctl: dot-dot doc"                       PASS "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh release $QL_R/../x.md $QL_TOK")")"
+assert "ctl: variable doc"                      PASS "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh release \$DOC $QL_TOK")")"
+assert "ctl: variable HANDOVER_DIR"             PASS "$(decide "$(j_bash "HANDOVER_DIR=\$X bash scripts/handover/queue-lock.sh release $QL_DOC $QL_TOK")")"
+assert "ctl: extra trailing arg"                PASS "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh release $QL_DOC $QL_TOK extra")")"
+assert "ctl: relative doc"                      PASS "$(decide "$(j_bash "bash scripts/handover/queue-lock.sh release yotamleo/x.md $QL_TOK")")"
+assert "ctl: non-.md doc"                       PASS "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh release $QL_R/x.txt $QL_TOK")")"
+assert "ctl: other bash script"                 PASS "$(decide "$(j_bash "bash scripts/handover/merge-on-green.sh 1 --jira-transition")")"
+# Whole-command means NO unquoted separator anywhere — not merely one non-empty
+# segment. scan_cmd emits an EMPTY segment after a trailing separator and the
+# segment count skips it, so these once counted as a lone command (CodeRabbit,
+# round 2): a trailing `&` even backgrounds the lock op. The lone command above
+# still approves; each of these is a control that must fall through.
+QL_LONE="HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh status $QL_DOC"
+assert "ctl: trailing &"                        PASS "$(decide "$(j_bash "$QL_LONE &")")"
+assert "ctl: trailing ;"                        PASS "$(decide "$(j_bash "$QL_LONE;")")"
+assert "ctl: trailing && (empty tail)"          PASS "$(decide "$(j_bash "$QL_LONE &&")")"
+assert "ctl: trailing || (empty tail)"          PASS "$(decide "$(j_bash "$QL_LONE ||")")"
+assert "ctl: trailing |  (empty tail)"          PASS "$(decide "$(j_bash "$QL_LONE |")")"
+# A bare trailing newline never reaches the scanner (the hook's `$(jq …)` capture
+# strips it), and `cmd\n` is the identical single command to the shell, so it
+# approves; a newline that leaves ANYTHING behind it is a real separator.
+assert "lone command + bare trailing newline"   ALLOW "$(decide "$(j_bash "$QL_LONE"$'\n')")"
+assert "ctl: newline + whitespace tail"         PASS "$(decide "$(j_bash "$QL_LONE"$'\n  ')")"
+assert "ctl: newline + second command"          PASS "$(decide "$(j_bash "$QL_LONE"$'\necho x')")"
+assert "ctl: leading newline + command"         PASS "$(decide "$(j_bash $'\n'"$QL_LONE")")"
+assert "ctl: trailing ;;"                       PASS "$(decide "$(j_bash "$QL_LONE ;;")")"
+assert "ctl: leading ;"                         PASS "$(decide "$(j_bash "; $QL_LONE")")"
+assert "ctl: leading &&"                        PASS "$(decide "$(j_bash "&& $QL_LONE")")"
+assert "ctl: release trailing &"                PASS "$(decide "$(j_bash "HANDOVER_DIR=$QL_R bash scripts/handover/queue-lock.sh release $QL_DOC $QL_TOK &")")"
+assert "the lone command still approves"        ALLOW "$(decide "$(j_bash "$QL_LONE")")"
+
 echo ""
 if [ "$FAILED" -eq 0 ]; then
     echo "All cases passed."

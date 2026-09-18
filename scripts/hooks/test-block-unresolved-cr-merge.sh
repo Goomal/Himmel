@@ -385,9 +385,11 @@ rm -f "$GOROOT/.locks/go/42.abc123"
 # truncated go-gate.sh is refused (rc=2), via its new `command -v go_gate`
 # precondition.
 TRUNC_GOGATE="$TMP/go-gate-truncated.sh"
-head -n 33 "$SCRIPT_DIR/../lib/go-gate.sh" > "$TRUNC_GOGATE"
+head -n 29 "$SCRIPT_DIR/../lib/go-gate.sh" > "$TRUNC_GOGATE"
 if grep -q '^go_gate()' "$TRUNC_GOGATE"; then
-    fail=$((fail+1)); echo "FAIL red-control setup: go-gate.sh header grew past line 33 — the truncated copy still defines go_gate, so this control no longer exercises a missing-symbol source"
+    fail=$((fail+1)); echo "FAIL red-control setup: go-gate.sh header grew past line 29 — the truncated copy still defines go_gate, so this control no longer exercises a missing-symbol source"
+elif ! grep -q '^console_leg()' "$TRUNC_GOGATE"; then
+    fail=$((fail+1)); echo "FAIL red-control setup: go-gate.sh's console_leg() no longer fits in the first 29 lines — the truncated copy would fail the new console_leg lib-missing check instead of exercising the go_gate missing-symbol source this control targets"
 else
     RC127_PAYLOAD="$TMP/red-control-rc127-payload.json"
     payload Bash "gh pr merge 42 --squash --match-head-commit abc123" > "$RC127_PAYLOAD"
@@ -452,6 +454,57 @@ RUNEOF
     else
         fail=$((fail+1)); echo "FAIL red-control-rc127-post-fix-refuses rc=$post_rc127_rc (want 2, stderr naming 'not defined')"
     fi
+fi
+
+# ── HIMMEL-3149 follow-up: a non-leg session must stay untouched by a
+# COMPLETELY BROKEN go-gate.sh, not just a missing symbol. Self-review before
+# /pr-check found that centralizing console_leg had widened gate 3's blast
+# radius: sourcing go-gate.sh and failing closed on load failure used to live
+# INSIDE the HIMMEL_CONSOLE_LEG-truthy branch (a non-leg session never
+# attempted it), but the first cut of this commit moved that unconditionally
+# before the leg check -- a broken go-gate.sh would then refuse EVERY merge,
+# leg or not, contradicting this file's own header ("untouched for a non-leg
+# session"). Fixed by gating the source on a cheap non-empty check on the raw
+# var first. Prove both halves against the SAME unparseable go-gate.sh: a
+# non-leg session must proceed (rc=0, no "cannot load" on stderr); a leg
+# session must still fail closed (rc=2, "cannot load" on stderr) -- the fix
+# narrows the blast radius, it does not remove the fail-closed guarantee for
+# actual legs.
+BROKEN_GOGATE="$TMP/go-gate-unparseable.sh"
+printf '#!/usr/bin/env bash\nif this is not valid bash (((\n' > "$BROKEN_GOGATE"
+BROKEN_GOGATE_ROOT="$TMP/broken-gogate-hook"
+mkdir -p "$BROKEN_GOGATE_ROOT/scripts/hooks" "$BROKEN_GOGATE_ROOT/scripts/lib"
+cp "$HOOK" "$BROKEN_GOGATE_ROOT/scripts/hooks/block-unresolved-cr-merge.sh"
+cp "$SCRIPT_DIR/../lib/cr-merge-gate.sh" "$BROKEN_GOGATE_ROOT/scripts/lib/cr-merge-gate.sh"
+cp "$SCRIPT_DIR/../lib/ci-green-gate.sh" "$BROKEN_GOGATE_ROOT/scripts/lib/ci-green-gate.sh"
+cp "$SCRIPT_DIR/../lib/handover-path.sh" "$BROKEN_GOGATE_ROOT/scripts/lib/handover-path.sh"
+cp "$BROKEN_GOGATE" "$BROKEN_GOGATE_ROOT/scripts/lib/go-gate.sh"
+
+BROKEN_GOGATE_PAYLOAD="$TMP/broken-gogate-payload.json"
+payload Bash "gh pr merge 42 --squash" > "$BROKEN_GOGATE_PAYLOAD"
+
+BROKEN_GOGATE_NONLEG_OUT="$TMP/broken-gogate-nonleg-out"
+BROKEN_GOGATE_NONLEG_ERR="$TMP/broken-gogate-nonleg-err"
+GH_STUB_MODE=clean GH_STUB_LOG="$TMP/calls-broken-gogate-nonleg.log" \
+    bash "$BROKEN_GOGATE_ROOT/scripts/hooks/block-unresolved-cr-merge.sh" \
+    < "$BROKEN_GOGATE_PAYLOAD" > "$BROKEN_GOGATE_NONLEG_OUT" 2>"$BROKEN_GOGATE_NONLEG_ERR"
+broken_gogate_nonleg_rc=$?
+if [ "$broken_gogate_nonleg_rc" -eq 0 ] && ! grep -qi "cannot load" "$BROKEN_GOGATE_NONLEG_ERR"; then
+    pass=$((pass+1)); echo "ok   broken-go-gate-nonleg-untouched"
+else
+    fail=$((fail+1)); echo "FAIL broken-go-gate-nonleg-untouched rc=$broken_gogate_nonleg_rc (want 0, no 'cannot load' on stderr) err=$(cat "$BROKEN_GOGATE_NONLEG_ERR")"
+fi
+
+BROKEN_GOGATE_LEG_OUT="$TMP/broken-gogate-leg-out"
+BROKEN_GOGATE_LEG_ERR="$TMP/broken-gogate-leg-err"
+HIMMEL_CONSOLE_LEG=1 GH_STUB_MODE=clean GH_STUB_LOG="$TMP/calls-broken-gogate-leg.log" \
+    bash "$BROKEN_GOGATE_ROOT/scripts/hooks/block-unresolved-cr-merge.sh" \
+    < "$BROKEN_GOGATE_PAYLOAD" > "$BROKEN_GOGATE_LEG_OUT" 2>"$BROKEN_GOGATE_LEG_ERR"
+broken_gogate_leg_rc=$?
+if [ "$broken_gogate_leg_rc" -eq 2 ] && grep -qi "cannot load" "$BROKEN_GOGATE_LEG_ERR"; then
+    pass=$((pass+1)); echo "ok   broken-go-gate-leg-still-fails-closed"
+else
+    fail=$((fail+1)); echo "FAIL broken-go-gate-leg-still-fails-closed rc=$broken_gogate_leg_rc (want 2, 'cannot load' on stderr) err=$(cat "$BROKEN_GOGATE_LEG_ERR")"
 fi
 
 # ── HIMMEL-3142 CR round 4: FOURTH and FIFTH RED controls — `command -v

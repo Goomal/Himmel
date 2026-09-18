@@ -168,6 +168,17 @@
 # export to children, same clearing effect as `unset` -- word-bounded scan
 # over every remaining word, same as `let`/`read`, no option-shape model.
 #
+# HIMMEL-3185 (the fifth clearing shape): an arithmetic COMMAND `(( ... ))` or
+# EXPANSION `$(( ... ))` whose body assigns a registered seam clears it in
+# the current shell like `let` does. `((NAME=0))` was already denied only by
+# accident (the split body reads as an assignment WORD); the spaced
+# `(( NAME = 0 ))`, `+=`, `++`/`--` and comma-joined forms left no assignment
+# word and were ALLOWED. segment_cmd now lifts each `((`/`$((` body out whole
+# (arith_body, quoted `"$(( ))"` included), scan_segment folds the seam names
+# it ASSIGNS (arith_fold). Unlike `let`/`$[...]` this fold names the assignment
+# forms rather than denying every mention, because a comparison inside `(( ))`
+# (`(( NAME == 0 ))`, `(( NAME > 0 ))`) is the ordinary idiom and must ALLOW.
+#
 # The round-2 '(' carve-out is CLOSED: an unquoted '(' / ')' / backtick
 # (and `$(` / backtick inside double quotes) opens a fresh command
 # position via segmentation, so subshell, $(...), and backtick-wrapped
@@ -283,6 +294,104 @@ fi
 # A shell-word that opens an assignment: NAME= with a valid variable name.
 ASSIGN_RE='^[A-Za-z_][A-Za-z0-9_]*='
 
+# HIMMEL-3185: segment_cmd tags an arithmetic body it lifted out of a
+# `(( ... ))` / `$(( ... ))` with this prefix so scan_segment can tell it from
+# ordinary command text (see arith_body / arith_fold below).
+ARITH_TAG=$'\001ARITH\001'
+
+# arith_body <text> <index just past the opening `((`> -- set ARITH_BODY to
+# the arithmetic expression up to its matching `))` (grouping parens inside
+# it balanced) and return 0; return 1 when no adjacent `))` closes it (the
+# `((cmd); cmd)` nested-subshell reading, or an unterminated span -- both
+# keep the segmentation they always had). Quotes are not modelled: a `)`
+# inside a quoted string in an arithmetic body mis-balances (ponytail:
+# documented determined-bypass residual, same posture as the header's
+# string-reconstruction note).
+arith_body() {
+    local s="$1" i="$2" n start="$2" d=0 c
+    ARITH_BODY=''
+    n=${#s}
+    while [ "$i" -lt "$n" ]; do
+        c=${s:i:1}
+        case "$c" in
+        '(') d=$((d + 1)) ;;
+        ')')
+            if [ "$d" -gt 0 ]; then
+                d=$((d - 1))
+            elif [ "${s:$((i + 1)):1}" = ")" ]; then
+                ARITH_BODY=${s:start:$((i - start))}
+                return 0
+            else
+                return 1
+            fi
+            ;;
+        esac
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# arith_fold <arithmetic body> -- fold every registered seam name the body
+# ASSIGNS into UNSET_NAMES, exactly like `let`'s fold. Unlike `let`/`$[...]`
+# (which deny a bare mention), a comparison or read inside `(( ))` is the
+# ordinary idiom (`(( SEAM == 0 ))`, `(( SEAM > 0 ))`) and stays ALLOW, so
+# this one fold does name the assignment forms: `NAME` (optionally
+# `NAME[..]`) followed by `=` (not `==`), a compound `op=` (`+= -= *= /= %=
+# &= |= ^= <<= >>=`), or a postfix `++`/`--`; and a prefix `++`/`--` before
+# the name. Whitespace anywhere between the tokens is allowed -- the spaced
+# spelling is the one the no-space assignment-WORD path never saw. Anywhere in
+# the body counts (comma lists, ternary arms, grouping parens).
+arith_fold() {
+    local body="$1" flat='' n re c i=0 k=0 d=0 ins='' nb=${#1}
+    local -a spans
+    local ns=0
+    local ws='[[:space:]]*'
+    # A subscript `[ ... ]` may nest (`NAME[i[0]] = 0`), which no bracket
+    # regex can match, so scan it with a depth counter (bash 3.2-safe): flatten
+    # every top-level span to `[]` for the assignment test below and keep its
+    # inside to be folded on its own -- an index is itself arithmetic
+    # (`x[ SEAM = 0 ] = 1` assigns SEAM). An unterminated `[` is a bash syntax
+    # error, so that body keeps its raw text.
+    while [ "$i" -lt "$nb" ]; do
+        c=${body:i:1}
+        if [ "$d" -eq 0 ]; then
+            flat="$flat$c"
+            if [ "$c" = "[" ]; then d=1; ins=''; fi
+        else
+            case "$c" in
+            '[') d=$((d + 1)); ins="$ins$c" ;;
+            ']')
+                d=$((d - 1))
+                if [ "$d" -eq 0 ]; then
+                    flat="$flat]"; spans[ns]="$ins"; ns=$((ns + 1))
+                else
+                    ins="$ins$c"
+                fi
+                ;;
+            *) ins="$ins$c" ;;
+            esac
+        fi
+        i=$((i + 1))
+    done
+    if [ "$d" -ne 0 ]; then flat="$body"; ns=0; fi
+    for n in $ALL_SEAM_VARS; do
+        [ -n "$n" ] || continue
+        re="(^|[^A-Za-z0-9_])${n}${ws}(\\[\\])?${ws}((\\+\\+|--)|(([-+*/%&|^]|<<|>>)?=([^=]|\$)))"
+        if [[ $flat =~ $re ]]; then
+            UNSET_NAMES="$UNSET_NAMES $n"
+            continue
+        fi
+        re="(\\+\\+|--)${ws}${n}(\$|[^A-Za-z0-9_])"
+        if [[ $flat =~ $re ]]; then
+            UNSET_NAMES="$UNSET_NAMES $n"
+        fi
+    done
+    while [ "$k" -lt "$ns" ]; do
+        arith_fold "${spans[k]}"
+        k=$((k + 1))
+    done
+}
+
 # segment_cmd <flat-command> -- print each command segment as
 # "<paren-depth>\t<segment>", one per line. A segment is a span of text
 # whose first word stands at COMMAND POSITION. Splits on unquoted ';', '&',
@@ -373,6 +482,11 @@ segment_cmd() {
                     ;;
                 \$)
                     if [ "${s:$((i + 1)):1}" = "(" ]; then
+                        # HIMMEL-3185: `"$(( ... ))"` -- same lift as the
+                        # unquoted `((` arm; the sub=1 split below still runs.
+                        if [ "${s:$((i + 2)):1}" = "(" ] && arith_body "$s" $((i + 3)); then
+                            printf '%s\t%s\n' "$pdepth" "$ARITH_TAG$ARITH_BODY"
+                        fi
                         printf '%s\t%s\n' "$pdepth" "$seg\""; seg=''; sub=1; i=$((i + 2))
                     else
                         seg="$seg$c"; i=$((i + 1))
@@ -439,6 +553,19 @@ segment_cmd() {
             seg="$seg$c"; i=$((i + 1)); cmdpos=1
             ;;
         \()
+            # HIMMEL-3185: `((` / `$((` -- lift the arithmetic body out
+            # whole, tagged, so scan_segment can fold a seam ASSIGNMENT in
+            # it. The body's own text still segments below exactly as
+            # before (its parens are opaque), but that path only sees an
+            # assignment WORD (`NAME=0`); the spaced `NAME = 0` is words.
+            # Emitted BEFORE the pending segment is flushed: bash expands
+            # `$(( ))` in a word before it execs the command, so in
+            # `bash chokepoint.sh $(( SEAM = 0 ))` the fold must already be
+            # in UNSET_NAMES when the segment holding the chokepoint (the
+            # text ahead of this `(`) is scanned (CodeRabbit, PR #853).
+            if [ "${s:$((i + 1)):1}" = "(" ] && arith_body "$s" $((i + 2)); then
+                printf '%s\t%s\n' "$pdepth" "$ARITH_TAG$ARITH_BODY"
+            fi
             printf '%s\t%s\n' "$pdepth" "$seg"; seg=''
             if [ "$confused" = "0" ]; then
                 kind='O'
@@ -947,6 +1074,12 @@ scan_segment() {
     local env_endopts=0 lo_out lo_verdict lo_operand
     local cluster_out cluster_verdict cluster_operand
     local n
+    # HIMMEL-3185: an arithmetic body lifted by segment_cmd is not command
+    # text -- fold its seam assignments and stop.
+    if [[ $seg == "$ARITH_TAG"* ]]; then
+        arith_fold "${seg#"$ARITH_TAG"}"
+        return 0
+    fi
     names="$inames"
     # HIMMEL-2939 (collapse, CR round 4 -- console ruling on the pattern
     # that parked HIMMEL-2929 and ended #635 at round 5): `$[NAME=0]`
@@ -970,6 +1103,10 @@ scan_segment() {
             [ -n "$n" ] || continue
             if [[ $seg =~ (^|[^A-Za-z0-9_])"$n"($|[^A-Za-z0-9_]) ]]; then
                 UNSET_NAMES="$UNSET_NAMES $n"
+                # ...and into THIS segment's own names: `bash chokepoint.sh
+                # $[ SEAM = 0 ]` expands before the exec, so the call in the
+                # same segment must see it (CodeRabbit, PR #853 class sweep).
+                names="$names $n"
             fi
         done
     fi

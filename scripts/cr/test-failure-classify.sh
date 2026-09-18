@@ -171,4 +171,61 @@ check "27: sourcing does not leak errexit" "$(cat "$tmp/source_result")" "surviv
 ) > "$tmp/source_result2" 2>/dev/null
 check "28: sourcing does not leak nounset" "$(cat "$tmp/source_result2")" "survived"
 
+# ── first_signal_line <file> (HIMMEL-3105): the FIRST line of a captured body
+# that carries a provider-failure signature. Feeds the ledger detail (so the
+# provider error line, not the last stderr line, is what the avail row shows)
+# and critic-first-pass.sh's "raw signal:" line for bodies whose decisive line
+# sits outside the raw-tail bound. Shares failure-classify.sh's signature
+# table, so it cannot drift from classify_failure.
+fsl() {
+    printf '%s' "$1" > "$tmp/fsl_in"
+    # shellcheck source=scripts/cr/failure-classify.sh
+    # shellcheck disable=SC1091
+    ( . "$FC"; first_signal_line "$tmp/fsl_in" )
+}
+check "29: banner then 429 line -> the 429 line, not the banner" \
+    "$(fsl 'A previous hermes update pulled new code; restart the gateway daemon.
+Provider said: HTTP 429: The usage limit has been reached
+Contact support if this persists.')" \
+    "Provider said: HTTP 429: The usage limit has been reached"
+check "30: quota wording without a status code is a signal line" \
+    "$(fsl 'prelude
+The free quota has been exhausted
+tail')" \
+    "The free quota has been exhausted"
+check "31: no signature anywhere -> empty" "$(fsl 'model prose with no failure text at all')" ""
+check "32: cfp's own Raw output: path line is never a signal (random mktemp suffix)" \
+    "$(fsl 'critic-first-pass.sh: malformed output — fail-open. Raw output: /tmp/cfp-raw.a429bc')" ""
+check "33: a ticket ID (HIMMEL-473) is not a status-code signal" \
+    "$(fsl 'adapted to the model FAMILY (HIMMEL-473)')" ""
+_fsl_long="$(fsl "HTTP 429 $(printf 'x%.0s' $(seq 1 400))")"
+check "34: signal line is bounded to 300 chars" "${#_fsl_long}" "300"
+_fsl_missing="$(
+    # shellcheck source=scripts/cr/failure-classify.sh
+    # shellcheck disable=SC1091
+    . "$FC"; first_signal_line "$tmp/does-not-exist"; echo "rc=$?"
+)"
+check "35: missing file -> empty, rc 0" "$_fsl_missing" "rc=0"
+# The signature set must cover every distinctive token classify_failure keys a
+# non-generic class on (CodeRabbit round 1): a quota-long line outside the raw
+# tail has to surface, and a bare "usage limit" (which classify_failure alone
+# never acts on, see 3110 above) must not select prose over the real line.
+check "36: codex 'hit your usage limit' line is a signal" \
+    "$(fsl "prelude
+You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 19th, 2026 10:09 AM.
+tail")" \
+    "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 19th, 2026 10:09 AM."
+check "37: plan-expired (quota-long sentinel) line is a signal" \
+    "$(fsl 'prelude
+Your plan has expired
+tail')" \
+    "Your plan has expired"
+check "38: weekly-cap (quota-long sentinel) line is a signal" \
+    "$(fsl 'prelude
+Weekly cap reached for this account
+tail')" \
+    "Weekly cap reached for this account"
+check "39: a bare 'usage limit' in prose is not a signal (classify_failure never acts on it alone)" \
+    "$(fsl 'The reviewer mentioned a usage limit in passing.')" ""
+
 [ "$fails" -eq 0 ] && echo "ALL PASS" || { echo "$fails FAILED"; exit 1; }

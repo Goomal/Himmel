@@ -516,6 +516,10 @@ fi
 # refused leg mutates nothing, and before the DRY_RUN branch so a dry run
 # reports the refusal too. Unset marker: skipped whole — the resolver is not
 # even sourced, so operator sessions are unchanged.
+#
+# The actual file check is scripts/lib/go-gate.sh's go_gate() (HIMMEL-3142) —
+# shared with block-unresolved-cr-merge.sh's own gh-pr-merge gate, so the two
+# cannot drift on what "the GO binds" means.
 if _truthy "${HIMMEL_CONSOLE_LEG:-}"; then
     go_root=""
     # shellcheck source=scripts/lib/handover-path.sh
@@ -524,8 +528,32 @@ if _truthy "${HIMMEL_CONSOLE_LEG:-}"; then
         go_root=$(handover_root 2>/dev/null) || go_root=""
     fi
     go_file="${go_root:-<unresolved handover root>}/.locks/go/$pr_num.$sha"
-    if [ -z "$go_root" ] || ! grep -qxF "head=$sha" "$go_file" 2>/dev/null; then
-        echo "merge-on-green: PR #$pr_num at $sha has no console GO ($go_file) — you are a console-spawned leg; send READY to your console and wait for GO; a GO for an older head is stale, never reuse it" >&2
+    # Drop any go_gate already in scope (a PATH executable or an inherited
+    # `export -f go_gate` would otherwise survive the source below
+    # undetected — declare -F after sourcing can't tell "the file defined
+    # it" from "it was already callable") before sourcing, so only the
+    # file's own definition can satisfy the declare -F check that follows.
+    unset -f go_gate 2>/dev/null || true
+    # shellcheck source=scripts/lib/go-gate.sh
+    # shellcheck disable=SC1091
+    if ! . "$SCRIPT_DIR/../lib/go-gate.sh" 2>/dev/null; then
+        echo "merge-on-green: cannot load scripts/lib/go-gate.sh — refusing (a console-spawned leg's GO gate must fail closed, not silently no-op)" >&2
+        audit "REFUSED reason=policy-refused phase=console-go-lib-missing repo=$nwo pr=#$pr_num sha=$sha"
+        exit 17
+    fi
+    if ! declare -F go_gate >/dev/null 2>&1; then
+        echo "merge-on-green: scripts/lib/go-gate.sh sourced but go_gate is not defined (truncated file?) — refusing (a console-spawned leg's GO gate must fail closed, not silently no-op)" >&2
+        audit "REFUSED reason=policy-refused phase=console-go-symbol-missing repo=$nwo pr=#$pr_num sha=$sha"
+        exit 17
+    fi
+    go_reason=""
+    go_rc=0
+    go_reason=$(go_gate "$pr_num" "$sha" "$go_root") || go_rc=$?
+    if [ "$go_rc" -ne 0 ]; then
+        if [ -z "$go_reason" ]; then
+            go_reason="go_gate for PR #$pr_num at $sha returned an unexpected exit code ($go_rc) — this is a console-spawned leg; send READY to your console and wait for GO"
+        fi
+        echo "merge-on-green: $go_reason" >&2
         audit "REFUSED reason=policy-refused phase=console-go repo=$nwo pr=#$pr_num sha=$sha go=$go_file"
         exit 17
     fi

@@ -193,6 +193,14 @@ mog_build_fixture() {
     cp "$SCRIPT_DIR/../lib/cr-available.sh" "$tmp/scripts/lib/cr-available.sh"
     # HIMMEL-2919: the console-GO gate resolves the GO file under handover_root.
     cp "$SCRIPT_DIR/../lib/handover-path.sh" "$tmp/scripts/lib/handover-path.sh"
+    # HIMMEL-3142: the GO file check itself now lives in the shared predicate
+    # go_gate() (also used by block-unresolved-cr-merge.sh's own gate).
+    # GO_GATE_SRC is MOG_SRC's own twin (same TEST-HARNESS-ONLY seam, same
+    # non-gate-integrity reasoning above): it lets a RED control swap in a
+    # scratch mutant of go-gate.sh (e.g. truncated, so it sources but never
+    # defines go_gate) while merge-on-green.sh itself stays whichever copy
+    # MOG_SRC picked. Defaults to the real file.
+    cp "${GO_GATE_SRC:-$SCRIPT_DIR/../lib/go-gate.sh}" "$tmp/scripts/lib/go-gate.sh"
     if [ "${NO_CHECK_CI:-0}" != "1" ]; then
         printf '#!/usr/bin/env bash\nexit %s\n' "${STUB_CI_RC:-0}" > "$tmp/scripts/check-ci.sh"
         chmod +x "$tmp/scripts/check-ci.sh"
@@ -2296,6 +2304,228 @@ if [ "$(cat "$LAST_GH_LOG")" = "$GO_B_GHLOG" ]; then pass; else fail "2919-b/d: 
 HIMMEL_CONSOLE_LEG=0 HANDOVER_DIR="$GO_ROOT" STUB_SHA="$GO_SHA" \
     run_mog 0 "2919-d2: HIMMEL_CONSOLE_LEG=0, no GO → merged"
 rm -rf "$GO_ROOT"
+
+# HIMMEL-3142 CR round 3: RED control — the pre-fix script tested
+# `[ "$go_rc" = "2" ]`, enumerating go_gate's one documented refusal code
+# instead of enforcing "nonzero = failure". A go-gate.sh that sources
+# cleanly but never DEFINES go_gate (truncated) makes the call fail with
+# "command not found" (go_rc=127), which is != "2" — so the pre-fix
+# script (head 6749462a, this ticket's round-2 shipped state) fell
+# through the refusal entirely and continued straight to a real merge,
+# with no GO file anywhere. Same fixture as 2919-a (console leg, no GO
+# file) but against a truncated go-gate.sh: prove it wrongly merges
+# pre-fix, and is refused post-fix by the new `command -v go_gate`
+# precondition.
+RC5_TRUNC_GOGATE=$(mktemp "${TMPDIR:-/tmp}/mog-3142-rc127-gogate.XXXXXX")
+head -n 33 "$SCRIPT_DIR/../lib/go-gate.sh" > "$RC5_TRUNC_GOGATE"
+if grep -q '^go_gate()' "$RC5_TRUNC_GOGATE"; then
+    fail "RC-5 setup: go-gate.sh header grew past line 33 — the truncated copy still defines go_gate, so this control no longer exercises a missing-symbol source"
+else
+    RC5_PRE_SHA=6749462a6c22911d748b8a39254fbd86bdf14ece
+    rc5_pre_mutant=$(mktemp "${TMPDIR:-/tmp}/mog-3142-rc127-pre.XXXXXX")
+    git -C "$SCRIPT_DIR/../.." show "$RC5_PRE_SHA:scripts/handover/merge-on-green.sh" > "$rc5_pre_mutant" 2>/dev/null
+    if [ ! -s "$rc5_pre_mutant" ]; then
+        fail "RC-5 setup: could not extract the pre-round-3-fix merge-on-green.sh from head $RC5_PRE_SHA"
+    else
+        rc5_go_root=$(mktemp -d "${TMPDIR:-/tmp}/mog-3142-rc127-go.XXXXXX")
+        rc5_go_root=$(cd "$rc5_go_root" && pwd)
+        rc5_sha=0123456789abcdef0123456789abcdef01234567
+        rc5_tmp=$(mktemp -d "${TMPDIR:-/tmp}/mog-3142-rc127-fixture.XXXXXX")
+        rc5_gh="$rc5_tmp/gh.log"; : > "$rc5_gh"
+        rc5_clear="$rc5_tmp/clear.log"; : > "$rc5_clear"
+        rc5_audit="$rc5_tmp/audit.log"
+        MOG_SRC="$rc5_pre_mutant" GO_GATE_SRC="$RC5_TRUNC_GOGATE" mog_build_fixture "$rc5_tmp"
+        red_control_run --cwd "$rc5_tmp" \
+            --env GH_LOG="$rc5_gh" --env CLEAR_LOG="$rc5_clear" --env MERGE_ON_GREEN_LOG="$rc5_audit" \
+            --env PATH="$rc5_tmp/bin:$PATH" --env MERGE_ON_GREEN_SLEEP_CMD=: \
+            --env HIMMEL_CONSOLE_LEG=1 --env HANDOVER_DIR="$rc5_go_root" --env STUB_SHA="$rc5_sha" \
+            -- bash "$rc5_tmp/scripts/handover/merge-on-green.sh"
+        rc5_merged=no
+        grep -Eq '^pr merge( |$)' "$rc5_gh" 2>/dev/null && rc5_merged=yes
+        if red_control_assert --label "HIMMEL-3142-RC127-MOG-RC" --expect-rc 0 \
+            --observed     "rc=$RED_CONTROL_RC merged=$rc5_merged" \
+            --expect-wrong "rc=0 merged=yes" \
+            --correct      "rc=17 merged=no" \
+            --note "pre-round-3-fix merge-on-green.sh (head $RC5_PRE_SHA) tested go_rc = \"2\" only; a truncated go-gate.sh sources cleanly but never defines go_gate, so the call fails with rc=127, the test is false, and the console-GO gate never fires — same fixture as 2919-a (console leg, no GO file), which the shipped script refuses"
+        then
+            pass
+        else
+            fail "RC-5 mutant: RED control did not hold (see the RED-control diagnostic above)"
+        fi
+        rm -rf "$rc5_tmp" "$rc5_go_root"
+
+        # Post-fix: same truncated go-gate.sh, but the LIVE (fixed) script.
+        rc5_post_tmp=$(mktemp -d "${TMPDIR:-/tmp}/mog-3142-rc127-post.XXXXXX")
+        rc5_post_gh="$rc5_post_tmp/gh.log"; : > "$rc5_post_gh"
+        rc5_post_clear="$rc5_post_tmp/clear.log"; : > "$rc5_post_clear"
+        rc5_post_audit="$rc5_post_tmp/audit.log"
+        rc5_post_go_root=$(mktemp -d "${TMPDIR:-/tmp}/mog-3142-rc127-post-go.XXXXXX")
+        rc5_post_go_root=$(cd "$rc5_post_go_root" && pwd)
+        GO_GATE_SRC="$RC5_TRUNC_GOGATE" mog_build_fixture "$rc5_post_tmp"
+        rc5_post_err="$rc5_post_tmp/stderr.log"
+        (
+            cd "$rc5_post_tmp" && \
+            GH_LOG="$rc5_post_gh" CLEAR_LOG="$rc5_post_clear" MERGE_ON_GREEN_LOG="$rc5_post_audit" \
+            PATH="$rc5_post_tmp/bin:$PATH" MERGE_ON_GREEN_SLEEP_CMD=: \
+            HIMMEL_CONSOLE_LEG=1 HANDOVER_DIR="$rc5_post_go_root" STUB_SHA="$rc5_sha" \
+            bash "$rc5_post_tmp/scripts/handover/merge-on-green.sh"
+        ) >/dev/null 2>"$rc5_post_err"
+        rc5_post_rc=$?
+        if [ "$rc5_post_rc" -eq 17 ] && grep -qi "not defined" "$rc5_post_err" \
+            && grep -q "phase=console-go-symbol-missing" "$rc5_post_audit" 2>/dev/null; then
+            pass
+        else
+            fail "RC-5 post-fix: expected exit 17 naming 'not defined' + phase=console-go-symbol-missing, got rc=$rc5_post_rc stderr=$(cat "$rc5_post_err" 2>/dev/null)"
+        fi
+        rm -rf "$rc5_post_tmp" "$rc5_post_go_root"
+    fi
+    rm -f "$rc5_pre_mutant"
+fi
+rm -f "$RC5_TRUNC_GOGATE"
+
+# HIMMEL-3142 CR round 4: RC-6/RC-7 — `command -v go_gate` (round 3's fix)
+# answers "is the name go_gate callable", not "did sourcing go-gate.sh define
+# the function". Two distinct ways that diverges, both against a truncated
+# go-gate.sh (does not define go_gate):
+#   RC-6: a PATH executable named go_gate — command -v finds it, the script
+#         CALLS it (not a function), it exits 0, and the console-GO gate
+#         never fires. declare -F (bash-function-only) rejects this.
+#   RC-7: an inherited `export -f go_gate` in the launching shell — a real
+#         bash function, so declare -F ALSO passes it through unless it is
+#         unset first; only `unset -f go_gate` before the source closes it.
+# Pre-fix blob for both is head 6fe4ad20 (round 3's shipped script, the
+# `command -v` version).
+RC67_TRUNC_GOGATE=$(mktemp "${TMPDIR:-/tmp}/mog-3142-rc67-gogate.XXXXXX")
+head -n 33 "$SCRIPT_DIR/../lib/go-gate.sh" > "$RC67_TRUNC_GOGATE"
+if grep -q '^go_gate()' "$RC67_TRUNC_GOGATE"; then
+    fail "RC-6/RC-7 setup: go-gate.sh header grew past line 33 — the truncated copy still defines go_gate, so this control no longer exercises a missing-symbol source"
+else
+    RC67_PRE_SHA=6fe4ad205612f59c71c8354ff9f5981c5d23bb5f
+    rc67_pre_mutant=$(mktemp "${TMPDIR:-/tmp}/mog-3142-rc67-pre.XXXXXX")
+    git -C "$SCRIPT_DIR/../.." show "$RC67_PRE_SHA:scripts/handover/merge-on-green.sh" > "$rc67_pre_mutant" 2>/dev/null
+    if [ ! -s "$rc67_pre_mutant" ]; then
+        fail "RC-6/RC-7 setup: could not extract the pre-round-4-fix merge-on-green.sh from head $RC67_PRE_SHA"
+    else
+        rc67_sha=0123456789abcdef0123456789abcdef01234567
+
+        # ── RC-6: PATH-executable go_gate ──
+        rc6_bin=$(mktemp -d "${TMPDIR:-/tmp}/mog-3142-rc6-bin.XXXXXX")
+        cat > "$rc6_bin/go_gate" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+        chmod +x "$rc6_bin/go_gate"
+
+        rc6_go_root=$(mktemp -d "${TMPDIR:-/tmp}/mog-3142-rc6-go.XXXXXX")
+        rc6_go_root=$(cd "$rc6_go_root" && pwd)
+        rc6_tmp=$(mktemp -d "${TMPDIR:-/tmp}/mog-3142-rc6-fixture.XXXXXX")
+        rc6_gh="$rc6_tmp/gh.log"; : > "$rc6_gh"
+        rc6_clear="$rc6_tmp/clear.log"; : > "$rc6_clear"
+        rc6_audit="$rc6_tmp/audit.log"
+        MOG_SRC="$rc67_pre_mutant" GO_GATE_SRC="$RC67_TRUNC_GOGATE" mog_build_fixture "$rc6_tmp"
+        red_control_run --cwd "$rc6_tmp" \
+            --env GH_LOG="$rc6_gh" --env CLEAR_LOG="$rc6_clear" --env MERGE_ON_GREEN_LOG="$rc6_audit" \
+            --env PATH="$rc6_bin:$rc6_tmp/bin:$PATH" --env MERGE_ON_GREEN_SLEEP_CMD=: \
+            --env HIMMEL_CONSOLE_LEG=1 --env HANDOVER_DIR="$rc6_go_root" --env STUB_SHA="$rc67_sha" \
+            -- bash "$rc6_tmp/scripts/handover/merge-on-green.sh"
+        rc6_merged=no
+        grep -Eq '^pr merge( |$)' "$rc6_gh" 2>/dev/null && rc6_merged=yes
+        if red_control_assert --label "HIMMEL-3142-RC6-RC" --expect-rc 0 \
+            --observed     "rc=$RED_CONTROL_RC merged=$rc6_merged" \
+            --expect-wrong "rc=0 merged=yes" \
+            --correct      "rc=17 merged=no" \
+            --note "round-3-shipped merge-on-green.sh (head $RC67_PRE_SHA) used \`command -v go_gate\`, which finds a PATH executable named go_gate exactly as readily as a sourced function; against a truncated go-gate.sh plus a PATH-executable go_gate that exits 0, the script calls that executable, treats go_rc=0 as a real GO, and merges with no go_gate function ever having run"
+        then
+            pass
+        else
+            fail "RC-6 mutant: RED control did not hold (see the RED-control diagnostic above)"
+        fi
+        rm -rf "$rc6_tmp" "$rc6_go_root"
+
+        rc6_post_go_root=$(mktemp -d "${TMPDIR:-/tmp}/mog-3142-rc6-post-go.XXXXXX")
+        rc6_post_go_root=$(cd "$rc6_post_go_root" && pwd)
+        rc6_post_tmp=$(mktemp -d "${TMPDIR:-/tmp}/mog-3142-rc6-post.XXXXXX")
+        rc6_post_gh="$rc6_post_tmp/gh.log"; : > "$rc6_post_gh"
+        rc6_post_clear="$rc6_post_tmp/clear.log"; : > "$rc6_post_clear"
+        rc6_post_audit="$rc6_post_tmp/audit.log"
+        GO_GATE_SRC="$RC67_TRUNC_GOGATE" mog_build_fixture "$rc6_post_tmp"
+        rc6_post_err="$rc6_post_tmp/stderr.log"
+        (
+            cd "$rc6_post_tmp" && \
+            GH_LOG="$rc6_post_gh" CLEAR_LOG="$rc6_post_clear" MERGE_ON_GREEN_LOG="$rc6_post_audit" \
+            PATH="$rc6_bin:$rc6_post_tmp/bin:$PATH" MERGE_ON_GREEN_SLEEP_CMD=: \
+            HIMMEL_CONSOLE_LEG=1 HANDOVER_DIR="$rc6_post_go_root" STUB_SHA="$rc67_sha" \
+            bash "$rc6_post_tmp/scripts/handover/merge-on-green.sh"
+        ) >/dev/null 2>"$rc6_post_err"
+        rc6_post_rc=$?
+        if [ "$rc6_post_rc" -eq 17 ] && grep -qi "not defined" "$rc6_post_err" \
+            && grep -q "phase=console-go-symbol-missing" "$rc6_post_audit" 2>/dev/null; then
+            pass
+        else
+            fail "RC-6 post-fix: expected exit 17 naming 'not defined' + phase=console-go-symbol-missing, got rc=$rc6_post_rc stderr=$(cat "$rc6_post_err" 2>/dev/null)"
+        fi
+        rm -rf "$rc6_post_tmp" "$rc6_post_go_root"
+        rm -rf "$rc6_bin"
+
+        # ── RC-7: inherited `export -f go_gate` ──
+        # shellcheck disable=SC2329,SC2317  # invoked indirectly via export -f in a child bash process (rc7 fixture)
+        go_gate() { exit 0; }
+        export -f go_gate
+
+        rc7_go_root=$(mktemp -d "${TMPDIR:-/tmp}/mog-3142-rc7-go.XXXXXX")
+        rc7_go_root=$(cd "$rc7_go_root" && pwd)
+        rc7_tmp=$(mktemp -d "${TMPDIR:-/tmp}/mog-3142-rc7-fixture.XXXXXX")
+        rc7_gh="$rc7_tmp/gh.log"; : > "$rc7_gh"
+        rc7_clear="$rc7_tmp/clear.log"; : > "$rc7_clear"
+        rc7_audit="$rc7_tmp/audit.log"
+        MOG_SRC="$rc67_pre_mutant" GO_GATE_SRC="$RC67_TRUNC_GOGATE" mog_build_fixture "$rc7_tmp"
+        red_control_run --cwd "$rc7_tmp" \
+            --env GH_LOG="$rc7_gh" --env CLEAR_LOG="$rc7_clear" --env MERGE_ON_GREEN_LOG="$rc7_audit" \
+            --env PATH="$rc7_tmp/bin:$PATH" --env MERGE_ON_GREEN_SLEEP_CMD=: \
+            --env HIMMEL_CONSOLE_LEG=1 --env HANDOVER_DIR="$rc7_go_root" --env STUB_SHA="$rc67_sha" \
+            -- bash "$rc7_tmp/scripts/handover/merge-on-green.sh"
+        rc7_merged=no
+        grep -Eq '^pr merge( |$)' "$rc7_gh" 2>/dev/null && rc7_merged=yes
+        if red_control_assert --label "HIMMEL-3142-RC7-RC" --expect-rc 0 \
+            --observed     "rc=$RED_CONTROL_RC merged=$rc7_merged" \
+            --expect-wrong "rc=0 merged=yes" \
+            --correct      "rc=17 merged=no" \
+            --note "round-3-shipped merge-on-green.sh (head $RC67_PRE_SHA) used \`command -v go_gate\` with no unset -f before sourcing; an inherited export -f go_gate in the launching shell is a real bash function, so command -v finds it exactly like one the file just defined, and a truncated go-gate.sh never overrides it"
+        then
+            pass
+        else
+            fail "RC-7 mutant: RED control did not hold (see the RED-control diagnostic above)"
+        fi
+        rm -rf "$rc7_tmp" "$rc7_go_root"
+
+        rc7_post_go_root=$(mktemp -d "${TMPDIR:-/tmp}/mog-3142-rc7-post-go.XXXXXX")
+        rc7_post_go_root=$(cd "$rc7_post_go_root" && pwd)
+        rc7_post_tmp=$(mktemp -d "${TMPDIR:-/tmp}/mog-3142-rc7-post.XXXXXX")
+        rc7_post_gh="$rc7_post_tmp/gh.log"; : > "$rc7_post_gh"
+        rc7_post_clear="$rc7_post_tmp/clear.log"; : > "$rc7_post_clear"
+        rc7_post_audit="$rc7_post_tmp/audit.log"
+        GO_GATE_SRC="$RC67_TRUNC_GOGATE" mog_build_fixture "$rc7_post_tmp"
+        rc7_post_err="$rc7_post_tmp/stderr.log"
+        (
+            cd "$rc7_post_tmp" && \
+            GH_LOG="$rc7_post_gh" CLEAR_LOG="$rc7_post_clear" MERGE_ON_GREEN_LOG="$rc7_post_audit" \
+            PATH="$rc7_post_tmp/bin:$PATH" MERGE_ON_GREEN_SLEEP_CMD=: \
+            HIMMEL_CONSOLE_LEG=1 HANDOVER_DIR="$rc7_post_go_root" STUB_SHA="$rc67_sha" \
+            bash "$rc7_post_tmp/scripts/handover/merge-on-green.sh"
+        ) >/dev/null 2>"$rc7_post_err"
+        rc7_post_rc=$?
+        if [ "$rc7_post_rc" -eq 17 ] && grep -qi "not defined" "$rc7_post_err" \
+            && grep -q "phase=console-go-symbol-missing" "$rc7_post_audit" 2>/dev/null; then
+            pass
+        else
+            fail "RC-7 post-fix: expected exit 17 naming 'not defined' + phase=console-go-symbol-missing, got rc=$rc7_post_rc stderr=$(cat "$rc7_post_err" 2>/dev/null)"
+        fi
+        rm -rf "$rc7_post_tmp" "$rc7_post_go_root"
+        unset -f go_gate
+    fi
+    rm -f "$rc67_pre_mutant"
+fi
+rm -f "$RC67_TRUNC_GOGATE"
 
 # --- HIMMEL-374: best-effort Jira auto-transition on merge -------------------
 # No ticket tag in the PR title => no Jira CLI calls, merge still succeeds.

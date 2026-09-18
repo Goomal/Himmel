@@ -11,6 +11,14 @@ set -uo pipefail
 # still block — the CI gate is independent of CR_MERGE_GATE_OK, HIMMEL-1043).
 unset ARMAUTOMERGE CR_MERGE_GATE_OK
 
+# HIMMEL-3142 — a console-spawned leg's own launching shell carries
+# HIMMEL_CONSOLE_LEG=1, which arms the new gate-3 console-GO check below. An
+# ambient value here (this suite is itself frequently run FROM such a leg)
+# would refuse every allow-case below with "no console GO" before gate 3 is
+# even under test (same precedent as test-merge-on-green.sh). Gate 3 gets its
+# own dedicated cases further down, each setting HIMMEL_CONSOLE_LEG itself.
+unset HIMMEL_CONSOLE_LEG
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOK="$SCRIPT_DIR/block-unresolved-cr-merge.sh"
 TMP="$(mktemp -d)"
@@ -182,6 +190,404 @@ GH_STUB_MODE=unresolved CR_MERGE_GATE_OK=1 t bypass-allows 0 Bash "gh pr merge 4
 unset CR_MERGE_GATE_OK
 GH_STUB_MODE=unresolved CR_PROFILE=none t profile-none-allows 0 Bash "gh pr merge 42 --squash"
 unset CR_PROFILE
+
+# ── HIMMEL-3142 gate 3: console-GO merge gate — runs only when
+# HIMMEL_CONSOLE_LEG is truthy, after the CR/CI gates above already pass
+# (GH_STUB_MODE=clean). Shares scripts/lib/go-gate.sh with
+# merge-on-green.sh's own HIMMEL-2919 gate, so the fixture shape (pr=42,
+# head=abc123, GO file at <go_root>/.locks/go/<pr>.<head>) mirrors that
+# suite's 2919-* cases.
+GOROOT="$TMP/handover_root"
+mkdir -p "$GOROOT/.locks/go"
+
+# leg + no GO file at all -> refused (the PR #798 shape this ticket exists to close)
+HIMMEL_CONSOLE_LEG=1 HANDOVER_DIR="$GOROOT" GH_STUB_MODE=clean t leg-no-go-blocks 2 Bash "gh pr merge 42 --squash"
+
+# leg + a GO file for the exact certified head, and the merge command pins
+# that exact head -> bound, merge allowed
+printf 'pr=42\nhead=abc123\nby=test\nat=now\n' > "$GOROOT/.locks/go/42.abc123"
+HIMMEL_CONSOLE_LEG=1 HANDOVER_DIR="$GOROOT" GH_STUB_MODE=clean t leg-valid-go-allows 0 Bash "gh pr merge 42 --squash --match-head-commit abc123"
+
+# HIMMEL-3142 CR round: a confirmed GO is bound to $go_sha, but that's only
+# THIS hook's own `gh pr view` read -- the merge command that follows is a
+# separate invocation and can land a different commit unless it pins one
+# itself. Three more cases against the SAME valid-GO fixture above:
+# (a) no pin at all -> refused (the gap CodeRabbit found)
+HIMMEL_CONSOLE_LEG=1 HANDOVER_DIR="$GOROOT" GH_STUB_MODE=clean t leg-valid-go-no-pin-blocks 2 Bash "gh pr merge 42 --squash"
+# (b) pin naming a DIFFERENT sha than the GO was bound to -> refused
+HIMMEL_CONSOLE_LEG=1 HANDOVER_DIR="$GOROOT" GH_STUB_MODE=clean t leg-valid-go-wrong-pin-blocks 2 Bash "gh pr merge 42 --squash --match-head-commit WRONGSHA"
+# (c) --match-head-commit=<sha> (the = form; the old parser silently
+# discarded it via the --*|-* catch-all instead of capturing it) naming the
+# exact certified head -> allowed
+HIMMEL_CONSOLE_LEG=1 HANDOVER_DIR="$GOROOT" GH_STUB_MODE=clean t leg-valid-go-pin-eq-form-allows 0 Bash "gh pr merge 42 --squash --match-head-commit=abc123"
+rm -f "$GOROOT/.locks/go/42.abc123"
+
+# leg + a GO file present but for a DIFFERENT (stale) head -> still refused
+printf 'pr=42\nhead=OLDSHA\nby=test\nat=now\n' > "$GOROOT/.locks/go/42.abc123"
+HIMMEL_CONSOLE_LEG=1 HANDOVER_DIR="$GOROOT" GH_STUB_MODE=clean t leg-stale-go-blocks 2 Bash "gh pr merge 42 --squash"
+rm -f "$GOROOT/.locks/go/42.abc123"
+
+# HIMMEL_CONSOLE_LEG=0 is the falsy convention (go.sh/merge-on-green.sh share
+# it) -> gate 3 never activates, no GO file needed
+HIMMEL_CONSOLE_LEG=0 HANDOVER_DIR="$GOROOT" GH_STUB_MODE=clean t leg-marker-falsy-allows 0 Bash "gh pr merge 42 --squash"
+
+# inversion control: a VALID matching GO file present, marker flipped OFF ->
+# still allowed. Discriminates the marker from the go_root/file as the thing
+# that gates -- leg-marker-falsy-allows above proves the marker gates when no
+# GO file exists at all, but that alone cannot rule out an implementation
+# that is really keying off go_root/file presence rather than the marker; a
+# GO file genuinely present here removes that ambiguity.
+printf 'pr=42\nhead=abc123\nby=test\nat=now\n' > "$GOROOT/.locks/go/42.abc123"
+HIMMEL_CONSOLE_LEG=0 HANDOVER_DIR="$GOROOT" GH_STUB_MODE=clean t leg-marker-falsy-with-go-present-allows 0 Bash "gh pr merge 42 --squash"
+rm -f "$GOROOT/.locks/go/42.abc123"
+
+# a non-leg session (HIMMEL_CONSOLE_LEG unset, the suite default) is
+# completely untouched by gate 3 even with an unresolvable go_root
+# (HANDOVER_DIR left unset here) -- "a gate that blocks everything is not a
+# gate".
+GH_STUB_MODE=clean t non-leg-untouched-by-go-gate 0 Bash "gh pr merge 42 --squash"
+
+grep -qi "no console GO" "$TMP/err-leg-no-go-blocks" || { echo "FAIL leg-no-go reason missing"; fail=$((fail+1)); }
+grep -q "42.abc123" "$TMP/err-leg-no-go-blocks" || { echo "FAIL leg-no-go reason missing GO path"; fail=$((fail+1)); }
+grep -qi "no console GO" "$TMP/err-leg-stale-go-blocks" || { echo "FAIL leg-stale-go reason missing"; fail=$((fail+1)); }
+grep -qi "must pin" "$TMP/err-leg-valid-go-no-pin-blocks" || { echo "FAIL leg-valid-go-no-pin reason missing"; fail=$((fail+1)); }
+grep -qi "does not match" "$TMP/err-leg-valid-go-wrong-pin-blocks" || { echo "FAIL leg-valid-go-wrong-pin reason missing"; fail=$((fail+1)); }
+
+# ── HIMMEL-3142 contract item 6: RED control — the pre-fix hook (base
+# 6ac483e4, before this ticket) never consulted .locks/go/ at all, so a
+# console-spawned leg with no GO file could run `gh pr merge` straight
+# through (the PR #798 shape this ticket exists to close). Prove it: extract
+# that exact script into a scratch mutant, run the SAME leg-no-go fixture
+# leg-no-go-blocks used above against it, and confirm it was allowed (rc=0)
+# where the shipped hook (proven by leg-no-go-blocks, above) refuses (rc=2).
+export RED_CONTROL_TMPDIR="$TMP"
+# shellcheck source=scripts/lib/red-control.sh
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/../lib/red-control.sh"
+
+PRE_FIX_SHA=6ac483e4ad49d66e5760a2ea632871bcab029576
+PRE_FIX_PAYLOAD="$TMP/red-control-payload.json"
+payload Bash "gh pr merge 42 --squash" > "$PRE_FIX_PAYLOAD"
+
+PRE_FIX_ROOT="$TMP/pre-fix-hook"
+mkdir -p "$PRE_FIX_ROOT/scripts/hooks" "$PRE_FIX_ROOT/scripts/lib"
+git -C "$SCRIPT_DIR/../.." show "$PRE_FIX_SHA:scripts/hooks/block-unresolved-cr-merge.sh" \
+    > "$PRE_FIX_ROOT/scripts/hooks/block-unresolved-cr-merge.sh" 2>/dev/null
+cp "$SCRIPT_DIR/../lib/cr-merge-gate.sh" "$PRE_FIX_ROOT/scripts/lib/cr-merge-gate.sh"
+cp "$SCRIPT_DIR/../lib/ci-green-gate.sh" "$PRE_FIX_ROOT/scripts/lib/ci-green-gate.sh"
+# The mutant wrapper always exits 0 itself (it prints the gated hook's rc as
+# data rather than propagating it) -- same shape as the RC-3 grep-mutant in
+# test-merge-on-green.sh: point (a) "the mutant RAN" is then trivially
+# satisfied, so the real evidence is the SPECIFIC printed value (point c),
+# which is why this echoes "rc=<n>" to stdout rather than relying on the
+# wrapper's own exit status.
+cat > "$PRE_FIX_ROOT/run.sh" <<RUNEOF
+#!/usr/bin/env bash
+bash "$PRE_FIX_ROOT/scripts/hooks/block-unresolved-cr-merge.sh" < "$PRE_FIX_PAYLOAD"
+echo "rc=\$?"
+RUNEOF
+chmod +x "$PRE_FIX_ROOT/run.sh"
+
+if [ ! -s "$PRE_FIX_ROOT/scripts/hooks/block-unresolved-cr-merge.sh" ]; then
+    fail=$((fail+1)); echo "FAIL red-control setup: could not extract the pre-fix hook from base $PRE_FIX_SHA"
+else
+    red_control_run \
+        --env HIMMEL_CONSOLE_LEG=1 --env "HANDOVER_DIR=$GOROOT" --env GH_STUB_MODE=clean \
+        --env "GH_STUB_LOG=$TMP/calls-red-control-pre.log" \
+        -- bash "$PRE_FIX_ROOT/run.sh"
+    if red_control_assert --label "HIMMEL-3142-RC" --expect-rc 0 \
+        --observed     "$RED_CONTROL_OUT" \
+        --expect-wrong "rc=0" \
+        --correct      "rc=2" \
+        --note "pre-fix block-unresolved-cr-merge.sh (base $PRE_FIX_SHA) had no console-GO gate at all, so it let a console-spawned leg with NO GO file merge straight through; the shipped hook's leg-no-go-blocks case (above, same fixture) refuses it"
+    then
+        pass=$((pass+1)); echo "ok   red-control-pre-fix-allowed-post-fix-refuses"
+    else
+        fail=$((fail+1)); echo "FAIL red-control-pre-fix-allowed-post-fix-refuses"
+    fi
+fi
+
+# ── HIMMEL-3142 CR round: SECOND RED control — the previously-shipped hook
+# (head ef6f995a, before the --match-head-commit pin check existed) resolved
+# go_num/go_sha and confirmed a GO was bound to that head, but never checked
+# the merge command's OWN --match-head-commit value, so a leg with a valid
+# GO and no pin at all merged straight through. Prove it: extract that exact
+# blob, run the SAME leg-valid-go-no-pin fixture against it, and confirm it
+# was allowed (rc=0) where the shipped hook (proven by
+# leg-valid-go-no-pin-blocks, above) refuses (rc=2). Deliberately NOT run
+# against PRE_FIX_SHA above: that blob predates go-gate.sh entirely, so it
+# would fail this fixture for the unrelated reason of having no GO concept
+# at all, proving nothing about the pin specifically.
+PRE_PIN_SHA=ef6f995aabf01bae0e19a1cefa04de2ae2977d18
+PRE_PIN_PAYLOAD="$TMP/red-control-pin-payload.json"
+payload Bash "gh pr merge 42 --squash" > "$PRE_PIN_PAYLOAD"
+
+PRE_PIN_ROOT="$TMP/pre-pin-hook"
+mkdir -p "$PRE_PIN_ROOT/scripts/hooks" "$PRE_PIN_ROOT/scripts/lib"
+git -C "$SCRIPT_DIR/../.." show "$PRE_PIN_SHA:scripts/hooks/block-unresolved-cr-merge.sh" \
+    > "$PRE_PIN_ROOT/scripts/hooks/block-unresolved-cr-merge.sh" 2>/dev/null
+cp "$SCRIPT_DIR/../lib/cr-merge-gate.sh" "$PRE_PIN_ROOT/scripts/lib/cr-merge-gate.sh"
+cp "$SCRIPT_DIR/../lib/ci-green-gate.sh" "$PRE_PIN_ROOT/scripts/lib/ci-green-gate.sh"
+cp "$SCRIPT_DIR/../lib/go-gate.sh" "$PRE_PIN_ROOT/scripts/lib/go-gate.sh"
+cp "$SCRIPT_DIR/../lib/handover-path.sh" "$PRE_PIN_ROOT/scripts/lib/handover-path.sh"
+
+cat > "$PRE_PIN_ROOT/run.sh" <<RUNEOF
+#!/usr/bin/env bash
+bash "$PRE_PIN_ROOT/scripts/hooks/block-unresolved-cr-merge.sh" < "$PRE_PIN_PAYLOAD"
+echo "rc=\$?"
+RUNEOF
+chmod +x "$PRE_PIN_ROOT/run.sh"
+
+printf 'pr=42\nhead=abc123\nby=test\nat=now\n' > "$GOROOT/.locks/go/42.abc123"
+if [ ! -s "$PRE_PIN_ROOT/scripts/hooks/block-unresolved-cr-merge.sh" ]; then
+    fail=$((fail+1)); echo "FAIL red-control setup: could not extract the pre-pin hook from head $PRE_PIN_SHA"
+else
+    red_control_run \
+        --env HIMMEL_CONSOLE_LEG=1 --env "HANDOVER_DIR=$GOROOT" --env GH_STUB_MODE=clean \
+        --env "GH_STUB_LOG=$TMP/calls-red-control-pin.log" \
+        -- bash "$PRE_PIN_ROOT/run.sh"
+    if red_control_assert --label "HIMMEL-3142-PIN-RC" --expect-rc 0 \
+        --observed     "$RED_CONTROL_OUT" \
+        --expect-wrong "rc=0" \
+        --correct      "rc=2" \
+        --note "pre-pin block-unresolved-cr-merge.sh (head $PRE_PIN_SHA) confirmed a GO was bound to \$go_sha but never checked the merge command's own --match-head-commit, so a leg with a valid GO and no pin at all merged straight through; the shipped hook's leg-valid-go-no-pin-blocks case (above, same fixture) refuses it"
+    then
+        pass=$((pass+1)); echo "ok   red-control-pin-pre-fix-allowed-post-fix-refuses"
+    else
+        fail=$((fail+1)); echo "FAIL red-control-pin-pre-fix-allowed-post-fix-refuses"
+    fi
+fi
+rm -f "$GOROOT/.locks/go/42.abc123"
+
+# ── HIMMEL-3142 CR round 3: THIRD RED control — both callers tested
+# `[ "$go_rc" = "2" ]`, enumerating go_gate's one documented refusal code
+# instead of enforcing "nonzero = failure". A go-gate.sh that sources cleanly
+# (rc=0) but never DEFINES go_gate (truncated) makes the later call fail with
+# "command not found" (go_rc=127), which is != "2" — so the pre-fix hook fell
+# through the guard entirely and reached the pin check using go_sha from its
+# OWN gh pr view read, not from go_gate. A leg that pins
+# --match-head-commit <that same head> then merges with NO go_gate call
+# ever having succeeded and NO GO file anywhere. Prove it two ways: the
+# pre-fix blob (head 6749462a, before this round's fix) is allowed (rc=0)
+# against a truncated go-gate.sh; the shipped, fixed hook against the SAME
+# truncated go-gate.sh is refused (rc=2), via its new `command -v go_gate`
+# precondition.
+TRUNC_GOGATE="$TMP/go-gate-truncated.sh"
+head -n 33 "$SCRIPT_DIR/../lib/go-gate.sh" > "$TRUNC_GOGATE"
+if grep -q '^go_gate()' "$TRUNC_GOGATE"; then
+    fail=$((fail+1)); echo "FAIL red-control setup: go-gate.sh header grew past line 33 — the truncated copy still defines go_gate, so this control no longer exercises a missing-symbol source"
+else
+    RC127_PAYLOAD="$TMP/red-control-rc127-payload.json"
+    payload Bash "gh pr merge 42 --squash --match-head-commit abc123" > "$RC127_PAYLOAD"
+
+    PRE_RC127_SHA=6749462a6c22911d748b8a39254fbd86bdf14ece
+    PRE_RC127_ROOT="$TMP/pre-rc127-hook"
+    mkdir -p "$PRE_RC127_ROOT/scripts/hooks" "$PRE_RC127_ROOT/scripts/lib"
+    git -C "$SCRIPT_DIR/../.." show "$PRE_RC127_SHA:scripts/hooks/block-unresolved-cr-merge.sh" \
+        > "$PRE_RC127_ROOT/scripts/hooks/block-unresolved-cr-merge.sh" 2>/dev/null
+    cp "$SCRIPT_DIR/../lib/cr-merge-gate.sh" "$PRE_RC127_ROOT/scripts/lib/cr-merge-gate.sh"
+    cp "$SCRIPT_DIR/../lib/ci-green-gate.sh" "$PRE_RC127_ROOT/scripts/lib/ci-green-gate.sh"
+    cp "$SCRIPT_DIR/../lib/handover-path.sh" "$PRE_RC127_ROOT/scripts/lib/handover-path.sh"
+    cp "$TRUNC_GOGATE" "$PRE_RC127_ROOT/scripts/lib/go-gate.sh"
+
+    cat > "$PRE_RC127_ROOT/run.sh" <<RUNEOF
+#!/usr/bin/env bash
+bash "$PRE_RC127_ROOT/scripts/hooks/block-unresolved-cr-merge.sh" < "$RC127_PAYLOAD"
+echo "rc=\$?"
+RUNEOF
+    chmod +x "$PRE_RC127_ROOT/run.sh"
+
+    if [ ! -s "$PRE_RC127_ROOT/scripts/hooks/block-unresolved-cr-merge.sh" ]; then
+        fail=$((fail+1)); echo "FAIL red-control setup: could not extract the pre-rc127-fix hook from head $PRE_RC127_SHA"
+    else
+        red_control_run \
+            --env HIMMEL_CONSOLE_LEG=1 --env "HANDOVER_DIR=$GOROOT" --env GH_STUB_MODE=clean \
+            --env "GH_STUB_LOG=$TMP/calls-red-control-rc127.log" \
+            -- bash "$PRE_RC127_ROOT/run.sh"
+        if red_control_assert --label "HIMMEL-3142-RC127-RC" --expect-rc 0 \
+            --observed     "$RED_CONTROL_OUT" \
+            --expect-wrong "rc=0" \
+            --correct      "rc=2" \
+            --note "pre-round-3-fix block-unresolved-cr-merge.sh (head $PRE_RC127_SHA) tested go_rc = \"2\" only; a truncated go-gate.sh sources cleanly but never defines go_gate, so the call fails with rc=127 (command not found), the test is false, and the hook falls through to a pin check it can satisfy with its own gh pr view read — no GO file needed at all"
+        then
+            pass=$((pass+1)); echo "ok   red-control-rc127-pre-fix-allowed"
+        else
+            fail=$((fail+1)); echo "FAIL red-control-rc127-pre-fix-allowed"
+        fi
+    fi
+
+    POST_RC127_ROOT="$TMP/post-rc127-hook"
+    mkdir -p "$POST_RC127_ROOT/scripts/hooks" "$POST_RC127_ROOT/scripts/lib"
+    cp "$HOOK" "$POST_RC127_ROOT/scripts/hooks/block-unresolved-cr-merge.sh"
+    cp "$SCRIPT_DIR/../lib/cr-merge-gate.sh" "$POST_RC127_ROOT/scripts/lib/cr-merge-gate.sh"
+    cp "$SCRIPT_DIR/../lib/ci-green-gate.sh" "$POST_RC127_ROOT/scripts/lib/ci-green-gate.sh"
+    cp "$SCRIPT_DIR/../lib/handover-path.sh" "$POST_RC127_ROOT/scripts/lib/handover-path.sh"
+    cp "$TRUNC_GOGATE" "$POST_RC127_ROOT/scripts/lib/go-gate.sh"
+
+    POST_RC127_OUT="$TMP/post-rc127-out"
+    POST_RC127_ERR="$TMP/post-rc127-err"
+    HIMMEL_CONSOLE_LEG=1 HANDOVER_DIR="$GOROOT" GH_STUB_MODE=clean \
+        GH_STUB_LOG="$TMP/calls-red-control-rc127-post.log" \
+        bash "$POST_RC127_ROOT/scripts/hooks/block-unresolved-cr-merge.sh" \
+        < "$RC127_PAYLOAD" > "$POST_RC127_OUT" 2>"$POST_RC127_ERR"
+    post_rc127_rc=$?
+    if [ "$post_rc127_rc" -eq 2 ] && grep -qi "not defined" "$POST_RC127_ERR"; then
+        pass=$((pass+1)); echo "ok   red-control-rc127-post-fix-refuses"
+    else
+        fail=$((fail+1)); echo "FAIL red-control-rc127-post-fix-refuses rc=$post_rc127_rc (want 2, stderr naming 'not defined')"
+    fi
+fi
+
+# ── HIMMEL-3142 CR round 4: FOURTH and FIFTH RED controls — `command -v
+# go_gate` (round 3's fix) answers "is the name go_gate callable", not "did
+# sourcing go-gate.sh define the function". Two distinct ways that diverges,
+# each needing its own control, against the SAME truncated go-gate.sh
+# ($TRUNC_GOGATE, built above — does not define go_gate):
+#   (A) a PATH executable named go_gate: `command -v` finds it on PATH and
+#       PASSES; the hook then CALLS it (not a function — the real binary),
+#       it exits 0, go_rc=0, and the hook proceeds to a full GO bypass.
+#       `declare -F` (bash-function-only) correctly rejects this.
+#   (B) an inherited `export -f go_gate` in the launching shell: it IS a
+#       real bash function, so `declare -F` ALSO passes it through — the
+#       symbol check alone cannot distinguish "the file just defined this"
+#       from "this was already in scope before we sourced". Only
+#       `unset -f go_gate` BEFORE the source (so a stale/inherited
+#       definition cannot survive it) closes this half.
+# The pre-fix blob for both is head 6fe4ad20 (round 3's shipped hook, the
+# `command -v` version) — control (B) also proves round 3's own fix does not
+# close this second door, motivating the unset-then-declare-F combination.
+PRE_RC4_SHA=6fe4ad205612f59c71c8354ff9f5981c5d23bb5f
+RC4_PAYLOAD="$TMP/red-control-rc4-payload.json"
+payload Bash "gh pr merge 42 --squash --match-head-commit abc123" > "$RC4_PAYLOAD"
+
+rc4_extract_hook() {
+    # $1 = dest root
+    mkdir -p "$1/scripts/hooks" "$1/scripts/lib"
+    git -C "$SCRIPT_DIR/../.." show "$PRE_RC4_SHA:scripts/hooks/block-unresolved-cr-merge.sh" \
+        > "$1/scripts/hooks/block-unresolved-cr-merge.sh" 2>/dev/null
+    cp "$SCRIPT_DIR/../lib/cr-merge-gate.sh" "$1/scripts/lib/cr-merge-gate.sh"
+    cp "$SCRIPT_DIR/../lib/ci-green-gate.sh" "$1/scripts/lib/ci-green-gate.sh"
+    cp "$SCRIPT_DIR/../lib/handover-path.sh" "$1/scripts/lib/handover-path.sh"
+    cp "$TRUNC_GOGATE" "$1/scripts/lib/go-gate.sh"
+}
+
+if [ ! -s "$TRUNC_GOGATE" ] || grep -q '^go_gate()' "$TRUNC_GOGATE"; then
+    fail=$((fail+1)); echo "FAIL red-control setup: TRUNC_GOGATE unusable for round-4 controls"
+else
+    # (A) PATH-executable go_gate
+    RC4A_BIN="$TMP/rc4a-bin"
+    mkdir -p "$RC4A_BIN"
+    cat > "$RC4A_BIN/go_gate" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    chmod +x "$RC4A_BIN/go_gate"
+
+    PRE_RC4A_ROOT="$TMP/pre-rc4a-hook"
+    rc4_extract_hook "$PRE_RC4A_ROOT"
+    if [ ! -s "$PRE_RC4A_ROOT/scripts/hooks/block-unresolved-cr-merge.sh" ]; then
+        fail=$((fail+1)); echo "FAIL red-control setup: could not extract the pre-rc4-fix hook from head $PRE_RC4_SHA"
+    else
+        cat > "$PRE_RC4A_ROOT/run.sh" <<RUNEOF
+#!/usr/bin/env bash
+bash "$PRE_RC4A_ROOT/scripts/hooks/block-unresolved-cr-merge.sh" < "$RC4_PAYLOAD"
+echo "rc=\$?"
+RUNEOF
+        chmod +x "$PRE_RC4A_ROOT/run.sh"
+        red_control_run \
+            --env HIMMEL_CONSOLE_LEG=1 --env "HANDOVER_DIR=$GOROOT" --env GH_STUB_MODE=clean \
+            --env "GH_STUB_LOG=$TMP/calls-red-control-rc4a.log" \
+            --env "PATH=$RC4A_BIN:$PATH" \
+            -- bash "$PRE_RC4A_ROOT/run.sh"
+        if red_control_assert --label "HIMMEL-3142-RC4A-RC" --expect-rc 0 \
+            --observed     "$RED_CONTROL_OUT" \
+            --expect-wrong "rc=0" \
+            --correct      "rc=2" \
+            --note "round-3-shipped block-unresolved-cr-merge.sh (head $PRE_RC4_SHA) used \`command -v go_gate\`, which finds a PATH executable named go_gate exactly as readily as a sourced function; against a truncated go-gate.sh plus a PATH-executable go_gate that exits 0, the hook calls that executable, treats go_rc=0 as a real GO, and merges with no go_gate function ever having run"
+        then
+            pass=$((pass+1)); echo "ok   red-control-rc4a-pre-fix-allowed"
+        else
+            fail=$((fail+1)); echo "FAIL red-control-rc4a-pre-fix-allowed"
+        fi
+    fi
+
+    POST_RC4A_ROOT="$TMP/post-rc4a-hook"
+    mkdir -p "$POST_RC4A_ROOT/scripts/hooks" "$POST_RC4A_ROOT/scripts/lib"
+    cp "$HOOK" "$POST_RC4A_ROOT/scripts/hooks/block-unresolved-cr-merge.sh"
+    cp "$SCRIPT_DIR/../lib/cr-merge-gate.sh" "$POST_RC4A_ROOT/scripts/lib/cr-merge-gate.sh"
+    cp "$SCRIPT_DIR/../lib/ci-green-gate.sh" "$POST_RC4A_ROOT/scripts/lib/ci-green-gate.sh"
+    cp "$SCRIPT_DIR/../lib/handover-path.sh" "$POST_RC4A_ROOT/scripts/lib/handover-path.sh"
+    cp "$TRUNC_GOGATE" "$POST_RC4A_ROOT/scripts/lib/go-gate.sh"
+
+    POST_RC4A_OUT="$TMP/post-rc4a-out"
+    POST_RC4A_ERR="$TMP/post-rc4a-err"
+    HIMMEL_CONSOLE_LEG=1 HANDOVER_DIR="$GOROOT" GH_STUB_MODE=clean \
+        GH_STUB_LOG="$TMP/calls-red-control-rc4a-post.log" \
+        PATH="$RC4A_BIN:$PATH" \
+        bash "$POST_RC4A_ROOT/scripts/hooks/block-unresolved-cr-merge.sh" \
+        < "$RC4_PAYLOAD" > "$POST_RC4A_OUT" 2>"$POST_RC4A_ERR"
+    post_rc4a_rc=$?
+    if [ "$post_rc4a_rc" -eq 2 ] && grep -qi "not defined" "$POST_RC4A_ERR"; then
+        pass=$((pass+1)); echo "ok   red-control-rc4a-post-fix-refuses"
+    else
+        fail=$((fail+1)); echo "FAIL red-control-rc4a-post-fix-refuses rc=$post_rc4a_rc (want 2, stderr naming 'not defined')"
+    fi
+
+    # (B) inherited `export -f go_gate`
+    # shellcheck disable=SC2329,SC2317  # invoked indirectly via export -f in a child bash process (rc4b fixture)
+    go_gate() { exit 0; }
+    export -f go_gate
+
+    PRE_RC4B_ROOT="$TMP/pre-rc4b-hook"
+    rc4_extract_hook "$PRE_RC4B_ROOT"
+    if [ ! -s "$PRE_RC4B_ROOT/scripts/hooks/block-unresolved-cr-merge.sh" ]; then
+        fail=$((fail+1)); echo "FAIL red-control setup: could not extract the pre-rc4-fix hook from head $PRE_RC4_SHA (control B)"
+    else
+        cat > "$PRE_RC4B_ROOT/run.sh" <<RUNEOF
+#!/usr/bin/env bash
+bash "$PRE_RC4B_ROOT/scripts/hooks/block-unresolved-cr-merge.sh" < "$RC4_PAYLOAD"
+echo "rc=\$?"
+RUNEOF
+        chmod +x "$PRE_RC4B_ROOT/run.sh"
+        red_control_run \
+            --env HIMMEL_CONSOLE_LEG=1 --env "HANDOVER_DIR=$GOROOT" --env GH_STUB_MODE=clean \
+            --env "GH_STUB_LOG=$TMP/calls-red-control-rc4b.log" \
+            -- bash "$PRE_RC4B_ROOT/run.sh"
+        if red_control_assert --label "HIMMEL-3142-RC4B-RC" --expect-rc 0 \
+            --observed     "$RED_CONTROL_OUT" \
+            --expect-wrong "rc=0" \
+            --correct      "rc=2" \
+            --note "round-3-shipped block-unresolved-cr-merge.sh (head $PRE_RC4_SHA) used \`command -v go_gate\` with no unset -f before sourcing; an inherited export -f go_gate in the launching shell is a real bash function, so command -v finds it exactly like one the file just defined, and a truncated go-gate.sh never overrides it"
+        then
+            pass=$((pass+1)); echo "ok   red-control-rc4b-pre-fix-allowed"
+        else
+            fail=$((fail+1)); echo "FAIL red-control-rc4b-pre-fix-allowed"
+        fi
+    fi
+
+    POST_RC4B_ROOT="$TMP/post-rc4b-hook"
+    mkdir -p "$POST_RC4B_ROOT/scripts/hooks" "$POST_RC4B_ROOT/scripts/lib"
+    cp "$HOOK" "$POST_RC4B_ROOT/scripts/hooks/block-unresolved-cr-merge.sh"
+    cp "$SCRIPT_DIR/../lib/cr-merge-gate.sh" "$POST_RC4B_ROOT/scripts/lib/cr-merge-gate.sh"
+    cp "$SCRIPT_DIR/../lib/ci-green-gate.sh" "$POST_RC4B_ROOT/scripts/lib/ci-green-gate.sh"
+    cp "$SCRIPT_DIR/../lib/handover-path.sh" "$POST_RC4B_ROOT/scripts/lib/handover-path.sh"
+    cp "$TRUNC_GOGATE" "$POST_RC4B_ROOT/scripts/lib/go-gate.sh"
+
+    POST_RC4B_OUT="$TMP/post-rc4b-out"
+    POST_RC4B_ERR="$TMP/post-rc4b-err"
+    HIMMEL_CONSOLE_LEG=1 HANDOVER_DIR="$GOROOT" GH_STUB_MODE=clean \
+        GH_STUB_LOG="$TMP/calls-red-control-rc4b-post.log" \
+        bash "$POST_RC4B_ROOT/scripts/hooks/block-unresolved-cr-merge.sh" \
+        < "$RC4_PAYLOAD" > "$POST_RC4B_OUT" 2>"$POST_RC4B_ERR"
+    post_rc4b_rc=$?
+    if [ "$post_rc4b_rc" -eq 2 ] && grep -qi "not defined" "$POST_RC4B_ERR"; then
+        pass=$((pass+1)); echo "ok   red-control-rc4b-post-fix-refuses"
+    else
+        fail=$((fail+1)); echo "FAIL red-control-rc4b-post-fix-refuses rc=$post_rc4b_rc (want 2, stderr naming 'not defined')"
+    fi
+
+    unset -f go_gate
+fi
 
 # passthrough cases must not touch gh at all (coderabbit: assert EVERY one)
 for pt in non-merge-passthrough string-literal-passthrough quoted-merge-text-passthrough; do

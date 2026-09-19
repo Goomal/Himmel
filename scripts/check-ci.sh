@@ -78,8 +78,10 @@
 # ARMED — see the availability note above; on a disarmed repo they simply do not
 # fire, and the checks + thread verdicts stand on their own):
 #   0 — all checks green AND all review threads resolved AND, WHEN ARMED,
-#       CodeRabbit concluded success on the head SHA AND zero outside-diff-range
-#       body findings AND the latest bot review is anchored to the head SHA, OR
+#       CodeRabbit concluded success on the head SHA AND no outside-diff-range
+#       body finding left undispositioned (an exact-head ledger deferred/disproved
+#       disposition counts, HIMMEL-3124 — see exit 3) AND the latest bot review is
+#       anchored to the head SHA, OR
 #       a stale-anchor diff is carried by a clean exact-head critic panel —
 #       the DEFAULT for that shape regardless of risk classification, HIMMEL-2162
 #       (safe to merge; nitpick/additional body findings are surfaced,
@@ -99,7 +101,11 @@
 #       a "completed" review with nothing to be incremental to (HIMMEL-1374)
 #   3 — checks green but the review state blocks the merge: unresolved review
 #       threads remain, a review requests changes, or CodeRabbit's review body
-#       reports an outside-diff-range finding — address, resolve, re-run
+#       reports an outside-diff-range finding with no exact-head ledger
+#       disposition (HIMMEL-3124) — address, resolve, or record the disposition
+#       recipe the message prints (deferred needs a tracked ticket AND a reason,
+#       disproved needs a reason; a disposition never carries to a new head),
+#       then re-run
 #   4 — (when armed) either: CodeRabbit concluded incrementally on the head but
 #       posted no review object there while a prior head had outside-diff
 #       findings (request @coderabbitai full review, or opt in with --escalate);
@@ -155,7 +161,8 @@ usage() {
 usage: check-ci.sh [<pr-number|branch|url>] [--grace <sec>] [--settle <sec>] [--max-wait <sec>] [--threads-only] [--escalate]
 exit codes: 0 = checks green + all review threads resolved
                 + (if CodeRabbit is armed) CodeRabbit concluded success on the head SHA
-                + zero outside-diff-range body findings
+                + no outside-diff-range body finding left undispositioned (an exact-head ledger
+                  deferred/disproved disposition counts, HIMMEL-3124 — see exit 3)
                 + the latest bot review is anchored to the head SHA, or a clean exact-head panel
                   carries an ordinary stale-anchor diff,
             1 = a check failed, or (if armed) CodeRabbit's status is failure/error,
@@ -165,7 +172,9 @@ exit codes: 0 = checks green + all review threads resolved
                 the review COMPLETED but the PR carries no CodeRabbit review object at any head and no
                 walkthrough certifies this head — nothing to be incremental to, HIMMEL-1374),
             3 = checks green but unresolved review threads remain, a review requests changes, or (if armed)
-                CodeRabbit's review body reports an outside-diff-range finding,
+                CodeRabbit's review body reports an outside-diff-range finding with no exact-head ledger
+                disposition (HIMMEL-3124; the message prints the deferred/disproved recipe, and a
+                disposition never carries to a new head),
             4 = (if armed) CodeRabbit concluded incrementally but posted no review object at the head while a
                 prior head had outside-diff findings (request @coderabbitai full review or use --escalate); or
                 the latest bot review is anchored to a NON-head commit and no clean exact-head panel carries it

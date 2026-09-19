@@ -70,6 +70,12 @@ New-Item -ItemType Directory -Force $Tmp | Out-Null
 $SavedChannelDir = $env:TELEGRAM_CHANNEL_DIR
 $SavedBridgeRoot = $env:BRIDGE_ROOT
 $SavedUserSettings = $env:HIMMEL_USER_SETTINGS
+$SavedCacheDir = $env:HIMMELCTL_CACHE_DIR
+
+# The wet runs that do not name a cache dir (e.g. Test 4b, the default run)
+# would otherwise inherit the operator's HIMMELCTL_CACHE_DIR, or fall back to
+# the real $HOME\.claude\himmel, and delete it. Redirect it for the whole suite.
+$env:HIMMELCTL_CACHE_DIR = Join-Path $Tmp 'cache-default'
 
 # Redirect the [6/7] settings-unwire target away from the operator's REAL
 # ~/.claude/settings.json for the whole suite (HIMMEL-460). SC6 cases re-seed it.
@@ -119,7 +125,7 @@ try {
     New-State
     $env:TELEGRAM_CHANNEL_DIR = $Channel
     $env:BRIDGE_ROOT = $Bridge
-    $out = Invoke-Uninstall @('-DryRun', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+    $out = Invoke-Uninstall @('-DryRun', '-PurgeState', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
     Assert-Rc 'dry-run exits 0' 0 $script:Rc
     Assert-Has 'dry-run prints DRY rm for channel dir' "DRY: Remove-Item -Recurse -Force -LiteralPath $Channel" $out
     Assert-Has 'dry-run prints DRY rm for bridge root' "DRY: Remove-Item -Recurse -Force -LiteralPath $Bridge" $out
@@ -134,7 +140,7 @@ try {
     New-State
     $env:TELEGRAM_CHANNEL_DIR = $Channel
     $env:BRIDGE_ROOT = $Bridge
-    $out = Invoke-Uninstall @('-Yes', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+    $out = Invoke-Uninstall @('-Yes', '-PurgeState', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
     Assert-Rc '-Yes run exits 0' 0 $script:Rc
     if ((Test-Path $Channel) -or (Test-Path $Bridge)) {
         Write-Host 'FAIL -Yes run left state behind'; $script:Failed++
@@ -158,11 +164,27 @@ try {
         Write-Host 'FAIL telegram state removed despite -KeepTelegramState'; $script:Failed++
     }
 
+    # 4b. HIMMEL-3058: the DEFAULT (no -PurgeState) keeps operator state and says
+    # how to remove it; -PurgeState with -KeepTelegramState is refused (rc=2).
+    New-State
+    $env:TELEGRAM_CHANNEL_DIR = $Channel
+    $env:BRIDGE_ROOT = $Bridge
+    $out = Invoke-Uninstall @('-Yes', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+    Assert-Rc 'default run exits 0' 0 $script:Rc
+    if ((Test-Path (Join-Path $Channel 'access.json')) -and (Test-Path $Bridge)) {
+        Write-Host 'PASS default run keeps operator state'
+    } else {
+        Write-Host 'FAIL default run removed operator state'; $script:Failed++
+    }
+    Assert-Has 'default run names -PurgeState' '-PurgeState' $out
+    $out = Invoke-Uninstall @('-Yes', '-PurgeState', '-KeepTelegramState', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+    Assert-Rc '-PurgeState with -KeepTelegramState is refused' 2 $script:Rc
+
     # 5. rm guard: refuses $HOME even when asked
     New-State
     $env:TELEGRAM_CHANNEL_DIR = $HOME
     $env:BRIDGE_ROOT = $Bridge
-    $out = Invoke-Uninstall @('-Yes', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+    $out = Invoke-Uninstall @('-Yes', '-PurgeState', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
     Assert-Rc 'HOME-as-target run exits 0' 0 $script:Rc
     Assert-Has 'refuses to rm HOME' 'refusing to remove suspicious path' $out
     if (Test-Path $HOME) {
@@ -261,7 +283,7 @@ function Unregister-ScheduledTask {
     Set-Content -Path (Join-Path $Bridge 'supervisor.pid') -Value '99999999'
     try {
         $env:PATH = "$StubBun;$SavedPath"
-        $out = Invoke-Uninstall @('-Yes', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+        $out = Invoke-Uninstall @('-Yes', '-PurgeState', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
     } finally { $env:PATH = $SavedPath }
     Assert-Rc 'bridge-stop run exits 0' 0 $script:Rc
     $bunLogText = if (Test-Path $BunLog) { Get-Content $BunLog -Raw } else { '' }
@@ -281,14 +303,17 @@ function Unregister-ScheduledTask {
     try {
         $env:PATH = "$StubBun;$SavedPath"
         $env:BUN_STUB_RC = '2'
-        $out = Invoke-Uninstall @('-Yes', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+        $out = Invoke-Uninstall @('-Yes', '-PurgeState', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
     } finally {
         $env:PATH = $SavedPath
         Remove-Item Env:\BUN_STUB_RC -ErrorAction SilentlyContinue
     }
-    Assert-Rc 'kill-failure run still exits 0' 0 $script:Rc
+    # -PurgeState was asked for and skipped: an INCOMPLETE run (exit 2), never "complete".
+    Assert-Rc 'kill-failure run is INCOMPLETE (exit 2)' 2 $script:Rc
     Assert-Has 'kill failure WARNs' 'supervisor --kill rc=2 -- bridge may still be running' $out
     Assert-Has 'state removal skipped while bridge may run' 'SKIPPED: step 1 could not stop the bridge' $out
+    Assert-Has 'kill-failure run names the not-purged step' '[2/7] telegram pairing + bridge state: not purged' $out
+    Assert-Has 'kill-failure run reports Uninstall INCOMPLETE' 'Uninstall INCOMPLETE' $out
     if ((Test-Path (Join-Path $Channel 'access.json')) -and (Test-Path (Join-Path $Bridge 'sessions\S1\inbox.jsonl'))) {
         Write-Host 'PASS state preserved while bridge may be running'
     } else {
@@ -309,11 +334,14 @@ function Unregister-ScheduledTask {
             $env:PATH = $SavedPath
             Write-Host 'SKIP test 9 -- bun still resolvable on the minimal PATH; bun-missing branch not reachable here'
         } else {
-            $out = Invoke-Uninstall @('-Yes', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+            $out = Invoke-Uninstall @('-Yes', '-PurgeState', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
             $env:PATH = $SavedPath
-            Assert-Rc 'bun-missing run still exits 0' 0 $script:Rc
+            # Same contract as test 8: a skipped -PurgeState is INCOMPLETE (exit 2).
+            Assert-Rc 'bun-missing run is INCOMPLETE (exit 2)' 2 $script:Rc
             Assert-Has 'bun missing WARNs' 'bun is not on PATH' $out
             Assert-Has 'bun-missing run skips state removal' 'SKIPPED: step 1 could not stop the bridge' $out
+            Assert-Has 'bun-missing run names the not-purged step' '[2/7] telegram pairing + bridge state: not purged' $out
+            Assert-Has 'bun-missing run reports Uninstall INCOMPLETE' 'Uninstall INCOMPLETE' $out
             if (Test-Path (Join-Path $Channel 'access.json')) {
                 Write-Host 'PASS state preserved when bridge cannot be stopped'
             } else {
@@ -335,7 +363,7 @@ function Unregister-ScheduledTask {
     $AccessJson = Join-Path $Channel 'access.json'
     $lock = [IO.File]::Open($AccessJson, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
     try {
-        $out = Invoke-Uninstall @('-Yes', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+        $out = Invoke-Uninstall @('-Yes', '-PurgeState', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
     } finally {
         $lock.Dispose()
     }
@@ -382,7 +410,7 @@ function Unregister-ScheduledTask {
     $env:TELEGRAM_CHANNEL_DIR = Join-Path $Tmp 'n1'
     $env:BRIDGE_ROOT = Join-Path $Tmp 'n1b'
     & $SeedSettings
-    $out = Invoke-Uninstall @('-Yes', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+    $out = Invoke-Uninstall @('-Yes', '-PurgeState', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
     Assert-Rc '[6/7] run exits 0' 0 $script:Rc
     Assert-Has '[6/7] banner present' '[6/7] Unwiring' $out
     Assert-Rc 'statusLine removed'      'null' (JqU '.statusLine // "null"')
@@ -402,7 +430,7 @@ function Unregister-ScheduledTask {
     $env:BRIDGE_ROOT = Join-Path $Tmp 'n2b'
     & $SeedSettings
     $before = Get-Content $UserSettingsFile -Raw
-    $out = Invoke-Uninstall @('-Yes', '-SkipSettings', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+    $out = Invoke-Uninstall @('-Yes', '-PurgeState', '-SkipSettings', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
     Assert-Rc '-SkipSettings run exits 0' 0 $script:Rc
     Assert-Has '-SkipSettings honored' 'kept (-SkipSettings)' $out
     Assert-Rc '-SkipSettings leaves file unchanged' $before (Get-Content $UserSettingsFile -Raw)
@@ -413,7 +441,7 @@ function Unregister-ScheduledTask {
     $env:BRIDGE_ROOT = Join-Path $Tmp 'n3b'
     & $SeedSettings
     $before = Get-Content $UserSettingsFile -Raw
-    $out = Invoke-Uninstall @('-DryRun', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+    $out = Invoke-Uninstall @('-DryRun', '-PurgeState', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
     Assert-Rc 'dry-run [6/7] exits 0' 0 $script:Rc
     Assert-Has 'dry-run prints [6/7] DRY' 'DRY: unwire statusLine' $out
     Assert-Rc 'dry-run leaves settings unchanged' $before (Get-Content $UserSettingsFile -Raw)
@@ -445,7 +473,7 @@ function Unregister-ScheduledTask {
         $env:BRIDGE_ROOT = Join-Path $Tmp 'n7b'
         $env:HIMMELCTL_CACHE_DIR = Join-Path $Tmp 'n7c'
         $env:USERPROFILE = $FakeHome; $env:HOME = $FakeHome; $env:PATH = $MinimalPath
-        $out = Invoke-Uninstall @('-DryRun', '-SkipTasks')
+        $out = Invoke-Uninstall @('-DryRun', '-PurgeState', '-SkipTasks')
         $env:PATH = $SavedPath
         Assert-Rc 'off-PATH tools resolved: exits 0' 0 $script:Rc
         Assert-Has 'resolved claude named' (Join-Path $FakeHome '.local\bin\claude.cmd') $out
@@ -459,7 +487,7 @@ function Unregister-ScheduledTask {
         $env:BRIDGE_ROOT = Join-Path $Tmp 'n8b'
         $env:HIMMELCTL_CACHE_DIR = Join-Path $Tmp 'n8c'
         $env:USERPROFILE = $EmptyHome; $env:HOME = $EmptyHome; $env:PATH = $MinimalPath
-        $out = Invoke-Uninstall @('-DryRun', '-SkipTasks')
+        $out = Invoke-Uninstall @('-DryRun', '-PurgeState', '-SkipTasks')
         $env:PATH = $SavedPath
         Assert-Rc 'unresolvable tools exit 2' 2 $script:Rc
         Assert-NotHas 'no false completion claim' 'Uninstall complete.' $out
@@ -473,7 +501,7 @@ function Unregister-ScheduledTask {
         $env:BRIDGE_ROOT = Join-Path $Tmp 'n9b'
         $env:HIMMELCTL_CACHE_DIR = Join-Path $Tmp 'n9c'
         $env:USERPROFILE = $EmptyHome; $env:HOME = $EmptyHome; $env:PATH = $MinimalPath
-        $out = Invoke-Uninstall @('-DryRun', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+        $out = Invoke-Uninstall @('-DryRun', '-PurgeState', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
         $env:PATH = $SavedPath
         Assert-Rc 'explicit -SkipPlugins/-SkipHooks exits 0' 0 $script:Rc
         Assert-Has 'explicit skip still completes' 'Uninstall complete.' $out
@@ -497,7 +525,7 @@ function Unregister-ScheduledTask {
     $env:TELEGRAM_CHANNEL_DIR = Join-Path $Tmp 'n10'
     $env:BRIDGE_ROOT = Join-Path $Tmp 'n10b'
     $env:HIMMELCTL_CACHE_DIR = $Cache
-    $out = Invoke-Uninstall @('-DryRun', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+    $out = Invoke-Uninstall @('-DryRun', '-PurgeState', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
     Assert-Rc 'cache dry-run exits 0' 0 $script:Rc
     Assert-Has 'dry-run previews the cache removal' "DRY: Remove-Item -Recurse -Force -LiteralPath $Cache" $out
     Assert-Has 'dry-run names the install profile' 'install-profile.json' $out
@@ -512,7 +540,7 @@ function Unregister-ScheduledTask {
     $env:TELEGRAM_CHANNEL_DIR = Join-Path $Tmp 'n11'
     $env:BRIDGE_ROOT = Join-Path $Tmp 'n11b'
     $env:HIMMELCTL_CACHE_DIR = $Cache
-    $out = Invoke-Uninstall @('-Yes', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+    $out = Invoke-Uninstall @('-Yes', '-PurgeState', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
     Assert-Rc 'cache removal run exits 0' 0 $script:Rc
     Assert-Has 'cache removal reported' "removed: $Cache" $out
     if (Test-Path $Cache) {
@@ -526,7 +554,7 @@ function Unregister-ScheduledTask {
     $env:TELEGRAM_CHANNEL_DIR = Join-Path $Tmp 'n12'
     $env:BRIDGE_ROOT = Join-Path $Tmp 'n12b'
     $env:HIMMELCTL_CACHE_DIR = $AbsentCache
-    $out = Invoke-Uninstall @('-Yes', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+    $out = Invoke-Uninstall @('-Yes', '-PurgeState', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
     Assert-Rc 'absent cache exits 0' 0 $script:Rc
     Assert-Has 'absent cache reported, not removed' "absent, skipping: $AbsentCache" $out
 
@@ -538,7 +566,7 @@ function Unregister-ScheduledTask {
     $SavedUserProfile2 = $env:USERPROFILE; $SavedHome2 = $env:HOME
     try {
         $env:USERPROFILE = $FakeHome; $env:HOME = $FakeHome
-        $out = Invoke-Uninstall @('-Yes', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+        $out = Invoke-Uninstall @('-Yes', '-PurgeState', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
     } finally {
         $env:USERPROFILE = $SavedUserProfile2; $env:HOME = $SavedHome2
     }
@@ -559,7 +587,7 @@ function Unregister-ScheduledTask {
     $SavedUserProfile3 = $env:USERPROFILE; $SavedHome3 = $env:HOME
     try {
         $env:USERPROFILE = $FakeHome; $env:HOME = $FakeHome
-        $out = Invoke-Uninstall @('-Yes', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+        $out = Invoke-Uninstall @('-Yes', '-PurgeState', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
     } finally {
         $env:USERPROFILE = $SavedUserProfile3; $env:HOME = $SavedHome3
     }
@@ -584,7 +612,7 @@ function Unregister-ScheduledTask {
         $env:TELEGRAM_CHANNEL_DIR = Join-Path $Tmp 'n15'
         $env:BRIDGE_ROOT = Join-Path $Tmp 'n15b'
         $env:HIMMELCTL_CACHE_DIR = $wild
-        $out = Invoke-Uninstall @('-Yes', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
+        $out = Invoke-Uninstall @('-Yes', '-PurgeState', '-SkipTasks', '-SkipPlugins', '-SkipHooks')
         Assert-Has "wildcard cache path refused: $wild" 'refusing to remove suspicious path' $out
         Assert-Rc "refused wildcard '$wild' exits 2, not 0" 2 $script:Rc
         Assert-NotHas "refused wildcard '$wild' claims no completion" 'Uninstall complete.' $out
@@ -599,7 +627,7 @@ function Unregister-ScheduledTask {
     $env:TELEGRAM_CHANNEL_DIR = $SavedChannelDir
     $env:BRIDGE_ROOT = $SavedBridgeRoot
     $env:HIMMEL_USER_SETTINGS = $SavedUserSettings
-    $env:HIMMELCTL_CACHE_DIR = $null
+    $env:HIMMELCTL_CACHE_DIR = $SavedCacheDir
     Remove-Item -Recurse -Force $Tmp -ErrorAction SilentlyContinue
 }
 

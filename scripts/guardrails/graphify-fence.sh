@@ -337,6 +337,15 @@ CMD="${1:-}"
 
 PHI_CONFIG_DIR="${CLAUDE_GLM_CONFIG_DIR:-$HOME/.config/claude-glm}"
 LEDGER="${GRAPHIFY_LEDGER:-$HOME/.claude/graphify-egress.jsonl}"
+# Ledger `tool` field. Script-internal, NOT read from the environment: only the
+# --eval direct-invoke mode (HIMMEL-1084, see below) overrides it, so every
+# hook-mode ledger line keeps "tool":"graphify".
+LEDGER_TOOL="graphify"
+# Ledger `purpose` field, same scoping: empty (field omitted) in hook mode so
+# hook-mode lines stay byte-identical; --eval sets "extraction", the field the
+# matrix's allow+log ledger contract names and the pre-HIMMEL-1084
+# refresh-graph-map.sh ledger already carried.
+LEDGER_PURPOSE=""
 LUNA_ROOT="${LUNA_VAULT:-${LUNA_VAULT_PATH:-}}"
 
 HANDOVER_ROOT=""
@@ -1041,15 +1050,16 @@ _json_escape() {
 # apply_verdict's allow branch calls this for EVERY declaration-reached run
 # (declared corpus OR declared backend), even on a plain `allow` cell.
 ledger_append() {
-    local dir ts ep decl="" bsrc=""
+    local dir ts ep decl="" bsrc="" purp=""
     [ "${6:-}" = 1 ] && decl=',"declared":true'
+    [ -n "$LEDGER_PURPOSE" ] && purp=",\"purpose\":\"$LEDGER_PURPOSE\""
     [ -n "${7:-}" ] && bsrc=",\"declared_backend_source\":\"$(_json_escape "${7}")\""
     dir="$(dirname "$LEDGER")"
     mkdir -p "$dir" || return 1
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%s)"
     ep="$(_json_escape "$1")"
-    printf '{"ts":"%s","path":"%s","corpus":"%s","backend":"%s","provider":"%s","verdict":"%s","tool":"graphify"%s%s}\n' \
-        "$ts" "$ep" "$2" "$3" "$4" "$5" "$decl" "$bsrc" >> "$LEDGER" || return 1
+    printf '{"ts":"%s","path":"%s","corpus":"%s","backend":"%s","provider":"%s","verdict":"%s"%s,"tool":"%s"%s%s}\n' \
+        "$ts" "$ep" "$2" "$3" "$4" "$5" "$purp" "$LEDGER_TOOL" "$decl" "$bsrc" >> "$LEDGER" || return 1
     return 0
 }
 
@@ -1734,6 +1744,55 @@ classify_clause() {
     esac
     return 0
 }
+
+# --- direct-eval mode (HIMMEL-1084): the non-hook contract ------------------
+#   graphify-fence.sh --eval <corpus> <backend> <abs-target> <tool-label>
+# EXACTLY five args. The PreToolUse hook always passes ONE arg (the command
+# string), so it can never reach this branch - hook behaviour is unchanged.
+# A scheduled/direct graphify caller (refresh-graph-map.sh) runs THIS before
+# dispatching instead of keeping its own copy of the matrix eval + ledger, so
+# the unattended path gets exactly the verdict an agent-typed invocation gets:
+# same provider map (endpoint-aware claude/claude-cli, reroute selectors,
+# OLLAMA_HOST), same unverified-endpoint hard deny, same matrix eval, same
+# conditional opt-ins, same ledger file + shape (`tool` = <tool-label>).
+#   <corpus>  the caller's ASSERTED class. It is a declaration - ledgered on
+#             every allow-family verdict (declared:true), exactly as a
+#             `.graphify-corpus` marker-declared staged copy is - and it can
+#             only be TIGHTENED: <abs-target> is classified with classify()
+#             above (.salus / PHI root lists / configured real roots) and the
+#             most restrictive of the two wins.
+#   <backend> the backend the caller will pass to graphify (the explicit
+#             --backend; the no-backend declaration paths do not apply).
+# Exit 0 = allow (ledger written where required), 2 = deny (reason on stderr).
+# A first arg of --eval with any OTHER arg count is a malformed direct call,
+# never a hook call (the hook passes the whole command string, which contains
+# graphify, as its single arg): deny rather than fall through to hook-mode
+# parsing, where a bare "--eval" is not a graphify clause and would exit 0.
+if [ "${1:-}" = "--eval" ] && [ "$#" -ne 5 ]; then
+    deny "--eval: expected exactly 4 operands <corpus> <backend> <abs-target> <tool-label>, got $(($# - 1)) (fail-closed)"
+fi
+if [ "$#" -eq 5 ] && [ "$1" = "--eval" ]; then
+    ev_corpus="$2"; ev_backend="$3"; ev_target="$4"; ev_tool="$5"
+    case "$ev_corpus" in
+        salus|luna-personal|luna-clippings|handover-state|himmel-code) ;;
+        *) deny "--eval: unknown corpus class '$ev_corpus' (must be salus|luna-personal|luna-clippings|handover-state|himmel-code)" ;;
+    esac
+    # Both land in the ledger JSON unescaped (ledger_append's contract), so the
+    # charset is the escaping.
+    case "$ev_backend" in ''|*[!A-Za-z0-9._-]*) deny "--eval: backend must match [A-Za-z0-9._-]+ (fail-closed)" ;; esac
+    case "$ev_tool" in ''|*[!A-Za-z0-9._-]*) deny "--eval: tool label must match [A-Za-z0-9._-]+ (fail-closed)" ;; esac
+    _is_abs_target "$ev_target" || deny "--eval: target must be an absolute path (fail-closed)"
+    ev_class="$(classify "$ev_target")"
+    _deny_on_classify_sentinel "$ev_class"
+    ev_class="${ev_class%%@declared*}"
+    if [ -n "$ev_class" ] && [ "$(_rank "$ev_class")" -gt "$(_rank "$ev_corpus")" ]; then
+        ev_corpus="$ev_class"
+    fi
+    LEDGER_TOOL="$ev_tool"
+    LEDGER_PURPOSE="extraction"
+    apply_verdict "$ev_corpus" "$ev_target" "$ev_backend" 1 "" "" 1
+    exit 0
+fi
 
 # --- main: split into clauses, evaluate every graphify command-position clause -
 # Separators ;  |  &  (and && / ||, which collapse) and newlines become clause

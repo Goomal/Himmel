@@ -35,6 +35,12 @@
 #                       from the install get written (skip-if-present); the
 #                       flag never removes it either.
 #
+# Exit codes: 0 applied / already current / dry-run / aborted at the prompt;
+# 1 partial (a write or snapshot failure, or a _CLAUDE.md conflict/error —
+# stamp NOT written); 2 env/usage error; 3 NEEDS-RECONCILE (HIMMEL-3037): the
+# only non-success is withheld local edits, no write failed — stamp NOT written,
+# last stdout line is "upgrade: NEEDS-RECONCILE — …".
+#
 # Version source = the template's marketplace/.claude-plugin/marketplace.json
 # metadata.version. The vault records its level in .vault-template.json; a
 # missing stamp is treated as 0.0.0 (full pass). The stamp is written LAST so
@@ -391,6 +397,28 @@ withhold_notice() {
     echo "  local edits withheld (not overwritten): $rel (backup: $backup_note) [baseline: $prov]"
 }
 
+# snapshot_git_equiv <rel> <dst> <snap>: exit 0 iff <dst> differs from the
+# snapshot ONLY by formatting (HIMMEL-3037). The snapshot is a hash, so it
+# cannot itself be compared newline/JSON-insensitively; instead the vault's git
+# baseline is consulted — but only a VERIFIED one: the file's content at
+# STAMP_COMMIT must hash to <snap>. That proves the commit holds what the
+# template wrote; a stamp commit that also swallowed a local edit (the
+# HIMMEL-2903 poison) hashes differently and is NOT trusted. Every other case
+# (no repo/stamp commit, BASELINE_ERROR, file absent or unreadable there,
+# hash mismatch, a real difference) exits 1 = keep withholding, fail-closed.
+snapshot_git_equiv() {
+    local rel="$1" dst="$2" snap="$3" committed rc=1
+    [ "$BASELINE_ERROR" = 0 ] && [ -n "$STAMP_COMMIT" ] || return 1
+    committed="$(mktemp)" && [ -e "$committed" ] || return 1
+    if git -C "$VAULT_DIR" show "$STAMP_COMMIT:./$rel" > "$committed" 2>/dev/null \
+        && [ "sha256:$(sha_of "$committed")" = "$snap" ] \
+        && content_equiv "$committed" "$dst" "$rel"; then
+        rc=0
+    fi
+    rm -f "$committed"
+    return $rc
+}
+
 # has_local_edit <rel> <dst> [print]: exit 0 iff <dst> differs from the
 # baseline for <rel> — i.e. the vault edited it since its last upgrade.
 # Baseline resolution order (HIMMEL-2903):
@@ -411,10 +439,17 @@ has_local_edit() {
     [ -f "$dst" ] || return 1
 
     # (1) Snapshot baseline: the sha the template itself last wrote here.
+    # ponytail: a HASH cannot be compared newline/JSON-insensitively (HIMMEL-3037),
+    # so a mismatch is only forgiven when a VERIFIED git baseline (see
+    # snapshot_git_equiv) shows the difference is formatting-only. A vault with
+    # no git baseline, or whose stamp commit already holds the re-serialised
+    # content (nothing left to verify against the hash), still withholds a file
+    # Obsidian re-serialised AND the template has since really changed.
     local snap dst_sha
     if snap="$(snapshot_sha "$rel")" && [ -n "$snap" ]; then
         dst_sha="sha256:$(sha_of "$dst")"
         if [ "$snap" != "$dst_sha" ]; then
+            snapshot_git_equiv "$rel" "$dst" "$snap" && return 1
             if [ "$print" = 1 ]; then
                 withhold_notice "$rel" "snapshot"
                 # The snapshot is a hash, not content — there is nothing to
@@ -476,10 +511,9 @@ has_local_edit() {
         [ "$print" = 1 ] && echo "  could not verify local edits for $rel (git show failed) — withholding the write as a precaution"
         return 0
     fi
-    local committed_sha
-    committed_sha="$(sha_of "$committed")"
-    dst_sha="$(sha_of "$dst")"
-    if [ "$committed_sha" != "$dst_sha" ]; then
+    # content_equiv, not a sha compare (HIMMEL-3037): Obsidian's newline-only /
+    # re-indented rewrite of a committed .obsidian/*.json is not a local edit.
+    if ! content_equiv "$committed" "$dst" "$rel"; then
         if [ "$print" = 1 ]; then
             withhold_notice "$rel" "git"
             if command -v diff >/dev/null 2>&1; then
@@ -532,6 +566,37 @@ write_file() {
 }
 
 sha_of() { if [ -f "$1" ]; then sha256sum "$1" | cut -d' ' -f1; else echo MISSING; fi; }
+
+# content_equiv <a> <b> <rel>: exit 0 iff the two files carry the same content
+# for upgrade purposes (HIMMEL-3037). Obsidian rewrites its own .obsidian/*.json
+# on every settings touch — dropping the template's final newline and
+# re-indenting — so a byte compare (sha) reads a semantically identical file as
+# different forever, and a withheld "local edit" then blocks the stamp. Equal
+# means: identical bytes, OR identical apart from ONE trailing newline, OR (a
+# *.json <rel>, working jq) identical after `jq -S .` normalisation. Two or more
+# extra newlines are a real difference. Without a working jq the JSON rule is
+# skipped with a one-time note and only the newline rule applies.
+JQ_NOTED=0
+content_equiv() {
+    local a="$1" b="$2" rel="$3" va vb
+    [ "$(sha_of "$a")" = "$(sha_of "$b")" ] && return 0
+    [ -f "$a" ] && [ -f "$b" ] || return 1
+    # `x` sentinel: $(...) would otherwise swallow EVERY trailing newline, and
+    # only one is ignorable.
+    va="$({ cat "$a"; printf x; } 2>/dev/null)"; va="${va%x}"; va="${va%$'\n'}"
+    vb="$({ cat "$b"; printf x; } 2>/dev/null)"; vb="${vb%x}"; vb="${vb%$'\n'}"
+    [ "$va" = "$vb" ] && return 0
+    case "$rel" in
+        *.json)
+            if jq -n . >/dev/null 2>&1; then
+                va="$(jq -S . "$a" 2>/dev/null)" && vb="$(jq -S . "$b" 2>/dev/null)" && [ "$va" = "$vb" ] && return 0
+            elif [ "$JQ_NOTED" = 0 ]; then
+                JQ_NOTED=1
+                echo "  note: jq not available — $rel and other JSON files are compared by the trailing-newline rule only, so a JSON-formatting-only difference reads as a local edit" >&2
+            fi ;;
+    esac
+    return 1
+}
 
 # Snapshot accumulator (HIMMEL-2903): the execute pass records, for every
 # "overwrite"-class file, the sha of what is in the VAULT once the pass is
@@ -787,7 +852,7 @@ process() {
         case "$class" in
             skip) ;;
             overwrite)
-                if [ "$(sha_of "$src")" != "$(sha_of "$dst")" ]; then
+                if ! content_equiv "$src" "$dst" "$rel"; then
                     if has_local_edit "$rel" "$dst" "$((1 - execute))"; then
                         PLAN+=("LOCAL-EDIT   $rel (vault has local edits since last upgrade — NOT overwritten)")
                         n_local_edit=$((n_local_edit+1))
@@ -813,7 +878,7 @@ process() {
                 if [ ! -f "$dst" ]; then
                     PLAN+=("WRITE-NEW    $rel"); n_write=$((n_write+1))
                     [ "$execute" = 1 ] && { write_file "$src" "$dst" || WRITE_FAILURES=$((WRITE_FAILURES+1)); }
-                elif [ "$(sha_of "$src")" != "$(sha_of "$dst")" ]; then
+                elif ! content_equiv "$src" "$dst" "$rel"; then
                     PLAN+=("REPORT       $rel (template changed; review — not overwritten)"); n_report=$((n_report+1))
                 fi ;;
             jsonmerge|threeway) : ;;  # handled out-of-loop below
@@ -972,7 +1037,7 @@ fi
 # target version — leave the stamp behind so a re-run re-processes (and
 # re-alerts) instead of a "current" stamp silently masking the gap. The stamp
 # is the last write, so an aborted run also re-runs cleanly (idempotent).
-if [ "$WRITE_FAILURES" -gt 0 ] || [ "$n_local_edit" -gt 0 ] || [ "$SNAPSHOT_FAILURES" -gt 0 ] || [ "$CLAUDE_MERGE_RESULT" = "conflict" ] || [ "$CLAUDE_MERGE_RESULT" = "error" ]; then
+if [ "$WRITE_FAILURES" -gt 0 ] || [ "$SNAPSHOT_FAILURES" -gt 0 ] || [ "$CLAUDE_MERGE_RESULT" = "conflict" ] || [ "$CLAUDE_MERGE_RESULT" = "error" ]; then
     echo "" >&2
     echo "upgrade: NOT writing the version stamp — the vault is partially upgraded" >&2
     echo "  (write failures: $WRITE_FAILURES; local edits withheld: $n_local_edit;" >&2
@@ -980,6 +1045,21 @@ if [ "$WRITE_FAILURES" -gt 0 ] || [ "$n_local_edit" -gt 0 ] || [ "$SNAPSHOT_FAIL
     echo "  _CLAUDE.md: ${CLAUDE_MERGE_RESULT:-ok}). Resolve the issues above and re-run;" >&2
     echo "  template-owned writes are idempotent." >&2
     exit 1
+fi
+
+# HIMMEL-3037: withheld local edits are the ONLY thing left — every write
+# succeeded and _CLAUDE.md merged. That is not a failure, but it is not
+# "upgraded" either: exit a distinct rc 3 (0 would read as applied to every
+# caller) and leave the stamp behind so the vault keeps being offered the
+# upgrade. The marker is the LAST stdout line — himmel-update shows the last
+# line as the status detail — so keep it last.
+if [ "$n_local_edit" -gt 0 ]; then
+    echo "" >&2
+    echo "upgrade: every other template-owned file was updated; the local edits listed above" >&2
+    echo "  were withheld. Take the template copy or keep yours for each (a backup path is" >&2
+    echo "  named above when one was given), then re-run to write the version stamp." >&2
+    echo "upgrade: NEEDS-RECONCILE — $n_local_edit local edit(s) withheld, version stamp NOT written"
+    exit 3
 fi
 
 if ! "$PYTHON" - "$STAMP" "$TEMPLATE_VERSION" "$SNAPSHOT_FILE" <<'PY'

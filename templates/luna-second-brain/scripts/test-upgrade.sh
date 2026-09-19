@@ -1319,5 +1319,247 @@ run_upgrade --yes >/dev/null 2>&1
 merged=$("$PY" -c 'import json,sys;print(",".join(sorted(json.load(open(sys.argv[1])))))' "$V/.obsidian/community-plugins.json" 2>/dev/null)
 assert_eq "T52 list template: still merges add-only" "calendar,dataview,new" "$merged"
 
+# ---------------------------------------------------------------------------
+# T53-T58 (HIMMEL-3037): Obsidian rewrites its own .obsidian/*.json on every
+# settings touch — without the template's trailing newline, and re-indented —
+# so a template-owned file with NO semantic difference read as a local edit on
+# every upgrade after the first launch, and the stamp was refused for good.
+# Template-vs-vault comparison now ignores a trailing-newline-only difference
+# and (jq present) normalises JSON. First-run helper: upgrade a stamped vault
+# so it carries the stamp's content snapshot, then bump the template.
+t53_seed() {   # $1 case tag; leaves $T/$V set, vault upgraded once, template bumped
+    T="$TMP/$1-tmpl"; V="$TMP/$1-vault"
+    make_template "$T" "1.0.0"
+    printf '{"promptDelete":false,"alwaysUpdateLinks":true}\n' > "$T/.obsidian/app.json"
+    mkdir -p "$V"; stamp_vault "$V" "0.1.0"
+    run_upgrade --yes >/dev/null 2>&1
+    printf '{"metadata":{"version":"1.0.1"}}\n' > "$T/marketplace/.claude-plugin/marketplace.json"
+}
+t53_stamp_version() { "$PY" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version",""))' "$V/.vault-template.json" 2>/dev/null; }
+
+# T53: the reported case — the vault's app.json is the template minus its final
+# newline. No LOCAL-EDIT, the run succeeds, the stamp advances.
+t53_seed t53
+printf '{"promptDelete":false,"alwaysUpdateLinks":true}' > "$V/.obsidian/app.json"
+t53_out=$(run_upgrade --yes 2>&1); t53_rc=$?
+assert_eq "T53 trailing-newline-only .obsidian/app.json: run exits 0" "0" "$t53_rc"
+case "$t53_out" in
+    *LOCAL-EDIT*|*"local edits withheld"*) fail "T53 trailing-newline-only .obsidian/app.json is not a local edit" "got: $t53_out" ;;
+    *) pass "T53 trailing-newline-only .obsidian/app.json is not a local edit" ;;
+esac
+assert_eq "T53 stamp advances to the template version" "1.0.1" "$(t53_stamp_version)"
+if [ "$(cat "$V/.obsidian/app.json")" = '{"promptDelete":false,"alwaysUpdateLinks":true}' ]; then
+    pass "T53 the vault's Obsidian-written file is left as Obsidian wrote it"
+else
+    fail "T53 the vault's Obsidian-written file is left as Obsidian wrote it" "got: $(cat "$V/.obsidian/app.json")"
+fi
+
+# T54: a REAL difference must still be withheld (the equivalence must not be
+# broader than newline/JSON formatting) — and the stamp must still be refused.
+t53_seed t54
+printf '{"promptDelete":true,"alwaysUpdateLinks":true}' > "$V/.obsidian/app.json"
+t54_out=$(run_upgrade --yes 2>&1); t54_rc=$?
+if [ "$t54_rc" -ne 0 ]; then pass "T54 a real value change in app.json still exits non-zero"; else fail "T54 a real value change in app.json still exits non-zero" "rc=0, out: $t54_out"; fi
+case "$t54_out" in
+    *"local edits withheld (not overwritten): .obsidian/app.json"*) pass "T54 a real value change in app.json is still withheld" ;;
+    *) fail "T54 a real value change in app.json is still withheld" "got: $t54_out" ;;
+esac
+assert_eq "T54 stamp NOT advanced (still the first upgrade's)" "1.0.0" "$(t53_stamp_version)"
+
+# T55: a difference of MORE than one trailing newline is not a
+# trailing-newline-only difference (non-JSON file: pure byte rule).
+t53_seed t55
+printf 'DEFAULT_X=1\n\n\n' > "$V/.env.example"
+t55_dry=$(run_upgrade --dry-run 2>&1)
+case "$t55_dry" in
+    *"LOCAL-EDIT"*".env.example"*|*"WRITE"*".env.example"*) pass "T55 extra blank lines at EOF are still a difference (not ignored)" ;;
+    *) fail "T55 extra blank lines at EOF are still a difference (not ignored)" "got: $t55_dry" ;;
+esac
+
+# T56: with jq, re-indented / re-keyed JSON with the same content is no local edit.
+if jq -n . >/dev/null 2>&1; then
+    t53_seed t56
+    printf '{\n\t"alwaysUpdateLinks": true,\n\t"promptDelete": false\n}' > "$V/.obsidian/app.json"
+    t56_out=$(run_upgrade --yes 2>&1); t56_rc=$?
+    assert_eq "T56 re-indented/re-ordered .obsidian/app.json (same JSON): run exits 0" "0" "$t56_rc"
+    case "$t56_out" in
+        *LOCAL-EDIT*|*"local edits withheld"*) fail "T56 same-JSON app.json is not a local edit" "got: $t56_out" ;;
+        *) pass "T56 same-JSON app.json is not a local edit" ;;
+    esac
+    assert_eq "T56 stamp advances" "1.0.1" "$(t53_stamp_version)"
+else
+    echo "SKIP T56 — no working jq on PATH"
+fi
+
+# T57: no working jq => the newline rule still applies, a JSON-formatting-only
+# difference is (conservatively) a local edit, and the run says why. A jq stub
+# that exits non-zero stands in for a missing/broken jq.
+t57_bin="$TMP/t57-bin"; mkdir -p "$t57_bin"
+printf '#!/bin/sh\nexit 127\n' > "$t57_bin/jq"; chmod +x "$t57_bin/jq"
+t53_seed t57
+printf '{"promptDelete":false,"alwaysUpdateLinks":true}' > "$V/.obsidian/app.json"
+t57_out=$(PATH="$t57_bin:$PATH" run_upgrade --yes 2>&1); t57_rc=$?
+if [ "$t57_rc" -eq 0 ]; then pass "T57 no jq: the trailing-newline-only case still exits 0"; else fail "T57 no jq: the trailing-newline-only case still exits 0" "rc=$t57_rc, out: $t57_out"; fi
+t53_seed t57b
+printf '{\n"promptDelete": false,\n"alwaysUpdateLinks": true\n}' > "$V/.obsidian/app.json"
+t57b_out=$(PATH="$t57_bin:$PATH" run_upgrade --yes 2>&1); t57b_rc=$?
+if [ "$t57b_rc" -ne 0 ]; then pass "T57 no jq: JSON-formatting-only difference falls back to the byte rule (withheld)"; else fail "T57 no jq: JSON-formatting-only difference falls back to the byte rule (withheld)" "rc=0, out: $t57b_out"; fi
+case "$t57b_out" in
+    *"jq"*"trailing-newline"*) pass "T57 no jq: the run notes the reduced comparison" ;;
+    *) fail "T57 no jq: the run notes the reduced comparison" "got: $t57b_out" ;;
+esac
+
+# T58: the git baseline path (a vault stamped before the snapshot existed) uses
+# the same equivalence: the vault only lost the newline of a file the TEMPLATE
+# has since really changed => not a local edit, the template copy is taken.
+T="$TMP/t58-tmpl"; V="$TMP/t58-vault"
+make_template "$T" "0.9.0"
+printf '{"promptDelete":false}\n' > "$T/.obsidian/app.json"
+mkdir -p "$V"; cp -r "$T/." "$V/"; rm -f "$V/marketplace/.claude-plugin/marketplace.json"
+stamp_vault "$V" "0.9.0"
+git -C "$V" init -q
+git -C "$V" config user.email "test@example.com"
+git -C "$V" config user.name "Test"
+git -C "$V" add -A
+git -C "$V" commit -q -m "stamp 0.9.0"
+printf '{"promptDelete":false}' > "$V/.obsidian/app.json"
+git -C "$V" add -A
+git -C "$V" commit -q -m "Obsidian rewrote app.json without the final newline"
+printf '{"metadata":{"version":"1.0.0"}}\n' > "$T/marketplace/.claude-plugin/marketplace.json"
+printf '{"promptDelete":true}\n' > "$T/.obsidian/app.json"
+t58_out=$(run_upgrade --yes 2>&1); t58_rc=$?
+if [ "$t58_rc" -eq 0 ]; then pass "T58 git baseline: newline-only vault drift + a real template change exits 0"; else fail "T58 git baseline: newline-only vault drift + a real template change exits 0" "rc=$t58_rc, out: $t58_out"; fi
+assert_eq "T58 git baseline: the template's new app.json was written" "$(sha_of "$T/.obsidian/app.json")" "$(sha_of "$V/.obsidian/app.json")"
+
+# T62 (HIMMEL-3037, CodeRabbit round on #888): the SNAPSHOT baseline is a hash,
+# so a vault that a prior upgrade snapshotted, Obsidian then re-serialised, and
+# the template then REALLY changed read as a local edit before the formatting-
+# tolerant git compare was ever reached. On a snapshot mismatch the git baseline
+# now answers too — but only a VERIFIED one: the content at STAMP_COMMIT must
+# hash to the snapshot (else a local edit committed in the stamp commit itself
+# would be trusted, the HIMMEL-2903 poison).
+t62_seed() {   # $1 case tag; git vault upgraded once + committed; template then changes app.json
+    T="$TMP/$1-tmpl"; V="$TMP/$1-vault"
+    make_template "$T" "1.0.0"
+    printf '{"promptDelete":false,"alwaysUpdateLinks":true}\n' > "$T/.obsidian/app.json"
+    mkdir -p "$V"; stamp_vault "$V" "0.1.0"
+    git -C "$V" init -q
+    git -C "$V" config user.email "test@example.com"
+    git -C "$V" config user.name "Test"
+    git -C "$V" add -A
+    git -C "$V" commit -q --no-verify -m "seed"
+    run_upgrade --yes >/dev/null 2>&1
+    git -C "$V" add -A
+    git -C "$V" commit -q --no-verify -m "upgrade 1.0.0"
+    printf '{"metadata":{"version":"1.0.1"}}\n' > "$T/marketplace/.claude-plugin/marketplace.json"
+    printf '{"promptDelete":true,"alwaysUpdateLinks":true}\n' > "$T/.obsidian/app.json"
+}
+t62_expect_taken() {   # $1 label; vault must have taken the template's app.json and stamped 1.0.1
+    assert_eq "$1: run exits 0" "0" "$t62_rc"
+    assert_eq "$1: the template's new app.json was written" "$(sha_of "$T/.obsidian/app.json")" "$(sha_of "$V/.obsidian/app.json")"
+    assert_eq "$1: stamp advances" "1.0.1" "$(t53_stamp_version)"
+}
+t62_expect_withheld() {   # $1 label
+    assert_eq "$1: run exits 3 (NEEDS-RECONCILE)" "3" "$t62_rc"
+    case "$t62_out" in
+        *"local edits withheld (not overwritten): .obsidian/app.json"*) pass "$1: app.json is withheld as a local edit" ;;
+        *) fail "$1: app.json is withheld as a local edit" "got: $t62_out" ;;
+    esac
+    assert_eq "$1: stamp NOT advanced" "1.0.0" "$(t53_stamp_version)"
+}
+
+# T62a: newline-only Obsidian rewrite of an already-snapshotted, stamp-committed
+# file + a later real template change => not a local edit, template taken.
+t62_seed t62a
+printf '{"promptDelete":false,"alwaysUpdateLinks":true}' > "$V/.obsidian/app.json"
+t62_out=$(run_upgrade --yes 2>&1); t62_rc=$?
+t62_expect_taken "T62a newline-only rewrite + later template change"
+# T62b: same with re-indented / re-keyed JSON (needs jq).
+if jq -n . >/dev/null 2>&1; then
+    t62_seed t62b
+    printf '{\n\t"alwaysUpdateLinks": true,\n\t"promptDelete": false\n}' > "$V/.obsidian/app.json"
+    t62_out=$(run_upgrade --yes 2>&1); t62_rc=$?
+    t62_expect_taken "T62b re-indented rewrite + later template change"
+else
+    echo "SKIP T62b — no working jq on PATH"
+fi
+# T62c control: a REAL local edit on top of the snapshot is still withheld.
+t62_seed t62c
+printf '{"promptDelete":"edited-by-hand","alwaysUpdateLinks":true}' > "$V/.obsidian/app.json"
+t62_out=$(run_upgrade --yes 2>&1); t62_rc=$?
+t62_expect_withheld "T62c real local edit over a snapshot"
+# T62d control: snapshot-only vault (no git baseline at all) stays fail-closed.
+t53_seed t62d
+printf '{"promptDelete":false,"alwaysUpdateLinks":true}' > "$V/.obsidian/app.json"
+printf '{"promptDelete":true,"alwaysUpdateLinks":true}\n' > "$T/.obsidian/app.json"
+t62_out=$(run_upgrade --yes 2>&1); t62_rc=$?
+t62_expect_withheld "T62d snapshot-only vault, no git baseline"
+# T62e control: a local edit COMMITTED IN the stamp commit itself (the 2903
+# poison) — the git baseline no longer hashes to the snapshot, so it is not
+# trusted and the file stays withheld.
+t62_seed t62e
+printf '{"promptDelete":"poisoned","alwaysUpdateLinks":true}' > "$V/.obsidian/app.json"
+git -C "$V" add -A
+git -C "$V" commit -q --no-verify -m "autosync: edit + stamp in one commit"
+printf '{"template":"luna-second-brain","version":"1.0.0","upgraded_at":"2026-01-02T00:00:00Z","files":%s}\n' "$("$PY" -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])).get("files",{})))' "$V/.vault-template.json")" > "$V/.vault-template.json"
+git -C "$V" add -A
+git -C "$V" commit -q --no-verify -m "stamp re-touched"
+t62_out=$(run_upgrade --yes 2>&1); t62_rc=$?
+t62_expect_withheld "T62e local edit committed alongside the stamp"
+
+# ---------------------------------------------------------------------------
+# T59-T60 (HIMMEL-3037): a run whose ONLY non-success is withheld local edits
+# (no write failure, no snapshot failure, no _CLAUDE.md conflict) is not a
+# failure — it exits a distinct rc 3 and prints a stable NEEDS-RECONCILE line
+# (stdout, last line), while the stamp is still NOT written so the vault keeps
+# being offered the upgrade. Anything else stays rc 1.
+# T59: local edit only.
+t53_seed t59
+printf '{"promptDelete":true,"alwaysUpdateLinks":true}' > "$V/.obsidian/app.json"
+t59_pre_sha=$(sha_of "$V/.obsidian/app.json")
+t59_out=$(run_upgrade --yes 2>/dev/null); t59_rc=$?
+assert_eq "T59 withheld-local-edits-only run exits 3" "3" "$t59_rc"
+case "$t59_out" in
+    *"upgrade: NEEDS-RECONCILE — 1 local edit(s) withheld, version stamp NOT written"*) pass "T59 stdout carries the stable NEEDS-RECONCILE line" ;;
+    *) fail "T59 stdout carries the stable NEEDS-RECONCILE line" "got: $t59_out" ;;
+esac
+t59_last=$(printf '%s\n' "$t59_out" | tail -n 1)
+case "$t59_last" in
+    "upgrade: NEEDS-RECONCILE"*) pass "T59 the NEEDS-RECONCILE line is the LAST stdout line (callers show it as the detail)" ;;
+    *) fail "T59 the NEEDS-RECONCILE line is the LAST stdout line (callers show it as the detail)" "last: $t59_last" ;;
+esac
+assert_eq "T59 the withheld file is untouched" "$t59_pre_sha" "$(sha_of "$V/.obsidian/app.json")"
+assert_eq "T59 stamp NOT advanced" "1.0.0" "$(t53_stamp_version)"
+t59_check=$(run_upgrade --check 2>&1)
+case "$t59_check" in
+    *"template v1.0.1 available (vault is v1.0.0)"*) pass "T59 --check afterwards still reports the template update as available" ;;
+    *) fail "T59 --check afterwards still reports the template update as available" "got: $t59_check" ;;
+esac
+# T60: a real failure alongside the withheld edit stays rc 1, and is NOT
+# relabelled NEEDS-RECONCILE (a _CLAUDE.md conflict needs a human first).
+t53_seed t60
+printf '{"promptDelete":true,"alwaysUpdateLinks":true}' > "$V/.obsidian/app.json"
+mkdir -p "$V/.vault-template.base"; cp "$T/_CLAUDE.md" "$V/.vault-template.base/_CLAUDE.md"
+printf '# Operating Manual OURS\n\nline-a\nline-b\nline-c\n' > "$V/_CLAUDE.md"
+printf '# Operating Manual THEIRS\n\nline-a\nline-b\nline-c\n' > "$T/_CLAUDE.md"
+t60_out=$(run_upgrade --yes 2>&1); t60_rc=$?
+assert_eq "T60 local edit + _CLAUDE.md conflict stays rc 1" "1" "$t60_rc"
+case "$t60_out" in
+    *NEEDS-RECONCILE*) fail "T60 a mixed failure is not labelled NEEDS-RECONCILE" "got: $t60_out" ;;
+    *) pass "T60 a mixed failure is not labelled NEEDS-RECONCILE" ;;
+esac
+# T61: a report-class file that really differs still prints its plan row in
+# the same 13-column layout as the other actions (the content_equiv rewrite of
+# that branch must not shift the column).
+t53_seed t61
+mkdir -p "$T/_Templates" "$V/_Templates"
+printf 'template body\n' > "$T/_Templates/daily.md"
+printf 'vault body\n' > "$V/_Templates/daily.md"
+t61_out=$(run_upgrade --dry-run 2>&1)
+case "$t61_out" in
+    *"REPORT       _Templates/daily.md (template changed"*) pass "T61 REPORT plan row keeps its column alignment" ;;
+    *) fail "T61 REPORT plan row keeps its column alignment" "got: $t61_out" ;;
+esac
+
 echo
 if [ "$FAILED" -eq 0 ]; then echo "All upgrade tests passed."; else echo "$FAILED test(s) failed."; exit 1; fi

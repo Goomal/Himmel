@@ -8,6 +8,49 @@ Version history for the luna-second-brain vault template (published as
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.46] — 2026-09-19
+
+### Fixed
+- `upgrade.sh` no longer reads a formatting-only rewrite as a local edit on a
+  vault that a previous upgrade already snapshotted. The stamp's snapshot is a
+  hash and could not tell a newline/re-indent rewrite (Obsidian) from a real
+  edit once the template had also changed the file; on a snapshot mismatch the
+  vault's git baseline now answers, but only a verified one — the content at
+  the stamp commit must hash to the snapshot, so a local edit committed in the
+  stamp commit itself is still withheld. A vault with no git baseline stays
+  fail-closed. (HIMMEL-3037)
+
+## [0.4.45] — 2026-09-19
+
+### Fixed
+- `upgrade.sh` plan output: the `REPORT` row lost one space of its label
+  padding in 0.4.43 and no longer lined up with the other action rows.
+
+## [0.4.44] — 2026-09-19
+
+### Changed
+- `upgrade.sh` now exits `3` (stdout line `upgrade: NEEDS-RECONCILE — …`) when
+  the only reason it did not stamp the version is withheld local edits — every
+  other file was applied and there was no write failure. Previously that run
+  exited `1`, indistinguishable from a real partial upgrade. A run that also
+  has a write/snapshot failure or a `_CLAUDE.md` conflict still exits `1`. The
+  stamp is still not written, so `--check` keeps reporting the update as
+  available until the edits are reconciled.
+
+## [0.4.43] — 2026-09-19
+
+### Fixed
+- `upgrade.sh` read a template-owned file as a local edit — refusing the
+  version stamp for good — whenever it differed from the template only by
+  formatting. Obsidian rewrites its own `.obsidian/*.json` on every settings
+  touch, dropping the final newline and re-indenting, so `app.json`,
+  `appearance.json` and `core-plugins.json` tripped this on every upgrade
+  after the first Obsidian launch. The template-vs-vault comparison (and the
+  vault-git baseline comparison) now ignores one trailing newline and, when
+  `jq` is available, compares `.json` files as normalised JSON; without `jq`
+  it falls back to the newline rule and says so. A real difference is still
+  withheld.
+
 ## [0.4.35] — 2026-09-16
 
 ### Fixed

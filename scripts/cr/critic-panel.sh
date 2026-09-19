@@ -2122,7 +2122,19 @@ if [ "$ndb" -gt 0 ]; then
         exit 6
     fi
     citation_guard_id="citation-guard-$(printf '%.16s' "$_guard_digest")"
-    _queue_finding citation-guard "$citation_guard_id" crit "" ""
+    # HIMMEL-2554: carry the dropped evidence as the row's text so the ledger
+    # (and handover-bridge.sh's mirror of it) records WHAT was dropped, not
+    # just THAT something was. The same drop_blocking the id is digested from;
+    # the digest above already ran on the byte-exact multi-line value, so this
+    # newline flatten (the spool is one record per line) cannot move the id.
+    # Secret-scrub + the 500-char cap are ledger-append.sh's batch path, the
+    # same one every ordinary finding row takes. CRLF collapses to ONE space
+    # (before lone LF/CR): the scrubber matches exactly one space after
+    # `Bearer`, and a per-character flatten turns `Bearer\r\n<token>` into two.
+    _guard_text="${drop_blocking//$'\r\n'/ }"
+    _guard_text="${_guard_text//$'\n'/ }"
+    _guard_text="${_guard_text//$'\r'/ }"
+    _queue_finding citation-guard "$citation_guard_id" crit "" "" "$_guard_text"
 fi
 
 # Emit merged block in heading contract format

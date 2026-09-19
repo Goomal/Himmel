@@ -356,5 +356,119 @@ k2_out="$(
 )"
 check "(k) control: a different caller pid, same shim -> PROCEED" PROCEED "$k2_out"
 
+# --- (l) HIMMEL-3012: a live session CONSUMES its reservation by NAME, but the
+# reservation's directory name is not always the name the census sees — a name
+# with a space (the census reads the first whitespace token of `-n`) and a
+# name that cannot be one directory component ('/' or over NAME_MAX, so the
+# key is a hash) never matched, and the slot was counted twice until the TTL.
+# The reservation now also records the raw leg name in `name` and the consume
+# check matches the live name against it too — but ONLY for a name with no
+# whitespace, where the census's first token IS the whole name (exact identity).
+# A name WITH whitespace is deliberately not consumed (see (l1)): the census
+# cannot tell it from another leg sharing its first token.
+count_resv() { local n=0 d; for d in "$1"/*/; do [ -d "$d" ] && n=$((n+1)); done; echo "$n"; }
+# reserve_then_live <case> <leg> <live -n value> [counted]: reserve <leg> with
+# no live session, then an informational read with one live `claude -n <live>`.
+# Default: the live session must CONSUME the reservation. With `counted`: it
+# must NOT — the reservation stays on disk and is counted alongside the live one.
+reserve_then_live() {
+  local label="$1" leg="$2" live="$3" mode="${4:-consumed}" slots pl out
+  slots="$(mktemp -d "$W/slots-l.XXXXXX")" || { echo "FAIL - could not create slots-l scratch dir" >&2; exit 1; }
+  out="$(run_pf "$slots" "$p0" CADENCE_BANK_LAUNCH=1 CADENCE_BANK_LEG="$leg" HIMMEL_FLEET_CAP=4)"
+  check "($label) setup: declared launch -> PROCEED, reservation created" PROCEED "$out"
+  check "($label) reservation records the raw leg name" "$leg" "$(cat "$slots"/*/name 2>/dev/null)"
+  pl="$(mktemp -d "$W/ps-l.XXXXXX")"; mk_ps_stub "$pl" "9001:claude:--model claude-opus-5 -n $live load doc"
+  : > "$W/err.log"
+  run_pf "$slots" "$pl" HIMMEL_FLEET_CAP=4 >/dev/null
+  if [ "$mode" = counted ]; then
+    if grep -q 'FLEET native=1 claudex=0 reserved=1 total=2/4' "$W/err.log" 2>/dev/null; then
+      PASS=$((PASS+1)); echo "ok - ($label) whitespace-name reservation NOT consumed by a first-token match (reserved=1, over-counts to the TTL)"
+    else
+      FAIL=$((FAIL+1)); echo "FAIL - ($label) whitespace-name reservation was consumed by a first-token match"; grep 'FLEET ' "$W/err.log" || true
+    fi
+    check "($label) unconsumed reservation directory stays on disk" 1 "$(count_resv "$slots")"
+    return 0
+  fi
+  if grep -q 'FLEET native=1 claudex=0 reserved=0 total=1/4' "$W/err.log" 2>/dev/null; then
+    PASS=$((PASS+1)); echo "ok - ($label) live session consumes the reservation (reserved=0, not double-counted)"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL - ($label) reservation not consumed by the matching live session"; grep 'FLEET ' "$W/err.log" || true
+  fi
+  check "($label) consumed reservation directory removed from disk" 0 "$(count_resv "$slots")"
+}
+# A name with whitespace is a documented over-count, not a fix: the census only
+# exposes the first token, which two different legs can share.
+reserve_then_live "l1 space in name (documented over-count)" "HIMMEL-9500-foo bar" "HIMMEL-9500-foo bar" counted
+reserve_then_live "l2 slash in name (hashed key)" "HIMMEL-9501/x" "HIMMEL-9501/x"
+l3_long="HIMMEL-9502-$(printf 'x%.0s' $(seq 1 300))"
+reserve_then_live "l3 over NAME_MAX (hashed key)" "$l3_long" "$l3_long"
+# Control: the plain same-name shape (b) still consumes — it must stay green.
+reserve_then_live "l0 control same name" "HIMMEL-9503-plain" "HIMMEL-9503-plain"
+
+# --- (m) a reservation written by the OLD code has no `name` file, and legs
+# launched from older worktrees share $SLOTS — it must still be consumed by
+# the directory-name match.
+slots_m="$(mktemp -d "$W/slots-m.XXXXXX")" || { echo "FAIL - could not create slots-m scratch dir" >&2; exit 1; }
+mkdir -p "$slots_m/HIMMEL-9504-oldcode"
+printf '%s\n' "$((NOW + 600))" > "$slots_m/HIMMEL-9504-oldcode/expires"
+printf '%s\n' "$$" > "$slots_m/HIMMEL-9504-oldcode/pid"
+pm="$W/ps-m"; mk_ps_stub "$pm" '9001:claude:--model claude-opus-5 -n HIMMEL-9504-oldcode load doc'
+: > "$W/err.log"
+run_pf "$slots_m" "$pm" HIMMEL_FLEET_CAP=4 >/dev/null
+if grep -q 'FLEET native=1 claudex=0 reserved=0 total=1/4' "$W/err.log" 2>/dev/null; then
+  PASS=$((PASS+1)); echo "ok - (m) a name-file-less (old-code) reservation is still consumed by the dir-name match"
+else
+  FAIL=$((FAIL+1)); echo "FAIL - (m) old-code reservation not consumed"; grep 'FLEET ' "$W/err.log" || true
+fi
+check "(m) consumed old-code reservation removed from disk" 0 "$(count_resv "$slots_m")"
+
+# --- (n) the `name` file changes nothing about pruning or the census glob: a
+# STALE reservation that has one is still pruned (and not counted), and a live
+# reservation that has one and matches no live session still counts once.
+slots_n="$(mktemp -d "$W/slots-n.XXXXXX")" || { echo "FAIL - could not create slots-n scratch dir" >&2; exit 1; }
+mkdir -p "$slots_n/HIMMEL-9505-stale" "$slots_n/HIMMEL-9506-fresh"
+printf '%s\n' "$((NOW - 10))" > "$slots_n/HIMMEL-9505-stale/expires"; printf '%s\n' "$$" > "$slots_n/HIMMEL-9505-stale/pid"
+printf '%s\n' "HIMMEL-9505-stale" > "$slots_n/HIMMEL-9505-stale/name"
+printf '%s\n' "$((NOW + 600))" > "$slots_n/HIMMEL-9506-fresh/expires"; printf '%s\n' "$$" > "$slots_n/HIMMEL-9506-fresh/pid"
+printf '%s\n' "HIMMEL-9506-fresh" > "$slots_n/HIMMEL-9506-fresh/name"
+: > "$W/err.log"
+run_pf "$slots_n" "$p0" HIMMEL_FLEET_CAP=4 >/dev/null
+if grep -q 'FLEET native=0 claudex=0 reserved=1 total=1/4' "$W/err.log" 2>/dev/null; then
+  PASS=$((PASS+1)); echo "ok - (n) stale reservation with a name file pruned, unmatched live one counted once"
+else
+  FAIL=$((FAIL+1)); echo "FAIL - (n) prune/count changed by the name file"; grep 'FLEET ' "$W/err.log" || true
+fi
+if [ -e "$slots_n/HIMMEL-9505-stale" ]; then
+  FAIL=$((FAIL+1)); echo "FAIL - (n) stale reservation with a name file was not removed from disk"
+else
+  PASS=$((PASS+1)); echo "ok - (n) stale reservation with a name file removed from disk"
+fi
+check "(n) unmatched unexpired reservation with a name file stays on disk" 1 "$(count_resv "$slots_n")"
+
+# --- (o) a first token carried by TWO pending reservations is ambiguous: one
+# live `-n HIMMEL-9507-shared` names neither "HIMMEL-9507-shared a" nor "... b",
+# so it consumes NEITHER — whitespace names are never consumed by the name-file
+# match; the census may over-count but must never under-count. Stateless, so it
+# must hold on every later preflight too (a consume-one-per-run rule eats the
+# sibling on the second run). Regression for the panel's first-token class.
+slots_o="$(mktemp -d "$W/slots-o.XXXXXX")" || { echo "FAIL - could not create slots-o scratch dir" >&2; exit 1; }
+for sfx in a b; do
+  mkdir -p "$slots_o/HIMMEL-9507-shared_$sfx"
+  printf '%s\n' "$((NOW + 600))" > "$slots_o/HIMMEL-9507-shared_$sfx/expires"
+  printf '%s\n' "$$" > "$slots_o/HIMMEL-9507-shared_$sfx/pid"
+  printf '%s\n' "HIMMEL-9507-shared $sfx" > "$slots_o/HIMMEL-9507-shared_$sfx/name"
+done
+po="$W/ps-o"; mk_ps_stub "$po" '9001:claude:--model claude-opus-5 -n HIMMEL-9507-shared load doc'
+for o_run in first second; do
+  : > "$W/err.log"
+  run_pf "$slots_o" "$po" HIMMEL_FLEET_CAP=4 >/dev/null
+  if grep -q 'FLEET native=1 claudex=0 reserved=2 total=3/4' "$W/err.log" 2>/dev/null; then
+    PASS=$((PASS+1)); echo "ok - (o) $o_run preflight: ambiguous first token consumes neither reservation (reserved=2, total=3)"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL - (o) $o_run preflight: an ambiguous first token consumed a reservation"; grep 'FLEET ' "$W/err.log" || true
+  fi
+  check "(o) $o_run preflight: both same-first-token reservations stay on disk" 2 "$(count_resv "$slots_o")"
+done
+
 echo "--- $PASS passed, $FAIL failed ---"
 [ "$FAIL" -eq 0 ]

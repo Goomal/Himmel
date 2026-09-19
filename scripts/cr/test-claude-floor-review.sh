@@ -22,6 +22,12 @@ printf '{"five_hour":{"utilization":10},"seven_day":{"utilization":20},"primarie
 export CADENCE_BANK_CACHE="$W/bank.json" CADENCE_BANK_SKIP_REFRESH=1 CADENCE_BANK_LEDGER="$W/bank-ledger.jsonl"
 printf '%s\n' '#!/usr/bin/env bash' 'true' > "$W/no-fleet.sh"; chmod +x "$W/no-fleet.sh"
 export FLEET_PS_CMD="$W/no-fleet.sh" HIMMEL_REGISTRY_DIR="$W/registry"
+# HIMMEL-3220: a throwaway HOME and floor key dir — this suite never touches
+# the real ~/.himmel/cr-floor-key.
+export HOME="$W/home" CR_FLOOR_KEY_DIR="$W/keys"
+mkdir -p "$HOME"
+FLOOR_MJS="$REPO/scripts/cr/claude-floor.mjs"
+node "$FLOOR_MJS" init-key > "$W/init.out" 2>&1 || { echo "FAIL - floor key init failed: $(cat "$W/init.out")" >&2; exit 1; }
 
 # The fake claude: records argv / cwd / stdin / whether cwd has a .git, then
 # writes FAKE_OUT (verbatim) to .cr-floor-review.json and prints FAKE_ENV.
@@ -33,6 +39,9 @@ pwd > "$REC/cwd"
 cat > "$REC/stdin"
 [ -e .git ] && echo yes > "$REC/has-git" || echo no > "$REC/has-git"
 ls -A > "$REC/ls"
+for f in f.txt g.txt x.sh; do [ -f "$f" ] && cp "$f" "$REC/$f"; done
+[ -x x.sh ] && echo yes > "$REC/x-exec"
+if [ -L link ]; then echo symlink > "$REC/link-kind"; elif [ -f link ]; then echo file > "$REC/link-kind"; cp link "$REC/link"; fi
 prev=""; for a in "$@"; do [ "$prev" = "--system-prompt-file" ] && cp "$a" "$REC/system.md"; prev="$a"; done
 [ -z "${FAKE_OUT:-}" ] || printf '%s' "$FAKE_OUT" > .cr-floor-review.json
 # Default in a variable: inside ${FAKE_ENV:-...} the JSON's first } would close
@@ -98,6 +107,11 @@ check "1 ledger floor ok row" 1 "$(jq -c 'select(.kind=="avail" and .model=="cla
 has "1 ledger row records same-model + context-free + unlocking lanes" "same-model context-free session=fake-sess-1 unlocked_by=coderabbit(reason=rate-limit) codex(reason=quota-5h)" "$CR_LEDGER"
 check "1 finding recorded unadjudicated" '"claude-floor-1" "imp" ""' "$(jq -r 'select(.kind=="finding") | "\"\(.finding_id)\" \"\(.severity)\" \"\(.verdict)\""' "$CR_LEDGER")"
 has "1 output says NOT cross-model" "NOT COVERED: cross-model review" "$W/out"
+# -- HIMMEL-3220: the artifact is stamped and bound to the dispatch row --
+check "1 artifact dispatch id = the registry row id" "$(jq -r .id "$HIMMEL_REGISTRY_DIR"/live/*.json 2>/dev/null | head -1)" "$(jq -r .dispatch_id "$ART" 2>/dev/null)"
+if node "$FLOOR_MJS" verify "$ART" 2>"$W/verify.err"; then ok "1 artifact stamp verifies"; else bad "1 artifact stamp verifies: $(cat "$W/verify.err")"; fi
+jq -c '.session_id = "forged"' "$ART" > "$W/forged.json"
+if node "$FLOOR_MJS" verify "$W/forged.json" 2>/dev/null; then bad "1 an edited artifact must not verify"; else ok "1 an edited artifact does not verify"; fi
 
 # 2. RED control: codex auth (401) — refuses, nothing spent.
 mk_repo 2; row coderabbit unavailable rate-limit; row codex unavailable auth
@@ -207,6 +221,136 @@ git -C "$R" update-ref -d refs/remotes/origin/main >/dev/null 2>&1
 run_sut
 check "15 no origin/HEAD or origin/main -> exit 3" 3 "$RC"
 check "15 claude never invoked" no "$([ -e "$REC/argv" ] && echo yes || echo no)"
+
+# 16. HIMMEL-3229: the snapshot holds the RAW committed bytes — no smudge
+# filter, no eol conversion — plus the exec bit; a symlink is an inert file
+# holding its target, so it cannot point the reviewer outside the snapshot.
+mk_repo 16
+( cd "$R" && git config filter.up.smudge 'tr a-z A-Z' && git config filter.up.clean cat &&
+  printf 'f.txt filter=up\ng.txt text eol=crlf\n' > .gitattributes &&
+  printf 'one\ntwo\n' > g.txt && printf '#!/bin/sh\n' > x.sh && chmod +x x.sh &&
+  git add .gitattributes g.txt x.sh &&
+  # The 120000 entry goes through the index, not `ln -s` (which fails on a
+  # Git Bash without the symlink privilege).
+  link_blob=$(printf 'f.txt' | git hash-object -w --stdin) &&
+  git update-index --add --cacheinfo 120000 "$link_blob" link &&
+  git commit -qm attrs ) >/dev/null 2>&1
+HEAD_SHA=$(git -C "$R" rev-parse HEAD); row codex unavailable quota
+run_sut
+check "16 smudge/eol repo -> exit 0" 0 "$RC"
+if git -C "$R" cat-file blob "$HEAD_SHA:f.txt" | cmp -s - "$REC/f.txt"; then ok "16 smudge-filtered f.txt is the raw blob"; else bad "16 smudge-filtered f.txt is the raw blob (got: $(head -c 40 "$REC/f.txt" 2>/dev/null))"; fi
+if git -C "$R" cat-file blob "$HEAD_SHA:g.txt" | cmp -s - "$REC/g.txt"; then ok "16 eol=crlf g.txt is the raw blob"; else bad "16 eol=crlf g.txt is the raw blob"; fi
+check "16 exec bit kept" yes "$(cat "$REC/x-exec" 2>/dev/null)"
+check "16 symlink is an inert file, not a link" file "$(cat "$REC/link-kind" 2>/dev/null)"
+check "16 inert symlink file holds its target" f.txt "$(cat "$REC/link" 2>/dev/null)"
+
+# 17. No floor signing key provisioned -> refuse BEFORE spending, naming the
+# operator's init command (fail closed, never an unsigned artifact).
+mk_repo 17; row codex unavailable quota
+CR_FLOOR_KEY_DIR="$W/no-keys" run_sut
+check "17 no signing key -> exit 3" 3 "$RC"
+check "17 claude never invoked" no "$([ -e "$REC/argv" ] && echo yes || echo no)"
+has "17 names the init command" "claude-floor.mjs init-key" "$W/out"
+check "17 no provenance artifact" no "$([ -e "$R/.git/cr-floor/$HEAD_SHA.json" ] && echo yes || echo no)"
+
+# 18. init-key: 0700 dir, 0600 private key, idempotent, never overwrites.
+K="$W/k18"
+CR_FLOOR_KEY_DIR="$K" node "$FLOOR_MJS" init-key >/dev/null 2>&1
+check "18 key dir is 0700" 700 "$(stat -c %a "$K" 2>/dev/null || stat -f %Lp "$K")"
+check "18 private key is 0600" 600 "$(stat -c %a "$K/signing.key" 2>/dev/null || stat -f %Lp "$K/signing.key")"
+cp "$K/signing.key" "$W/k18.before"
+RC=0; CR_FLOOR_KEY_DIR="$K" node "$FLOOR_MJS" init-key > "$W/out" 2>&1 || RC=$?
+check "18 second init-key exits 0" 0 "$RC"
+if cmp -s "$K/signing.key" "$W/k18.before"; then ok "18 second init-key leaves the key unchanged"; else bad "18 second init-key overwrote the key"; fi
+has "18 second init-key says unchanged" "unchanged" "$W/out"
+
+# 19. sign stamps only an artifact its registry row backs (completed,
+# is_error=false, same dispatch id and session id).
+printf '{"schema":2,"head":"h","base":"b","diff_hash":"d","session_id":"s1","dispatch_id":"d1","findings":[]}\n' > "$W/a19.json"
+printf '{"id":"d1","status":"completed","outcome":{"is_error":false,"session_id":"s1"}}\n' > "$W/r19-ok.json"
+printf '{"id":"d1","status":"completed","outcome":{"is_error":true,"session_id":"s1"}}\n' > "$W/r19-err.json"
+printf '{"id":"d1","status":"completed","outcome":{"is_error":false,"session_id":"s2"}}\n' > "$W/r19-sess.json"
+printf '{"id":"d2","status":"completed","outcome":{"is_error":false,"session_id":"s1"}}\n' > "$W/r19-id.json"
+RC=0; node "$FLOOR_MJS" sign "$W/a19.json" "$W/r19-ok.json" > "$W/a19.signed" 2>"$W/out" || RC=$?
+check "19 matching registry row -> signed" 0 "$RC"
+RC=0; node "$FLOOR_MJS" verify "$W/a19.signed" > "$W/out" 2>&1 || RC=$?
+check "19 the signed artifact verifies" 0 "$RC"
+for c in err sess id; do
+    RC=0; node "$FLOOR_MJS" sign "$W/a19.json" "$W/r19-$c.json" > /dev/null 2>"$W/out" || RC=$?
+    check "19 registry row mismatch ($c) -> refused" 1 "$RC"
+    has "19 refusal ($c) names the registry row" "registry row" "$W/out"
+done
+
+# 20. A non-UTF-8 path is refused, never decoded lossily into another name.
+mk_repo 20
+if ( cd "$R" && : > "$(printf 'bad\377name')" && git add -A && git commit -qm bad ) >/dev/null 2>&1; then
+    RC=0; ( cd "$R" && node "$FLOOR_MJS" snapshot HEAD "$W/snap20" ) > "$W/out" 2>&1 || RC=$?
+    check "20 non-UTF-8 path -> snapshot refused" 1 "$RC"
+    has "20 refusal names the cause" "not valid UTF-8" "$W/out"
+else
+    ok "20 SKIP: this filesystem refuses non-UTF-8 names"
+fi
+
+# 21. The schema is signed and must be 2: sign refuses another schema, and a
+# signed artifact whose schema is edited no longer verifies.
+sed 's/"schema":2/"schema":1/' "$W/a19.json" > "$W/a21-s1.json"
+RC=0; node "$FLOOR_MJS" sign "$W/a21-s1.json" "$W/r19-ok.json" > /dev/null 2>"$W/out" || RC=$?
+check "21 sign refuses schema 1" 1 "$RC"
+has "21 refusal names the schema" "schema" "$W/out"
+sed 's/"schema":2/"schema":3/' "$W/a19.signed" > "$W/a21-edit.json"
+RC=0; node "$FLOOR_MJS" verify "$W/a21-edit.json" > "$W/out" 2>&1 || RC=$?
+check "21 schema edited after signing -> verify refuses" 1 "$RC"
+
+# 22. Two tree paths landing on one host path (a case-insensitive or
+# normalising filesystem, a Windows backslash) never overwrite silently: the
+# snapshot creates every file exclusively. Simulated with a dest that already
+# holds one of the head's paths.
+mk_repo 22
+mkdir -p "$W/snap22" && printf 'stale\n' > "$W/snap22/f.txt"
+RC=0; ( cd "$R" && node "$FLOOR_MJS" snapshot HEAD "$W/snap22" ) > "$W/out" 2>&1 || RC=$?
+check "22 colliding host path -> snapshot refused" 1 "$RC"
+has "22 refusal names the collision" "collides" "$W/out"
+
+# 23. A private key other users can read fails closed (POSIX): key-check and
+# init-key both refuse it.
+K="$W/k23"; mkdir -p "$K" && cp "$CR_FLOOR_KEY_DIR/signing.key" "$CR_FLOOR_KEY_DIR/signing.pub" "$K/" && chmod 700 "$K" && chmod 640 "$K/signing.key"
+RC=0; CR_FLOOR_KEY_DIR="$K" node "$FLOOR_MJS" key-check > "$W/out" 2>&1 || RC=$?
+check "23 group-readable key -> key-check refuses" 1 "$RC"
+has "23 refusal names the permissions" "readable by other users" "$W/out"
+RC=0; CR_FLOOR_KEY_DIR="$K" node "$FLOOR_MJS" init-key > "$W/out" 2>&1 || RC=$?
+check "23 group-readable key -> init-key refuses" 1 "$RC"
+chmod 600 "$K/signing.key"
+RC=0; CR_FLOOR_KEY_DIR="$K" node "$FLOOR_MJS" key-check > "$W/out" 2>&1 || RC=$?
+check "23 0600 key -> key-check passes" 0 "$RC"
+
+# 24. A tree path that could leave the snapshot (a backslash `..` climbs out
+# on Windows) is refused on every platform, and nothing is written outside it.
+mk_repo 24
+if ( cd "$R" && b=$(printf 'x' | git hash-object -w --stdin) &&
+     t=$(printf '100644 blob %s\t..\\..\\evil24\n' "$b" | git mktree) &&
+     c=$(git commit-tree -m esc "$t") && git update-ref refs/heads/esc "$c" ) >/dev/null 2>&1; then
+    RC=0; ( cd "$R" && node "$FLOOR_MJS" snapshot esc "$W/snap24/in" ) > "$W/out" 2>&1 || RC=$?
+    check "24 escaping tree path -> snapshot refused" 1 "$RC"
+    has "24 refusal names the escape" "could leave the snapshot" "$W/out"
+else
+    bad "24 could not build the escaping tree"
+fi
+
+# 25. snapshotPath, the one write chokepoint, unit-tested under path.win32 and
+# POSIX: every escaping or ambiguous component is refused, never normalised.
+# shellcheck disable=SC2016 # a JS program, not a shell string
+FLOOR_MJS="$FLOOR_MJS" node --input-type=module -e '
+import path from "node:path";
+const { snapshotPath } = await import(process.env.FLOOR_MJS);
+const refused = ["..\\..\\x", "a\\b", "C:x", "a/C:/x", "../x", "a/../../x", "./x", "a//b", "", "a/."];
+for (const p of [path.win32, path.posix]) for (const n of refused)
+    console.log(`${p === path.win32 ? "win32" : "posix"} ${JSON.stringify(n)} ${snapshotPath(p === path.win32 ? "C:\\snap" : "/snap", n, p) === null ? "refused" : "ALLOWED"}`);
+console.log(`win32 ok ${snapshotPath("C:\\snap", "a/b.txt", path.win32)}`);
+console.log(`posix ok ${snapshotPath("/snap", "a/b.txt", path.posix)}`);
+' > "$W/out25" 2>&1
+check "25 every escaping name refused under win32 and posix" 20 "$(grep -c ' refused$' "$W/out25")"
+check "25 a plain win32 path stays inside" 'win32 ok C:\snap\a\b.txt' "$(grep '^win32 ok' "$W/out25")"
+check "25 a plain posix path stays inside" 'posix ok /snap/a/b.txt' "$(grep '^posix ok' "$W/out25")"
 
 echo "claude-floor-review: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

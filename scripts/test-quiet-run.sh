@@ -329,6 +329,138 @@ CYGSTUB
         ;;
 esac
 
+# 15. Killing quiet-run.sh must reap the command it wraps, grandchildren
+# included - a TERM/INT/HUP to the wrapper used to leave the whole suite
+# running with no owning session (HIMMEL-2221). The wrapped command spawns a
+# long sleep and records its pid; after the signal that pid must be gone.
+for SIG in TERM INT HUP; do
+    PIDFILE="$SCRATCH/reap-$SIG.pid"
+    rm -f "$PIDFILE"
+    # A non-interactive `&` starts its child with INT ignored (and an ignored
+    # signal cannot be trapped); job control gives it the default disposition.
+    set -m
+    (
+        TMPDIR="$SCRATCH" exec bash "$QUIET_RUN" reap-$SIG -- \
+            bash -c 'sleep 300 & echo $! > "$1"; wait' _ "$PIDFILE" </dev/null >/dev/null 2>&1
+    ) &
+    QR_PID=$!
+    set +m
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        [ -s "$PIDFILE" ] && break
+        sleep 0.25
+    done
+    GRANDCHILD=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -z "$GRANDCHILD" ]; then
+        echo "FAIL reap $SIG - wrapped command never recorded its grandchild pid"
+        FAILED=$((FAILED + 1))
+        kill -KILL "$QR_PID" 2>/dev/null
+        continue
+    fi
+    kill -"$SIG" "$QR_PID" 2>/dev/null
+    # Bounded: an unreaped wrapper (the pre-fix shape) sits out its child. 10 s,
+    # twice the handler's own 5 s TERM-to-KILL budget, so a slow reap is not
+    # mistaken for a missing one.
+    for _ in $(seq 1 40); do
+        kill -0 "$QR_PID" 2>/dev/null || break
+        sleep 0.25
+    done
+    kill -KILL "$QR_PID" 2>/dev/null
+    QR_RC=0
+    wait "$QR_PID" 2>/dev/null || QR_RC=$?
+    case "$SIG" in TERM) EXPECT_RC=143 ;; INT) EXPECT_RC=130 ;; *) EXPECT_RC=129 ;; esac
+    assert_rc "reap $SIG - wrapper exits 128+signal on its own (not killed by the test)" "$EXPECT_RC" "$QR_RC"
+    GONE=0
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        if ! kill -0 "$GRANDCHILD" 2>/dev/null; then GONE=1; break; fi
+        sleep 0.25
+    done
+    if [ "$GONE" -eq 1 ]; then
+        echo "PASS reap $SIG - grandchild $GRANDCHILD gone after the wrapper was signalled"
+    else
+        echo "FAIL reap $SIG - grandchild $GRANDCHILD still running after the wrapper was signalled"
+        FAILED=$((FAILED + 1))
+        kill -KILL "$GRANDCHILD" 2>/dev/null
+    fi
+done
+
+# 16. Running the command as its own process group must not cost it stdin: a
+# suite that reads stdin still gets the caller's bytes and exits with its own
+# rc. The control is the naive shape (a bare `&` with job control off), which
+# hands the command /dev/null - it must read nothing, proving this case can
+# fail.
+NAIVE="$SCRATCH/quiet-run-naive-bg.sh"
+cat > "$NAIVE" <<'NAIVE_EOF'
+#!/usr/bin/env bash
+shift; shift
+"$@" >"$TMPDIR/naive.log" 2>&1 &
+wait $!
+NAIVE_EOF
+mkdir -p "$SCRATCH/stdin-log"
+printf 'stdin-payload\n' | TMPDIR="$SCRATCH/stdin-log" bash "$NAIVE" x -- bash -c 'cat; exit 3'
+if grep -q 'stdin-payload' "$SCRATCH/stdin-log/naive.log"; then
+    echo "FAIL RED: a bare-& wrapper was expected to lose stdin"
+    FAILED=$((FAILED + 1))
+else
+    echo "PASS RED: a bare-& wrapper loses stdin (control can fail)"
+fi
+OUT=$(printf 'stdin-payload\n' | TMPDIR="$SCRATCH/stdin-log" bash "$QUIET_RUN" stdin -- bash -c 'cat; exit 3' 2>&1)
+RC=$?
+assert_rc "command's own rc survives the process-group wrapper" 3 "$RC"
+LOGFILE=""
+for f in "$SCRATCH"/stdin-log/quiet-run-stdin-*.log; do
+    [ -f "$f" ] && { LOGFILE="$f"; break; }
+done
+if [ -n "$LOGFILE" ] && grep -q 'stdin-payload' "$LOGFILE"; then
+    echo "PASS command reads the caller's stdin through quiet-run"
+else
+    echo "FAIL command did not receive the caller's stdin through quiet-run"
+    FAILED=$((FAILED + 1))
+fi
+
+# 17. A command that reads the caller's TTY must not be stopped: a background
+# process group that reads the terminal gets SIGTTIN (wrapper rc 149), so with a
+# tty on stdin quiet-run keeps the foreground shape. Needs python3's pty module;
+# skipped where it is absent (Windows).
+if command -v python3 >/dev/null 2>&1; then
+    TTYIN="$SCRATCH/pty-stdin.py"
+    cat > "$TTYIN" <<'TTYIN_EOF'
+import os, sys, time, signal, glob
+try:
+    import pty
+except ImportError:
+    sys.exit(77)
+qr, scratch = sys.argv[1], sys.argv[2]
+env = dict(os.environ, TMPDIR=scratch)
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvpe("bash", ["bash", qr, "ttyin", "--", "bash", "-c", "read x; echo got:$x"], env)
+time.sleep(1.0)
+os.write(fd, b"hello\n")
+rc = None
+for _ in range(20):
+    p, status = os.waitpid(pid, os.WNOHANG)
+    if p:
+        rc = os.waitstatus_to_exitcode(status)
+        break
+    time.sleep(0.25)
+got = any("got:hello" in open(f).read() for f in glob.glob(os.path.join(scratch, "quiet-run-ttyin-*.log")))
+print(f"wrapper rc={rc} (None=hung) log-has-input={got}")
+if rc is None:
+    os.kill(pid, signal.SIGKILL)
+sys.exit(0 if (rc == 0 and got) else 1)
+TTYIN_EOF
+    mkdir -p "$SCRATCH/tty-log"
+    python3 "$TTYIN" "$QUIET_RUN" "$SCRATCH/tty-log"
+    RC=$?
+    if [ "$RC" -eq 77 ]; then
+        echo "SKIP 17: python3 has no pty module on this host"
+    else
+        assert_rc "command reads the caller's tty through quiet-run without SIGTTIN" 0 "$RC"
+    fi
+else
+    echo "SKIP 17: python3 not found"
+fi
+
 echo ""
 if [ "$FAILED" -eq 0 ]; then
     echo "All quiet-run.sh guard cases passed."

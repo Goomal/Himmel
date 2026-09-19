@@ -94,13 +94,60 @@ LOG="${TMPDIR:-/tmp}/quiet-run-${LABEL}-$(date +%Y%m%d-%H%M%S)-$$.log"
     echo ""
 } >>"$LOG"
 
+# HIMMEL-2221: a wrapper that dies leaves its command (and everything that
+# command spawned) running with no owning session. Run the command as its own
+# process group (`set -m`; unlike a bare `&` it keeps stdin) and, on
+# TERM/INT/HUP, reap that whole group before exiting 128+signal.
+# ponytail: SIGKILL of the wrapper itself cannot be trapped, so a kill -9'd
+# quiet-run still orphans its command; a command that calls setsid/setpgid
+# leaves the group and escapes the reap; and a caller that started quiet-run as
+# a non-interactive `&` job handed it SIGINT already ignored, which bash cannot
+# trap (TERM/HUP still reap). With a tty on stdin the command stays in the
+# foreground group instead: a background group that reads the terminal is
+# stopped by SIGTTIN, and ^C already reaches the whole foreground group there,
+# so that path keeps the pre-HIMMEL-2221 shape (a `kill <pid>` of the wrapper
+# alone still orphans it). A command that opens /dev/tty while stdin is not a
+# tty is stopped the same way in the grouped path.
+# shellcheck disable=SC2329,SC2317  # invoked only through the traps below
+reap() {
+    local sig="$1" code="$2" i=0
+    trap '' TERM INT HUP
+    # A signal can land between the spawn and `CHILD=$!`; $! still names the job.
+    CHILD="${CHILD:-${!:-}}"
+    if [ -z "$CHILD" ]; then
+        echo "ERR quiet-run $LABEL killed by $sig before the command started (log: $LOG)" >&2
+        exit "$code"
+    fi
+    kill -TERM -- "-$CHILD" 2>/dev/null || true
+    while kill -0 -- "-$CHILD" 2>/dev/null && [ "$i" -lt 20 ]; do
+        sleep 0.25
+        i=$((i + 1))
+    done
+    kill -KILL -- "-$CHILD" 2>/dev/null || true
+    wait "$CHILD" 2>/dev/null || true
+    echo "ERR quiet-run $LABEL killed by $sig (log: $LOG)" >&2
+    exit "$code"
+}
+
 START=$(date +%s)
-if "$@" >>"$LOG" 2>&1; then
+RC=0
+if [ -t 0 ]; then
+    "$@" >>"$LOG" 2>&1 || RC=$?
+else
+    CHILD=""
+    trap 'reap TERM 143' TERM
+    trap 'reap INT 130' INT
+    trap 'reap HUP 129' HUP
+    set -m
+    "$@" >>"$LOG" 2>&1 &
+    CHILD=$!
+    wait "$CHILD" || RC=$?
+fi
+if [ "$RC" -eq 0 ]; then
     DUR=$(( $(date +%s) - START ))
     echo "OK quiet-run $LABEL (${DUR}s, log: $LOG)"
     exit 0
 else
-    RC=$?
     DUR=$(( $(date +%s) - START ))
     echo "ERR quiet-run $LABEL exit=$RC (${DUR}s, log: $LOG)" >&2
     exit $RC

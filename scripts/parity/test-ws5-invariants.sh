@@ -18,7 +18,10 @@
 #                       excluded: a harness loop is not runtime surface; a
 #                       VENDORED.md tree is excluded too, HIMMEL-3093: it is
 #                       upstream content this repo mirrors, not himmel's own
-#                       surface -- see the corpus loop below).
+#                       surface -- see the corpus loop below). The daemon
+#                       marker skips prose -- *.md and comment lines --
+#                       and adds service-creation shapes (HIMMEL-3233;
+#                       rules at T13(b) below).
 #   T14 locks        -- no per-token-lane wiring in shipped source; the
 #                       gemini/copilot/cursor index rows stay deferred.
 #                       (The former T14(a) claude-codex-launcher prohibition
@@ -200,7 +203,11 @@ trap 'rm -f "$SHIPPED"' EXIT
 # cancellation LESS likely, i.e. the gate stays strict.
 VENDORED_LIST="$(mktemp "${TMPDIR:-/tmp}/ws5-vendored-list.XXXXXX")" || { echo "test-ws5-invariants.sh: mktemp failed" >&2; exit 2; }
 REMOVED="$(mktemp "${TMPDIR:-/tmp}/ws5-removed.XXXXXX")" || { echo "test-ws5-invariants.sh: mktemp failed" >&2; exit 2; }
-trap 'rm -f "$SHIPPED" "$VENDORED_LIST" "$REMOVED"' EXIT
+# One line per $SHIPPED line, in lockstep: "md" when the added line came from a
+# *.md file, "code" otherwise. T13(b)'s daemon class reads it (HIMMEL-3233);
+# $SHIPPED itself stays bare lines so T14(b)'s grep cannot match a path.
+SHIPPED_KIND="$(mktemp "${TMPDIR:-/tmp}/ws5-shipped-kind.XXXXXX")" || { echo "test-ws5-invariants.sh: mktemp failed" >&2; exit 2; }
+trap 'rm -f "$SHIPPED" "$VENDORED_LIST" "$REMOVED" "$SHIPPED_KIND"' EXIT
 while IFS= read -r f; do
     [ -n "$f" ] || continue
     base="${f##*/}"
@@ -237,7 +244,7 @@ while IFS= read -r f; do
     fi
 done < <(git diff "$BASE...HEAD" --name-only)
 
-git diff "$BASE...HEAD" | awk -v vendored_file="$VENDORED_LIST" -v removed_file="$REMOVED" '
+git diff "$BASE...HEAD" | awk -v vendored_file="$VENDORED_LIST" -v removed_file="$REMOVED" -v kind_file="$SHIPPED_KIND" '
     BEGIN {
         while ((getline line < vendored_file) > 0) vendored[line] = 1
         close(vendored_file)
@@ -255,10 +262,11 @@ git diff "$BASE...HEAD" | awk -v vendored_file="$VENDORED_LIST" -v removed_file=
         # words T13(b) scans for (e.g. a setInterval-timing test).
         skip = (base ~ /^test-/) || (base ~ /\.tsv$/) \
             || (base ~ /\.test\.(ts|js|mjs|cjs)$/) || (f in vendored)
+        kind = (tolower(base) ~ /\.md$/) ? "md" : "code"
         next
     }
     skip { next }
-    /^\+/ { print }
+    /^\+/ { print; print kind > kind_file }
     /^-/ && !/^--- / { print > removed_file }
 ' > "$SHIPPED"
 
@@ -334,16 +342,54 @@ else
     # as HIMMEL-3090 renames / HIMMEL-3151 test fixtures). One removal cancels
     # ONE addition, so a moved line plus a duplicate still fails, and a marker
     # added while a DIFFERENT line is removed is never neutral.
+    #
+    # `while true` / `setInterval` match every shipped line, as they always
+    # have. The daemon class (HIMMEL-3233) used to be the bare word `daemon`
+    # on every line, so prose naming an EXISTING daemon failed (PR #932: a
+    # README remedy, a shell comment). It now skips prose only, and is never
+    # weaker on code:
+    #   - *.md is prose: the daemon class does not apply there;
+    #   - a full-line comment (#, //, /*, *, <!--) is prose: skipped. A
+    #     leading run of `/* ... */` / `<!-- ... -->` closed on the line is
+    #     stripped first, so the code after it is still checked;
+    #   - on every other line the bare word `daemon` still counts, quoted or
+    #     not. Known limit: a message string naming a daemon (a doctor
+    #     `emit "the qmd daemon is wedged"`) still trips the gate -- telling a
+    #     message from an argv/`bash -c` string is not a regex's job (three
+    #     review rounds each found a new shape that hid a real daemon).
+    #     Workaround: name the daemon in a comment line, or say "service";
+    #   - service-creation shapes count too, which the bare word never
+    #     caught: `nohup ... &` backgrounded (a lone `&`, not `&&` or a
+    #     `2>&1` redirect), `systemctl ... enable`, `launchctl
+    #     load|bootstrap`. Bare nohup/setsid/disown are NOT shapes: measured
+    #     on main 2026-09-19 they hit 31 lines, mostly hook command-position
+    #     case lists (`command|exec|nohup)`) and bounded detach helpers
+    #     (scripts/lib/detach.sh); `nohup ... &` hits 7 lines in 4 files,
+    #     each a real detached process.
+    # ponytail: a heredoc body or multi-line string holding `#` at line start
+    # reads as a comment, and a C-preprocessor `#define` line likewise
+    # (himmel ships no C).
     t13b_hit=0
-    t13b_count="$(awk -v removed_file="$REMOVED" '
+    t13b_count="$(awk -v removed_file="$REMOVED" -v kind_file="$SHIPPED_KIND" '
         function trim(x) { sub(/^[ \t]+/, "", x); sub(/[ \t\r]+$/, "", x); return x }
         BEGIN {
             while ((getline line < removed_file) > 0) removed[trim(substr(line, 2))]++
             close(removed_file)
         }
         {
+            if ((getline kind < kind_file) <= 0) kind = "code"
             t = trim(substr($0, 2))
-            if (tolower(t) ~ /while[ \t]+true|setinterval|daemon/) {
+            lt = tolower(t)
+            hit = (lt ~ /while[ \t]+true|setinterval/)
+            code = lt
+            while (code ~ /^\/\*.*\*\/|^<!--.*-->/) {
+                if (substr(code, 1, 2) == "/*") code = trim(substr(code, index(code, "*/") + 2))
+                else code = trim(substr(code, index(code, "-->") + 3))
+            }
+            if (!hit && kind == "code" && code != "" && code !~ /^(#|\/\/|\/\*|\*([ \t]|$)|<!--)/ &&
+                code ~ /daemon|(^|[^a-z0-9_-])nohup[ \t].*(^|[^&<>])&([ \t]*($|[);"\047])|[ \t]+[^&> \t])|systemctl[^|;&]*[ \t]enable([ \t]|$)|launchctl[ \t]+(load|bootstrap)([ \t]|$)/)
+                hit = 1
+            if (hit) {
                 if (removed[t] > 0) removed[t]--
                 else hits++
             }

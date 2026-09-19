@@ -296,10 +296,17 @@ fi
 # (.gitleaks.toml) flag. ONE definition shared by --detail (provider error
 # bodies can echo request fragments/credentials) and --text (critic review
 # prose can quote a secret straight out of the reviewed diff).
+# HIMMEL-3207: the flatten below maps each \r and \n to its OWN space, so a
+# scheme word split from its secret by a CR/LF run ("Bearer\r\n<tok>") reaches
+# the scrub as "Bearer  <tok>" (2+ spaces). The patterns therefore take
+# whitespace RUNS after the scheme word and around the telegram ':' (the
+# token/secret/api-key pattern below already did) — rather than collapsing the
+# run in the flatten, which would change the stored bytes of every non-secret
+# row containing a blank line. The JS twin below mirrors this in lockstep.
 scrub_secrets() {
   printf '%s' "$1" | sed -E \
-    -e 's/[0-9]{8,10}:[A-Za-z0-9_-]{35}/[REDACTED]/g' \
-    -e 's/(Bearer|bearer) [A-Za-z0-9._-]{16,}/\1 [REDACTED]/g' \
+    -e 's/[0-9]{8,10}[[:space:]]*:[[:space:]]*[A-Za-z0-9_-]{35}/[REDACTED]/g' \
+    -e 's/(Bearer|bearer)[[:space:]]+[A-Za-z0-9._-]{16,}/\1 [REDACTED]/g' \
     -e 's/sk-[A-Za-z0-9][A-Za-z0-9_-]{15,}/[REDACTED]/g' \
     -e 's/AKIA[0-9A-Z]{16}/[REDACTED]/g' \
     -e 's/([Aa][Pp][Ii][_-]?[Kk]ey|[Tt]oken|[Ss]ecret)[[:space:]]*[:=][[:space:]]*[A-Za-z0-9._-]{12,}/\1=[REDACTED]/g'
@@ -393,8 +400,8 @@ REASON="$reason" DETAIL="$detail" DEFERRED_TO="$deferred_to" TEXT="$text" RAW_TE
   // Same anchored patterns as the shell scrub_secrets function above (CR
   // round, HIMMEL-1176/HIMMEL-2078) — keep both definitions in lockstep.
   const scrubSecrets=(s)=>s
-    .replace(/[0-9]{8,10}:[A-Za-z0-9_-]{35}/g,"[REDACTED]")
-    .replace(/(Bearer|bearer) [A-Za-z0-9._-]{16,}/g,"$1 [REDACTED]")
+    .replace(/[0-9]{8,10}[ \t\v\f]*:[ \t\v\f]*[A-Za-z0-9_-]{35}/g,"[REDACTED]")
+    .replace(/(Bearer|bearer)[ \t\v\f]+[A-Za-z0-9._-]{16,}/g,"$1 [REDACTED]")
     .replace(/sk-[A-Za-z0-9][A-Za-z0-9_-]{15,}/g,"[REDACTED]")
     .replace(/AKIA[0-9A-Z]{16}/g,"[REDACTED]")
     .replace(/([Aa][Pp][Ii][_-]?[Kk]ey|[Tt]oken|[Ss]ecret)[ \t]*[:=][ \t]*[A-Za-z0-9._-]{12,}/g,"$1=[REDACTED]");
@@ -555,7 +562,9 @@ REASON="$reason" DETAIL="$detail" DEFERRED_TO="$deferred_to" TEXT="$text" RAW_TE
                  line:Number(spec.line)||spec.line,verdict:spec.verdict,artifact,perspective};
       if(spec.responding_model) rec.responding_model=spec.responding_model;
       if(spec.reason) rec.reason=spec.reason;
-      if(spec.detail) rec.detail=spec.detail;
+      // HIMMEL-3207: same flatten -> scrub -> 200-char cap the shell applies to
+      // argv --detail (:325-327); a batch spec used to store it raw.
+      if(spec.detail) rec.detail=scrubSecrets(String(spec.detail).replace(/[\r\n]/g," ")).slice(0,200);
       if(spec.deferred_to) rec.deferred_to=spec.deferred_to;
       if(spec.round) rec.round=Number(spec.round);
       if(spec.disposition_round) rec.disposition_round=Number(spec.disposition_round);

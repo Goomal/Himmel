@@ -1,6 +1,7 @@
 // Pure logic for scripts/vault/backfill-source-identity.mjs (HIMMEL-3055).
 // No I/O here — every function takes plain data in and returns plain data out,
 // so it is unit-testable without a vault, a network, or gh.
+import { createHash } from "node:crypto";
 
 /**
  * Parse a github repo source URL into { owner, repo }, or null if it is not
@@ -53,14 +54,59 @@ export function applyCanonicalRenames(groupedByRawKey, canonicalByRawKey) {
   return { merged, renames };
 }
 
-function formatDelta(label, oldVal, newVal) {
+/**
+ * sha256 of the README bytes from the README API's `.content` (base64, wrapped
+ * with embedded newlines). Mirrors luna-ingest's `tr -d '\n' | base64 -d |
+ * sha256sum`, so backfill and ingest hash the same document. Null when there
+ * is no API reply at all (404 / non-string) — an absent README is an absent
+ * field, never a hash of empty bytes.
+ */
+export function readmeSha256FromApiContent(content) {
+  if (typeof content !== "string") return null;
+  const decoded = Buffer.from(content.replace(/\n/g, ""), "base64");
+  return createHash("sha256").update(decoded).digest("hex");
+}
+
+function formatDelta(label, oldVal, newVal, sameLabel = "unchanged") {
   if (oldVal === null || oldVal === undefined || oldVal === "") {
     return `${label}: ${newVal} (no prior value recorded)`;
   }
   if (String(oldVal) === String(newVal)) {
-    return `${label}: ${newVal} (unchanged)`;
+    return `${label}: ${newVal} (${sameLabel})`;
   }
   return `${label}: ${oldVal}→${newVal}`;
+}
+
+const sameInstant = (a, b) => {
+  const [ta, tb] = [Date.parse(a), Date.parse(b)];
+  return Number.isNaN(ta) || Number.isNaN(tb) ? String(a) === String(b) : ta === tb;
+};
+
+/**
+ * Has the repo moved since the note's recorded evidence? Full-precision
+ * evidence wins: a commit OID and/or a full pushed_at timestamp on both sides.
+ * Any difference there is "moved"; all-equal is "unchanged" (confirmed).
+ * With no full-precision pair, calendar dates are compared: a different date
+ * is still "moved", but the SAME date is only "date-only" — two pushes on one
+ * UTC day are indistinguishable, so it must not read as confirmed-unchanged.
+ * No usable prior evidence at all -> "no-baseline".
+ */
+export function classifyMovement({
+  existingCommit,
+  newCommit,
+  existingPushedAtFull,
+  newPushedAtFull,
+  existingPushedAtDate,
+  newPushedAtDate,
+}) {
+  const compared = [];
+  if (existingCommit && newCommit) compared.push(existingCommit === newCommit);
+  if (existingPushedAtFull && newPushedAtFull) compared.push(sameInstant(existingPushedAtFull, newPushedAtFull));
+  if (compared.length > 0) return compared.includes(false) ? "moved" : "unchanged";
+  if (existingPushedAtDate && newPushedAtDate) {
+    return existingPushedAtDate === newPushedAtDate ? "date-only" : "moved";
+  }
+  return "no-baseline";
 }
 
 /**
@@ -88,13 +134,31 @@ export function buildIdentityFields({
     ? formatDelta("stars", existingStars, newStars)
     : null;
   const pushedDelta = newPushedAtDate
-    ? formatDelta("pushed_at", existingPushedAt, newPushedAtDate)
+    ? formatDelta("pushed_at", existingPushedAt, newPushedAtDate, "same day, date-only") // a calendar date cannot confirm "unchanged"
     : null;
   const deltaParts = [starsDelta, pushedDelta].filter(Boolean);
   if (deltaParts.length > 0) {
     fields.push({ key: "revalidation_delta", value: deltaParts.join(", ") });
   }
   return fields;
+}
+
+// Frontmatter fences are matched CR-tolerantly: a CRLF note splits on "\n" into
+// lines that still end in "\r", and must not be mistaken for a fence-less note.
+const isFence = (line) => line !== undefined && line.replace(/\r$/, "") === "---";
+const closingFenceIndex = (lines) => lines.findIndex((line, i) => i > 0 && isFence(line));
+
+/** Extract a top-level `key: value` line's value from WITHIN the frontmatter block only. */
+export function extractFrontmatterField(content, key) {
+  const lines = content.split("\n");
+  if (!isFence(lines[0])) return null;
+  const closeIdx = closingFenceIndex(lines);
+  if (closeIdx === -1) return null;
+  for (const line of lines.slice(1, closeIdx)) {
+    const m = line.replace(/\r$/, "").match(new RegExp(`^${key}:\\s*(.*)$`));
+    if (m) return m[1].trim().replace(/^["']|["']$/g, "");
+  }
+  return null;
 }
 
 /** A plain YAML scalar is unsafe once it contains ": " (colon-space) or starts with a special char. */
@@ -116,10 +180,10 @@ function yamlScalar(value) {
  */
 export function patchFrontmatter(content, fields) {
   const lines = content.split("\n");
-  if (lines[0] !== "---") {
+  if (!isFence(lines[0])) {
     throw new Error("patchFrontmatter: content does not start with a frontmatter fence");
   }
-  const closeIdx = lines.indexOf("---", 1);
+  const closeIdx = closingFenceIndex(lines);
   if (closeIdx === -1) {
     throw new Error("patchFrontmatter: no closing frontmatter fence found");
   }
@@ -137,7 +201,10 @@ export function patchFrontmatter(content, fields) {
     return { content, changed: false };
   }
 
-  const appended = toAppend.map((f) => `${f.key}: ${yamlScalar(f.value)}`);
+  // Split on "\n" leaves a CRLF note's "\r" on every original line, so those
+  // round-trip untouched; the appended lines take the opening fence's ending.
+  const cr = lines[0].endsWith("\r") ? "\r" : "";
+  const appended = toAppend.map((f) => `${f.key}: ${yamlScalar(f.value)}${cr}`);
   const newLines = [...frontmatterLines, ...appended, ...rest];
   return { content: newLines.join("\n"), changed: true };
 }

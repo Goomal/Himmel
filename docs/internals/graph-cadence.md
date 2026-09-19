@@ -6,17 +6,6 @@
 > is the fuller reference for the fifth: `scripts/graphify/graph-cadence.sh`,
 > its ledger, and its failure surfacing.
 
-> **⚠ Currently refuses to run — HIMMEL-2654, unresolved.** `graph-cadence.sh`
-> exits 2 unconditionally, before touching anything: its pipeline lock is not
-> actually safe under concurrency (stale-lock takeover is not single-winner,
-> and lock age alone can evict a still-running pipeline), so two concurrent
-> runs can both `reset --hard` + `clean -fdx` the same worktree. Do **not**
-> register the scheduled entry (`graphmap-cadence.sh arm`) until HIMMEL-2654
-> lands — arming it today only gets you a task that fires and refuses every
-> time. The guard, this note, and its test all get deleted together as
-> HIMMEL-2654's own step 3, which is what makes that ticket's closure
-> observable.
-
 ## Why this exists
 
 himmel's own graphify graph (`graphify-out/graph.json`) is heavily used —
@@ -91,10 +80,6 @@ what `graph-publish.sh` actually creates.
 
 ## Arm / inspect / remove
 
-**Do not run `arm` for this leg until HIMMEL-2654 lands** (see the notice at
-the top of this page) — the task will register fine, but every scheduled
-fire refuses immediately (exit 2) instead of doing anything.
-
 Same three verbs as every sibling cadence, via the shared
 `graphmap-cadence.sh` entry point — there is no separate arm command for
 this leg:
@@ -119,6 +104,25 @@ run `ast-update.sh`, open/refresh a PR, and drive `merge-on-green.sh`'s own
 `ast-update.sh`'s HIMMEL-910 promote lock (skip-not-wait, so a collision is
 a skipped-and-retried refresh next fire, not a failure — the wider offset
 just makes that the exception rather than the rule).
+
+Two fires of this leg itself are serialized by `graph-cadence.sh`'s own
+pipeline lock (`<worktree>.lock`), because each run `reset --hard` +
+`clean -fdx`es the same worktree. `mkdir` is the whole protocol (HIMMEL-2654,
+following `scripts/luna/qmd-cadence.sh`, where three rounds of automatic
+stale-lock takeover each produced the next race). A run proceeds only if its
+own `mkdir` succeeded, and nothing ever removes a lock it did not create: the
+exit trap removes the run's own instance only, by owner token. The lock
+records the holder's pid, host and a `heartbeat` re-stamped every 30s — for
+detection only. A contender that finds a live holder (pid alive on this host,
+or a heartbeat under 600s old from another host) skips, `action=skipped`,
+rc 0. A contender that finds a dead holder never takes the lock over: it
+refuses loudly — `action=failed`, rc 3, naming the lock path, the holder pid
+("stale: holder pid N dead") and its age — and so does every later fire until
+an operator removes `<worktree>.lock`. `himmel-doctor` C33 surfaces that
+failed row. A run re-checks its owner token right before its first
+destructive git command. A refreshed graph lands only through a `chore/graph-publish-<slug>`
+PR merged on green — never a direct push to `main` (asserted in
+`test-graph-cadence.sh`).
 
 ## The ledger
 

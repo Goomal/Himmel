@@ -138,6 +138,15 @@ case "$1" in
         echo "fake-graphify: simulated failure" >&2
         exit 1
     fi
+    # HIMMEL-2654 lock tests: park inside the pipeline (past the destructive
+    # sync) until the test releases us, so a rival can race a LIVE holder.
+    if [ -n "${FAKE_GRAPHIFY_HOLD_DIR:-}" ]; then
+        : > "$FAKE_GRAPHIFY_HOLD_DIR/entered.$$"
+        i=0
+        while [ ! -e "$FAKE_GRAPHIFY_HOLD_DIR/release" ] && [ "$i" -lt 3000 ]; do
+            sleep 0.01; i=$((i + 1))
+        done
+    fi
     out="$dir/graphify-out"
     mkdir -p "$out"
     head=$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo unknown)
@@ -242,18 +251,6 @@ corpus_slug_of() {
     printf '%s' "$s"
 }
 
-# HIMMEL-2654 STOP SIGN: graph-cadence.sh now refuses to run at all (exit 2)
-# unless GRAPH_CADENCE_BYPASS_2654_GUARD=1 *and* GRAPH_CADENCE_HIMMEL_ROOT are
-# both set (see the guard at the top of graph-cadence.sh). Every caller of
-# run_gc() already sets GRAPH_CADENCE_HIMMEL_ROOT as an env-prefix before the
-# call, so exporting the bypass here -- and ONLY here, inside the test
-# harness -- lets the pipeline-logic tests below keep exercising the code the
-# guard sits in front of, while the guard itself stays structurally
-# unreachable from any real cadence invocation (cron, manual, arm) that never
-# sets GRAPH_CADENCE_HIMMEL_ROOT. The dedicated refusal test (below) calls
-# graph-cadence.sh directly, NOT through run_gc, so it still sees the
-# default-refuses behaviour. Deleted alongside the guard itself when
-# HIMMEL-2654 lands (see graph-cadence.sh's own REMOVAL TRIGGER comment).
 run_gc() {
     PATH="$FAKE_BIN:$PATH" \
     FORGE=github \
@@ -261,7 +258,6 @@ run_gc() {
     FAKE_GH_LOG="$FAKE_GH_LOG" \
     GRAPH_CADENCE_MERGE_ON_GREEN="$FAKE_MERGE" \
     FAKE_MERGE_LOG="$FAKE_MERGE_LOG" \
-    GRAPH_CADENCE_BYPASS_2654_GUARD=1 \
     HIMMEL_FLOW_RUNS_LEDGER="${HIMMEL_FLOW_RUNS_LEDGER:-$TMP_ROOT/run-gc-flow-runs.jsonl}" \
     bash "$CADENCE" "$@"
 }
@@ -434,10 +430,21 @@ HOME2="$TMP_ROOT/t2-home"; LEDGER2="$TMP_ROOT/t2-ledger"
 mkdir -p "$HOME2" "$LEDGER2"
 seed_repo "$REPO2" "$BARE2" 20
 : > "$FAKE_MERGE_LOG"
+: > "$FAKE_GH_LOG"
+BARE2_MAIN_BEFORE=$(git --git-dir="$BARE2" rev-parse main)
+BARE2_REFS_BEFORE=$(git --git-dir="$BARE2" for-each-ref --format='%(refname)')
 rc=0
 out=$(HOME="$HOME2" GRAPH_CADENCE_HIMMEL_ROOT="$REPO2" GRAPH_CADENCE_LEDGER_ROOT="$LEDGER2" FAKE_MERGE_RC=0 \
       run_gc --threshold 10 2>&1) || rc=$?
 assert_eq        "full-pipeline rc=0" "0" "$rc"
+# OPERATOR REQUIREMENT (HIMMEL-2654): graph updates land ONLY via a PR --
+# never a direct push to main. origin/main is byte-identical after a full
+# publish+merge run, the ONLY new ref is the publish branch, a PR was opened
+# for it, and the merge went through merge-on-green.sh (the PR merge gate).
+assert_eq "origin/main NOT moved by the run (no direct push to main)" "$BARE2_MAIN_BEFORE" "$(git --git-dir="$BARE2" rev-parse main)"
+BARE2_NEW_REFS=$(comm -13 <(printf '%s\n' "$BARE2_REFS_BEFORE" | sort) <(git --git-dir="$BARE2" for-each-ref --format='%(refname)' | sort))
+assert_eq "the only ref pushed is the publish branch" "refs/heads/chore/graph-publish-$(corpus_slug_of "$REPO2")" "$BARE2_NEW_REFS"
+assert_contains "a PR was opened for the publish branch" "gh pr create" "$(cat "$FAKE_GH_LOG")"
 CORPUS_SLUG=$(corpus_slug_of "$REPO2")
 assert_contains "graph-publish committed to the predicted branch" "chore/graph-publish-${CORPUS_SLUG}" "$out"
 # The commit actually reached the bare origin.
@@ -598,7 +605,6 @@ out=$(env -i \
         GRAPH_CADENCE_MERGE_ON_GREEN="$FAKE_MERGE" \
         FAKE_MERGE_LOG="$FAKE_MERGE_LOG" \
         GRAPH_CADENCE_HIMMEL_ROOT="$REPO7" \
-        GRAPH_CADENCE_BYPASS_2654_GUARD=1 \
         GRAPH_CADENCE_LEDGER_ROOT="$LEDGER7" \
         bash "$CADENCE" --threshold 10 2>&1) || rc=$?
 assert_eq "env -i (with PATH/HOME given) rc=0" "0" "$rc"
@@ -614,7 +620,6 @@ rc=0
 out=$(env -i \
         HOME="$HOME7b" \
         GRAPH_CADENCE_HIMMEL_ROOT="$REPO7b" \
-        GRAPH_CADENCE_BYPASS_2654_GUARD=1 \
         GRAPH_CADENCE_LEDGER_ROOT="$LEDGER7b" \
         bash "$CADENCE" --threshold 10 2>&1) || rc=$?
 assert_eq "env -i with no PATH still completes (below-threshold path needs only git)" "0" "$rc"
@@ -645,7 +650,6 @@ rc=0
 out=$(env -i \
         PATH="$FAKE_BIN:/usr/local/bin:/usr/bin:/bin" \
         GRAPH_CADENCE_HIMMEL_ROOT="$REPO7c" \
-        GRAPH_CADENCE_BYPASS_2654_GUARD=1 \
         GRAPH_CADENCE_LEDGER_ROOT="$LEDGER7c" \
         GRAPH_CADENCE_WORKTREE_DIR="$GRAPH_CADENCE_WORKTREE_DIR_7c" \
         HIMMEL_FLOW_RUNS_LEDGER="$FLOW_LEDGER7c" \
@@ -681,7 +685,6 @@ out=$(env -i \
         HOME="$HOME7d" \
         PATH="$FAKE_BIN:/usr/local/bin:/usr/bin:/bin" \
         GRAPH_CADENCE_HIMMEL_ROOT="$REPO7d" \
-        GRAPH_CADENCE_BYPASS_2654_GUARD=1 \
         GRAPH_CADENCE_DOTENV_ROOT="$DOTENV_ROOT7d" \
         HIMMEL_FLOW_RUNS_LEDGER="$FLOW_LEDGER7d" \
         bash "$CADENCE" --threshold 10 2>&1) || rc=$?
@@ -722,7 +725,6 @@ out=$(env -i \
         GRAPH_CADENCE_MERGE_ON_GREEN="$FAKE_MERGE" \
         FAKE_MERGE_LOG="$FAKE_MERGE_LOG" \
         GRAPH_CADENCE_HIMMEL_ROOT="$REPO7e" \
-        GRAPH_CADENCE_BYPASS_2654_GUARD=1 \
         HANDOVER_DIR="$HANDOVER7e" \
         bash "$CADENCE" --threshold 10 2>&1) || rc=$?
 assert_eq "HANDOVER_DIR-set (no seam) run rc=0" "0" "$rc"
@@ -862,6 +864,10 @@ CORPUS_SLUG4d=$(corpus_slug_of "$REPO4d")
 PRE_LOCK="$HOME4d/.claude/graph-cadence/${CORPUS_SLUG4d}.lock"
 mkdir -p "$(dirname "$PRE_LOCK")"
 mkdir "$PRE_LOCK"
+# A LIVE holder (this test shell) on this host -- a dead one is refused, not
+# skipped (HIMMEL-2654; see the stale-lock case further down).
+echo "$$" > "$PRE_LOCK/pid"
+uname -n > "$PRE_LOCK/host"
 : > "$FAKE_MERGE_LOG"
 rc=0
 out=$(HOME="$HOME4d" GRAPH_CADENCE_HIMMEL_ROOT="$REPO4d" GRAPH_CADENCE_LEDGER_ROOT="$LEDGER4d" \
@@ -876,35 +882,11 @@ if [ -d "$HOME4d/.claude/graph-cadence/$CORPUS_SLUG4d" ]; then
 else
     pass "lock-contended run never created/touched the worktree"
 fi
-rmdir "$PRE_LOCK" 2>/dev/null || true
+rm -rf "$PRE_LOCK"
 
-# --- codex-1 (PR-B panel r2, hardened): a STALE lock (old "acquired" stamp,
-# simulating a crashed prior run -- reboot/SIGKILL leaves exactly this
-# behind) is TAKEN OVER, not honoured forever. Before this fix a lock with no
-# owner/staleness recovery at all would make EVERY subsequent above-threshold
-# run report a successful skip while refreshing and publishing nothing --
-# forever, since nothing but a clean release ever removed it.
-echo "TEST: a STALE pipeline lock (crashed prior run) is taken over, not honoured forever"
-REPO4j="$TMP_ROOT/t4j-primary"; BARE4j="$TMP_ROOT/t4j-origin.git"
-HOME4j="$TMP_ROOT/t4j-home"; LEDGER4j="$TMP_ROOT/t4j-ledger"
-mkdir -p "$HOME4j" "$LEDGER4j"
-seed_repo "$REPO4j" "$BARE4j" 20
-CORPUS_SLUG4j=$(corpus_slug_of "$REPO4j")
-STALE_LOCK="$HOME4j/.claude/graph-cadence/${CORPUS_SLUG4j}.lock"
-mkdir -p "$(dirname "$STALE_LOCK")"
-mkdir "$STALE_LOCK"
-echo "crashed-holder-pid-not-us" > "$STALE_LOCK/owner"
-STALE_EPOCH=$(( $(date -u +%s) - 7200 ))
-echo "$STALE_EPOCH" > "$STALE_LOCK/acquired"
-: > "$FAKE_MERGE_LOG"
-rc=0
-out=$(HOME="$HOME4j" GRAPH_CADENCE_HIMMEL_ROOT="$REPO4j" GRAPH_CADENCE_LEDGER_ROOT="$LEDGER4j" \
-      run_gc --threshold 10 2>&1) || rc=$?
-assert_eq "stale-lock takeover run completes normally (not a skip)" "0" "$rc"
-assert_contains "run reports taking over the stale lock" "is stale" "$out"
-LEDGER_LINE4j=$(tail -n1 "$LEDGER4j/.graph-cadence/ledger.jsonl" 2>/dev/null || echo MISSING)
-assert_contains "ledger action=merged -- the run actually refreshed+published+merged, not skipped" '"action":"merged"' "$LEDGER_LINE4j"
-assert_not_contains "ledger action is not skipped for a stale-lock takeover" '"action":"skipped"' "$LEDGER_LINE4j"
+# (A STALE lock -- crashed prior run -- was TAKEN OVER here until HIMMEL-2654;
+# it now blocks every fire loudly until a human removes it. Covered by the
+# HIMMEL-2654 "STALE lock blocks and is reported" case below.)
 
 # --- codex-3: a `git clean -fdx` failure aborts the pipeline (hard failure,
 # never a silent `|| true` that lets refresh/publish proceed on an unproven
@@ -972,7 +954,6 @@ out=$(env -i \
         HOME="$HOME4e" \
         PATH="$FAKE_BIN:/usr/local/bin:/usr/bin:/bin" \
         GRAPH_CADENCE_HIMMEL_ROOT="$REPO4e" \
-        GRAPH_CADENCE_BYPASS_2654_GUARD=1 \
         GRAPH_CADENCE_DOTENV_ROOT="$DOTENV4e" \
         bash "$CADENCE" --threshold 10 2>&1) || rc=$?
 assert_eq "dotenv-supplied HANDOVER_DIR is honoured, no refusal" "0" "$rc"
@@ -1000,72 +981,184 @@ flow4f=$(cat "$FLOW_LEDGER4f" 2>/dev/null || echo MISSING)
 assert_contains "the flow-run end row's own outcome is ALSO error (not masked)" '"outcome":"error"' "$flow4f"
 
 # =============================================================================
+# HIMMEL-2654: the pipeline lock is single-winner -- mkdir is the whole
+# protocol (scripts/luna/qmd-cadence.sh precedent). A PATH-stub `git` counts
+# every `reset --hard` (the first destructive step) -- a stub, never a code
+# seam, so the SAME fixture drives the pre-fix code as its RED control. The
+# fake graphify holds each run that gets past the sync (FAKE_GRAPHIFY_HOLD_DIR),
+# so a holder is provably LIVE while its rival decides.
+# =============================================================================
+LOCKBIN="$TMP_ROOT/lockbin"
+mkdir -p "$LOCKBIN"
+REAL_GIT=$(command -v git)
+cat > "$LOCKBIN/git" <<EOF
+#!/usr/bin/env bash
+case " \$* " in *" reset --hard "*) [ -n "\${LOCKTEST_RESET_LOG:-}" ] && echo "reset \$PPID" >> "\$LOCKTEST_RESET_LOG" ;; esac
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$LOCKBIN/git"
+
+# wait_for <path-glob> <max-centiseconds> -- bounded poll; rc 1 on timeout.
+wait_for() {
+    local i=0
+    # shellcheck disable=SC2086  # the glob is the point
+    until ls $1 >/dev/null 2>&1; do
+        [ "$i" -lt "$2" ] || return 1
+        sleep 0.01; i=$((i + 1))
+    done
+}
+# lock_fixture <n> -- seed a repo, establish its dedicated worktree with one
+# clean run, and export REPO_L/HOME_L/LOCK_L/HOLD_L/RESETS_L for case <n>.
+lock_fixture() {
+    REPO_L="$TMP_ROOT/tl$1-primary"; HOME_L="$TMP_ROOT/tl$1-home"
+    HOLD_L="$TMP_ROOT/tl$1-hold"; RESETS_L="$TMP_ROOT/tl$1-resets.log"
+    mkdir -p "$HOME_L" "$HOLD_L" "$TMP_ROOT/tl$1-ledger-a" "$TMP_ROOT/tl$1-ledger-b"
+    seed_repo "$REPO_L" "$TMP_ROOT/tl$1-origin.git" 20
+    HOME="$HOME_L" GRAPH_CADENCE_HIMMEL_ROOT="$REPO_L" GRAPH_CADENCE_LEDGER_ROOT="$TMP_ROOT/tl$1-ledger-a" \
+        run_gc --threshold 10 >/dev/null 2>&1 || true
+    LOCK_L="$HOME_L/.claude/graph-cadence/$(corpus_slug_of "$REPO_L").lock"
+    : > "$RESETS_L"
+}
+# lock_run <n> <a|b> -- one backgrounded run of case <n>; pid in LOCK_PID.
+lock_run() {
+    HOME="$HOME_L" GRAPH_CADENCE_HIMMEL_ROOT="$REPO_L" GRAPH_CADENCE_LEDGER_ROOT="$TMP_ROOT/tl$1-ledger-$2" \
+        PATH="$LOCKBIN:$PATH" LOCKTEST_RESET_LOG="$RESETS_L" FAKE_GRAPHIFY_HOLD_DIR="$HOLD_L" \
+        run_gc --threshold 10 > "$TMP_ROOT/tl$1-$2.out" 2>&1 &
+    LOCK_PID=$!
+}
+# lock_fire <n> <ledger-suffix> -- one foreground run; sets rc and out.
+lock_fire() {
+    rc=0
+    out=$(HOME="$HOME_L" GRAPH_CADENCE_HIMMEL_ROOT="$REPO_L" GRAPH_CADENCE_LEDGER_ROOT="$TMP_ROOT/tl$1-ledger-$2" \
+          PATH="$LOCKBIN:$PATH" LOCKTEST_RESET_LOG="$RESETS_L" run_gc --threshold 10 2>&1) || rc=$?
+}
+# wait_exit_or_resets <pid> <n-resets> <max-centiseconds> -- until the run
+# exits (it lost) or the reset count reaches n (it got in).
+wait_exit_or_resets() {
+    local i=0
+    while kill -0 "$1" 2>/dev/null && [ "$(wc -l < "$RESETS_L")" -lt "$2" ]; do
+        [ "$i" -lt "$3" ] || return 1
+        sleep 0.01; i=$((i + 1))
+    done
+}
+# A pid that provably belonged to a process that has exited.
+true & DEAD_PID=$!
+wait "$DEAD_PID" 2>/dev/null || true
+LOCK_HOST=$(uname -n)
+
+echo "TEST (HIMMEL-2654): two CONCURRENT runs -- a live (and old-looking) holder is never evicted"
+lock_fixture 2
+lock_run 2 b; PID_B=$LOCK_PID
+wait_for "$HOLD_L/entered.*" 3000 || fail "holder never entered the pipeline"
+# Make the live holder's lock look old by every age signal it carries.
+for _f in acquired heartbeat; do
+    [ -e "$LOCK_L/$_f" ] && echo "$(( $(date -u +%s) - 7200 ))" > "$LOCK_L/$_f"
+done
+lock_run 2 a; PID_A=$LOCK_PID
+wait_exit_or_resets "$PID_A" 2 3000 || true
+: > "$HOLD_L/release"
+rc_a=0; wait "$PID_A" 2>/dev/null || rc_a=$?
+wait "$PID_B" 2>/dev/null || true
+assert_eq "exactly ONE run reached reset --hard (the destructive step)" "1" "$(wc -l < "$RESETS_L" | tr -d ' ')"
+assert_eq "the contender exits 0 (a live holder is a benign skip)" "0" "$rc_a"
+ledger_a=$(tail -n1 "$TMP_ROOT/tl2-ledger-a/.graph-cadence/ledger.jsonl" 2>/dev/null || echo MISSING)
+assert_contains "the contender skipped" '"action":"skipped"' "$ledger_a"
+assert_contains "the skip names the live holder" "is alive" "$(cat "$TMP_ROOT/tl2-a.out")"
+if [ -d "$LOCK_L" ]; then fail "holder left its lock behind" "$(ls "$LOCK_L")"; else pass "holder released its lock on exit"; fi
+
+echo "TEST (HIMMEL-2654): a STALE lock blocks and is reported loudly, never taken over"
+lock_fixture 1
+mkdir "$LOCK_L"
+echo "crashed-holder" > "$LOCK_L/owner"
+echo "$DEAD_PID" > "$LOCK_L/pid"
+echo "$LOCK_HOST" > "$LOCK_L/host"
+echo "$(( $(date -u +%s) - 7200 ))" > "$LOCK_L/acquired"
+echo "$(( $(date -u +%s) - 7200 ))" > "$LOCK_L/heartbeat"
+for _fire in a b; do
+    lock_fire 1 "$_fire"
+    assert_eq "fire $_fire: refuses non-zero (rc 3)" "3" "$rc"
+    assert_contains "fire $_fire: names the dead holder" "stale: holder pid $DEAD_PID dead" "$out"
+    assert_contains "fire $_fire: names the lock path" "$LOCK_L" "$out"
+    assert_contains "fire $_fire: names the lock's age" "acquired 720" "$out"
+    ledger=$(tail -n1 "$TMP_ROOT/tl1-ledger-$_fire/.graph-cadence/ledger.jsonl" 2>/dev/null || echo MISSING)
+    assert_contains "fire $_fire: ledger records action=failed" '"action":"failed"' "$ledger"
+    assert_contains "fire $_fire: ledger names the stale holder" "stale: holder pid $DEAD_PID dead" "$ledger"
+done
+assert_eq "nothing destructive ran while the stale lock stood" "0" "$(wc -l < "$RESETS_L" | tr -d ' ')"
+assert_eq "the stale lock is left untouched for the operator" "crashed-holder" "$(cat "$LOCK_L/owner" 2>/dev/null)"
+# The operator removes it by hand; the next fire runs normally.
+rm -rf "$LOCK_L"
+lock_fire 1 c
+assert_eq "after a human removes the lock, the next fire completes" "0" "$rc"
+assert_eq "...and reaches reset --hard exactly once" "1" "$(wc -l < "$RESETS_L" | tr -d ' ')"
+
+echo "TEST (HIMMEL-2654): a stamp-less lock (holder died between mkdir and its pid write) is reported, never taken over"
+lock_fixture 5
+mkdir "$LOCK_L"
+touch -t 202001010000 "$LOCK_L"
+lock_fire 5 a
+assert_eq "stamp-less lock: refuses non-zero (rc 3)" "3" "$rc"
+assert_contains "stamp-less lock: reported stale with an unknown holder" "stale: holder pid unknown dead" "$out"
+assert_eq "stamp-less lock: nothing destructive ran" "0" "$(wc -l < "$RESETS_L" | tr -d ' ')"
+if [ -d "$LOCK_L" ] && [ -z "$(ls -A "$LOCK_L")" ]; then pass "stamp-less lock: left untouched"; else fail "stamp-less lock: was modified or removed" "$(ls -A "$LOCK_L" 2>&1)"; fi
+rm -rf "$LOCK_L"
+
+echo "TEST (HIMMEL-2654): a fresh HEARTBEAT keeps another host's lock (pid not checkable here) a benign skip"
+lock_fixture 3
+mkdir "$LOCK_L"
+echo "holder-on-another-host" > "$LOCK_L/owner"
+echo "1" > "$LOCK_L/pid"
+echo "some-other-host" > "$LOCK_L/host"
+echo "$(( $(date -u +%s) - 7200 ))" > "$LOCK_L/acquired"
+date -u +%s > "$LOCK_L/heartbeat"
+lock_fire 3 a
+assert_eq "heartbeat-live lock: contender exits 0" "0" "$rc"
+assert_eq "heartbeat-live lock: nothing destructive ran" "0" "$(wc -l < "$RESETS_L" | tr -d ' ')"
+assert_contains "heartbeat-live lock: the skip names the heartbeat" "last heartbeat" "$out"
+assert_eq "heartbeat-live lock: the holder's lock is untouched" "holder-on-another-host" "$(cat "$LOCK_L/owner" 2>/dev/null)"
+rm -rf "$LOCK_L"
+
+echo "TEST (HIMMEL-2654): the holder's heartbeat ADVANCES, and its EXIT trap removes only its OWN lock"
+lock_fixture 4
+HOME="$HOME_L" GRAPH_CADENCE_HIMMEL_ROOT="$REPO_L" GRAPH_CADENCE_LEDGER_ROOT="$TMP_ROOT/tl4-ledger-b" \
+    GRAPH_CADENCE_LOCK_HEARTBEAT_SECONDS=1 FAKE_GRAPHIFY_HOLD_DIR="$HOLD_L" \
+    run_gc --threshold 10 > "$TMP_ROOT/tl4-b.out" 2>&1 &
+PID_B=$!
+wait_for "$HOLD_L/entered.*" 3000 || fail "holder never entered the pipeline"
+echo "0" > "$LOCK_L/heartbeat"
+_i=0
+while [ "$(cat "$LOCK_L/heartbeat" 2>/dev/null)" = "0" ] && [ "$_i" -lt 500 ]; do sleep 0.01; _i=$((_i + 1)); done
+_hb=$(cat "$LOCK_L/heartbeat" 2>/dev/null || echo 0)
+if [ "$(( $(date -u +%s) - _hb ))" -lt 10 ]; then pass "heartbeat was re-stamped by the live holder"; else fail "heartbeat never advanced" "heartbeat=$_hb"; fi
+_lpid=$(cat "$LOCK_L/pid" 2>/dev/null || echo none)
+if kill -0 "$_lpid" 2>/dev/null; then pass "lock records a LIVE holder pid"; else fail "lock pid is not a live process" "pid=$_lpid"; fi
+: > "$HOLD_L/release"
+rc=0; wait "$PID_B" || rc=$?
+assert_eq "heartbeating holder completes normally" "0" "$rc"
+if [ -d "$LOCK_L" ]; then fail "holder left its lock behind" "$(ls "$LOCK_L")"; else pass "holder released its lock on exit"; fi
+# Same holder shape, but its lock is replaced mid-run (removed by hand and
+# re-created by another run): its exit must leave the other instance alone.
+rm -rf "$HOLD_L"; mkdir -p "$HOLD_L"
+HOME="$HOME_L" GRAPH_CADENCE_HIMMEL_ROOT="$REPO_L" GRAPH_CADENCE_LEDGER_ROOT="$TMP_ROOT/tl4-ledger-b" \
+    FAKE_GRAPHIFY_HOLD_DIR="$HOLD_L" run_gc --threshold 10 > "$TMP_ROOT/tl4-c.out" 2>&1 &
+PID_C=$!
+wait_for "$HOLD_L/entered.*" 3000 || fail "second holder never entered the pipeline"
+echo "another-instance" > "$LOCK_L/owner"
+: > "$HOLD_L/release"
+wait "$PID_C" 2>/dev/null || true
+assert_eq "a lock this run did not create survives its exit" "another-instance" "$(cat "$LOCK_L/owner" 2>/dev/null)"
+rm -rf "$LOCK_L"
+
+# =============================================================================
 # Test 8: usage errors
 # =============================================================================
 echo "TEST: usage errors exit 1"
-# GRAPH_CADENCE_HIMMEL_ROOT is set here purely to satisfy run_gc()'s
-# HIMMEL-2654 bypass double-gate (see run_gc()'s own comment) -- arg parsing
-# happens before this script ever reads it for real, so any value works.
+# GRAPH_CADENCE_HIMMEL_ROOT is pinned so a run that got past arg parsing
+# could never fall back to the real primary checkout.
 rc=0; out=$(GRAPH_CADENCE_HIMMEL_ROOT="$TMP_ROOT" run_gc --threshold not-a-number 2>&1) || rc=$?
 assert_eq "non-numeric --threshold rc=1" "1" "$rc"
 rc=0; out=$(GRAPH_CADENCE_HIMMEL_ROOT="$TMP_ROOT" run_gc --bogus-flag 2>&1) || rc=$?
 assert_eq "unknown flag rc=1" "1" "$rc"
-
-# =============================================================================
-# Test 9: HIMMEL-2654 stop sign -- the script refuses to run AT ALL today.
-# This test does NOT go through run_gc() (which pins the test-only bypass for
-# every OTHER test in this file) -- it calls graph-cadence.sh directly, the
-# same way cron or an operator would, to prove the guard is on by default. A
-# check for "non-zero rc" alone would pass for any unrelated breakage, so
-# this asserts both the exact exit code (2) AND that the message names the
-# ticket. When HIMMEL-2654 lands, this test (along with the guard itself and
-# the doc note in docs/internals/graph-cadence.md) gets deleted -- see the
-# REMOVAL TRIGGER comment at the top of graph-cadence.sh.
-# =============================================================================
-echo "TEST: HIMMEL-2654 stop sign -- refuses to run today, by default, unconditionally"
-rc=0
-out=$(env -i PATH="/usr/bin:/bin" bash "$CADENCE" 2>&1) || rc=$?
-assert_eq "bare invocation (no args, no special env) refuses with rc=2" "2" "$rc"
-assert_contains "the refusal message names HIMMEL-2654" "HIMMEL-2654" "$out"
-
-rc=0
-out=$(env -i PATH="/usr/bin:/bin" bash "$CADENCE" --threshold 5 2>&1) || rc=$?
-assert_eq "refusal fires even with a valid --threshold (before arg parsing runs anything)" "2" "$rc"
-assert_contains "the --threshold-args refusal message also names HIMMEL-2654" "HIMMEL-2654" "$out"
-
-# GRAPH_CADENCE_HIMMEL_ROOT ALONE is not enough -- the bypass is double-gated
-# exactly like the existing GRAPH_CADENCE_DOTENV_ROOT seam, so accidentally
-# having HIMMEL_ROOT set (as every other test in this file does, via run_gc's
-# callers) does not, by itself, punch a hole in the default refusal.
-rc=0
-out=$(env -i PATH="/usr/bin:/bin" GRAPH_CADENCE_HIMMEL_ROOT="$TMP_ROOT" bash "$CADENCE" 2>&1) || rc=$?
-assert_eq "GRAPH_CADENCE_HIMMEL_ROOT alone (no bypass var) still refuses with rc=2" "2" "$rc"
-assert_contains "still names HIMMEL-2654 with HIMMEL_ROOT set alone" "HIMMEL-2654" "$out"
-
-# The MIRROR RED control (02R console ruling, N16b): the bypass var ALONE,
-# with GRAPH_CADENCE_HIMMEL_ROOT unset, must also still refuse. Without this
-# row the suite proves only one half of the double gate -- a future edit that
-# collapsed the `||` to test the bypass var alone would leave every assertion
-# above green while turning the stop sign into a single-variable off switch
-# that any environment could flip. This is the row that makes the SEAM itself
-# inert outside a fixture, not merely the guard present.
-rc=0
-out=$(env -i PATH="/usr/bin:/bin" GRAPH_CADENCE_BYPASS_2654_GUARD=1 bash "$CADENCE" 2>&1) || rc=$?
-assert_eq "the bypass var alone (no GRAPH_CADENCE_HIMMEL_ROOT) still refuses with rc=2" "2" "$rc"
-assert_contains "still names HIMMEL-2654 with the bypass var set alone" "HIMMEL-2654" "$out"
-
-# The twin positive control: proves the bypass this file relies on for every
-# OTHER test actually works, and works only when BOTH seams are present --
-# i.e. proves run_gc()'s escape hatch is real, not a no-op that happens to
-# not matter because those tests would pass anyway. TMP_ROOT is not a git
-# checkout, so this run fails for some OTHER reason once past the guard --
-# HOME is pinned (not left to getent-fallback) purely so that later, unrelated
-# failure cannot write anything into real operator state; this test does not
-# care how it fails, only that it is not THIS refusal.
-HOME9="$TMP_ROOT/t9-positive-home"; mkdir -p "$HOME9"
-rc=0
-out=$(env -i PATH="/usr/bin:/bin" HOME="$HOME9" GRAPH_CADENCE_HIMMEL_ROOT="$TMP_ROOT" GRAPH_CADENCE_BYPASS_2654_GUARD=1 bash "$CADENCE" 2>&1) || rc=$?
-assert_not_contains "both seams together actually bypass the stop sign (positive control)" "HIMMEL-2654 (unresolved)" "$out"
 
 echo
 echo "===================================="

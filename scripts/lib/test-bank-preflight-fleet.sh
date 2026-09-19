@@ -470,5 +470,135 @@ for o_run in first second; do
   check "(o) $o_run preflight: both same-first-token reservations stay on disk" 2 "$(count_resv "$slots_o")"
 done
 
+# --- (p) HIMMEL-3216: the census used to expose only the FIRST whitespace token
+# of a live `-n` value, so a reservation keyed on that token was consumed by a
+# DIFFERENT live leg sharing it. Where /proc/<pid>/cmdline is readable the census
+# now reads the exact argv element after `-n`, and consumption compares the FULL
+# name. mk_argv_stub writes BOTH views a real box has: the ps line (argv joined
+# by spaces, control characters shown as `?` like ps does) and the NUL-separated
+# cmdline. The suites above build ps-only stubs (no cmdline file) — that is the
+# fallback path (no procfs), still first-token, and stays covered by (b)/(l)/(m)/(o).
+mk_argv_stub() { # <dir> <pid> <ps-visible -n value> <exact -n value>
+  local dir="$1" pid="$2" shown="$3" exact="$4"
+  mkdir -p "$dir/proc/$pid"
+  printf '%s' claude > "$dir/proc/$pid/comm"
+  printf '%s %s\n' "$pid" "--model claude-opus-5 -n $shown load doc" > "$dir/ps.data"
+  printf '%s\0' claude --model claude-opus-5 -n "$exact" load doc > "$dir/proc/$pid/cmdline"
+  printf '%s\n' '#!/usr/bin/env bash' "cat '$dir/ps.data'" > "$dir/ps"
+  chmod +x "$dir/ps"
+}
+# p_live <slots> <ps-visible> <exact>: informational read with one live session.
+p_live() {
+  local pp
+  pp="$(mktemp -d "$W/ps-p.XXXXXX")" || { echo "FAIL - could not create ps-p scratch dir" >&2; exit 1; }
+  mk_argv_stub "$pp" 9001 "$2" "$3"
+  : > "$W/err.log"
+  run_pf "$1" "$pp" HIMMEL_FLEET_CAP=4 >/dev/null
+}
+p_expect() { # <label> <slots> consumed|kept
+  if [ "$3" = kept ]; then
+    if grep -q 'FLEET native=1 claudex=0 reserved=1 total=2/4' "$W/err.log" 2>/dev/null; then
+      PASS=$((PASS+1)); echo "ok - ($1) not consumed by a different live full name (reserved=1)"
+    else
+      FAIL=$((FAIL+1)); echo "FAIL - ($1) reservation consumed by a live session with a different full name"; grep 'FLEET ' "$W/err.log" || true
+    fi
+    check "($1) unconsumed reservation stays on disk" 1 "$(count_resv "$2")"
+  else
+    if grep -q 'FLEET native=1 claudex=0 reserved=0 total=1/4' "$W/err.log" 2>/dev/null; then
+      PASS=$((PASS+1)); echo "ok - ($1) consumed by the live session with the identical full name (reserved=0)"
+    else
+      FAIL=$((FAIL+1)); echo "FAIL - ($1) not consumed by the identical live full name"; grep 'FLEET ' "$W/err.log" || true
+    fi
+    check "($1) consumed reservation removed from disk" 0 "$(count_resv "$2")"
+  fi
+}
+# p_case <label> <leg> <ps-visible live> <exact live> consumed|kept
+p_case() {
+  local slots out
+  slots="$(mktemp -d "$W/slots-p.XXXXXX")" || { echo "FAIL - could not create slots-p scratch dir" >&2; exit 1; }
+  out="$(run_pf "$slots" "$p0" CADENCE_BANK_LAUNCH=1 CADENCE_BANK_LEG="$2" HIMMEL_FLEET_CAP=4)"
+  check "($1) setup: declared launch -> PROCEED, reservation created" PROCEED "$out"
+  p_live "$slots" "$3" "$4"
+  p_expect "$1" "$slots" "$5"
+}
+# p1: the plain-name shape the ticket names (pre-#920 too): a live
+# `-n "HIMMEL-9600 anything"` shares the first token with a HIMMEL-9600 reservation.
+p_case "p1 plain reservation, live shares the first token" "HIMMEL-9600" "HIMMEL-9600 anything" "HIMMEL-9600 anything" kept
+# p2: a hashed-key (slash) name, live `-n "<name> other"`.
+p_case "p2 slash reservation, live shares the first token" "HIMMEL-9601/x" "HIMMEL-9601/x other" "HIMMEL-9601/x other" kept
+# p3: a whitespace name is now exact — consumed by the identical full name.
+p_case "p3 whitespace reservation, identical live full name" "HIMMEL-9602-foo bar" "HIMMEL-9602-foo bar" "HIMMEL-9602-foo bar" consumed
+# p4 control: the plain same-name shape still consumes with a cmdline present.
+p_case "p4 control same name, cmdline present" "HIMMEL-9603-plain" "HIMMEL-9603-plain" "HIMMEL-9603-plain" consumed
+# p5 guards: a live name with a control character is never a list entry, so it
+# can neither be stripped down to a plain name (a trailing newline lost to `$(...)`)
+# nor forge a second line that consumes another leg's reservation.
+p5a_nl=$'\n'
+p_case "p5a live name with a trailing newline" "HIMMEL-9604-x" "HIMMEL-9604-x?" "HIMMEL-9604-x$p5a_nl" kept
+p5b_exact="$(printf 'HIMMEL-9605-a\nHIMMEL-9606-b')"
+p_case "p5b live name embedding a second line" "HIMMEL-9606-b" "HIMMEL-9605-a?HIMMEL-9606-b" "$p5b_exact" kept
+
+# p6: a reservation name with a newline or any control character is refused at
+# reserve time — the name file is read as one line, so it could otherwise forge
+# an identity ("foo/bar<LF>other" read as "foo/bar").
+for p6 in "$(printf 'HIMMEL-9607/x\nother')" "$(printf 'HIMMEL-9608\tx')" "$(printf 'HIMMEL-9609\rx')"; do
+  slots_p6="$(mktemp -d "$W/slots-p6.XXXXXX")" || { echo "FAIL - could not create slots-p6 scratch dir" >&2; exit 1; }
+  : > "$W/ledger.jsonl"
+  p6_out="$(run_pf "$slots_p6" "$p0" CADENCE_BANK_LAUNCH=1 CADENCE_BANK_LEG="$p6" HIMMEL_FLEET_CAP=4)"
+  check "(p6) a control character in the leg name -> SKIPPED-FLEET, not PROCEED" SKIPPED-FLEET "$p6_out"
+  check "(p6) no reservation left behind for a control-character name" 0 "$(count_resv "$slots_p6")"
+  # The refusal is recorded in the JSONL ledger: the rejected name must not split
+  # the record (newline) or put a raw control character inside the JSON string.
+  check "(p6) the ledger gets exactly one record for the refused name" 1 "$(grep -c '' "$W/ledger.jsonl")"
+  check "(p6) the ledger record carries no raw control character" 0 "$(tr -d '\n' < "$W/ledger.jsonl" | tr -cd '[:cntrl:]' | wc -c | tr -d ' ')"
+done
+# p6b: same class, no control character — a quote or backslash in the leg name
+# must be escaped in the ledger record, not close the JSON string early.
+slots_p6b="$(mktemp -d "$W/slots-p6b.XXXXXX")" || { echo "FAIL - could not create slots-p6b scratch dir" >&2; exit 1; }
+: > "$W/ledger.jsonl"
+run_pf "$slots_p6b" "$p0" CADENCE_BANK_LAUNCH=1 CADENCE_BANK_LEG='HIMMEL-9611"x\y' HIMMEL_FLEET_CAP=4 >/dev/null
+check "(p6b) a quote/backslash in the leg name is escaped in the ledger record" 1 "$(grep -cF 'HIMMEL-9611\"x\\y' "$W/ledger.jsonl")"
+# p7: a PRE-EXISTING (forged / older-copy) name file whose second line differs
+# is not read as its first line: it must not consume the live `HIMMEL-9610/x`.
+slots_p7="$(mktemp -d "$W/slots-p7.XXXXXX")" || { echo "FAIL - could not create slots-p7 scratch dir" >&2; exit 1; }
+mkdir -p "$slots_p7/4242"
+printf '%s\n' "$((NOW + 600))" > "$slots_p7/4242/expires"; printf '%s\n' "$$" > "$slots_p7/4242/pid"
+printf '%s\n%s\n' "HIMMEL-9610/x" "other" > "$slots_p7/4242/name"
+p_live "$slots_p7" "HIMMEL-9610/x" "HIMMEL-9610/x"
+p_expect "p7 multi-line name file" "$slots_p7" kept
+# p7b: extra trailing blank lines in a name file must not be normalised away
+# ($(cat) strips ALL trailing newlines): only the single LF the writer emits is
+# part of the file format, anything more is a multi-line identity.
+slots_p7b="$(mktemp -d "$W/slots-p7b.XXXXXX")" || { echo "FAIL - could not create slots-p7b scratch dir" >&2; exit 1; }
+mkdir -p "$slots_p7b/4243"
+printf '%s\n' "$((NOW + 600))" > "$slots_p7b/4243/expires"; printf '%s\n' "$$" > "$slots_p7b/4243/pid"
+printf '%s\n\n' "HIMMEL-9611-x" > "$slots_p7b/4243/name"
+p_live "$slots_p7b" "HIMMEL-9611-x" "HIMMEL-9611-x"
+p_expect "p7b name file with extra trailing blank lines" "$slots_p7b" kept
+# p7c: a NUL byte in a name file is not a complete identity — `read -d ''`
+# stops at it, so the prefix must not be accepted as the whole name.
+slots_p7c="$(mktemp -d "$W/slots-p7c.XXXXXX")" || { echo "FAIL - could not create slots-p7c scratch dir" >&2; exit 1; }
+mkdir -p "$slots_p7c/4244"
+printf '%s\n' "$((NOW + 600))" > "$slots_p7c/4244/expires"; printf '%s\n' "$$" > "$slots_p7c/4244/pid"
+printf 'HIMMEL-9612-x\0other\n' > "$slots_p7c/4244/name"
+p_live "$slots_p7c" "HIMMEL-9612-x" "HIMMEL-9612-x"
+p_expect "p7c name file with an embedded NUL" "$slots_p7c" kept
+# p8: the reservation DIRECTORY name is an identity too. `$(basename)` strips a
+# trailing newline ("HIMMEL-9613-x<LF>" -> "HIMMEL-9613-x") and a multi-line
+# name handed to `grep -F` is a LIST of patterns, so either shape would consume
+# a plain live name. A control-character directory name matches nothing.
+p8_i=0
+for p8 in $'HIMMEL-9613-x\n' $'HIMMEL-9614-y\nHIMMEL-9615-z'; do
+  p8_i=$((p8_i + 1))
+  slots_p8="$(mktemp -d "$W/slots-p8.XXXXXX")" || { echo "FAIL - could not create slots-p8 scratch dir" >&2; exit 1; }
+  mkdir -p "$slots_p8/$p8"
+  printf '%s\n' "$((NOW + 600))" > "$slots_p8/$p8/expires"; printf '%s\n' "$$" > "$slots_p8/$p8/pid"
+  case $p8_i in
+    1) p_live "$slots_p8" "HIMMEL-9613-x" "HIMMEL-9613-x" ;;
+    2) p_live "$slots_p8" "HIMMEL-9615-z" "HIMMEL-9615-z" ;;
+  esac
+  p_expect "p8.$p8_i reservation directory name with a newline" "$slots_p8" kept
+done
+
 echo "--- $PASS passed, $FAIL failed ---"
 [ "$FAIL" -eq 0 ]

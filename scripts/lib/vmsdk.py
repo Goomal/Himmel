@@ -112,6 +112,30 @@ def _guest_path(root):
     return "'" + root + "'"
 
 
+def _inert_lanes_test():
+    """HIMMEL-3252: the find sub-expression that is TRUE for the one file the `full`
+    scan may let through -- himmelctl's own lane-profile persistence writes
+    scripts/lanes/lanes.local.json during an install, so a guest that has ever been
+    through one would otherwise fail every full scan of the clone on the NAME alone.
+    A regular file there, <=1 KiB, whose bytes (newline/tab/CR read as spaces) match an anchored
+    ERE naming exactly lanes / profileAllowlist / profileAllowlistScope with every
+    string value from a CLOSED vocabulary (an allowlist of an inert shape, not a hunt
+    for secrets). Runs inside `sh -c '...'`, so the JSON quotes are \\" there.
+    Byte-identical to _vm_guest_inert_lanes_test in vm-guest-excludes.sh."""
+    q = '\\"'
+    s = " *"  # structural whitespace only; tr maps \n \t \r to spaces first, so a space INSIDE a quoted string can never match
+    lane = "(codex-exec|hermes-oneshot)"
+    ids = f"({q}{lane}{q}({s},{s}{q}{lane}{q})*)?"
+    entry = (f"\\{{{s}{q}id{q}{s}:{s}{q}{lane}{q}{s},{s}{q}probe{q}{s}:{s}"
+             f"\\{{{s}{q}kind{q}{s}:{s}{q}(always|never){q}{s}\\}}{s}\\}}")
+    ere = (f"^{s}\\{{{s}{q}lanes{q}{s}:{s}\\[{s}({entry}({s},{s}{entry})*)?{s}\\]"
+           f"({s},{s}{q}profileAllowlist{q}{s}:{s}\\[{s}{ids}{s}\\]"
+           f"({s},{s}{q}profileAllowlistScope{q}{s}:{s}\\[{s}{ids}{s}\\])?)?{s}\\}}{s}\\$")
+    return ("-type f -path '*/scripts/lanes/lanes.local.json' -size -3 "
+            "-exec sh -c 'tr \"\\n\\t\\r\" \"   \" <\"$1\" | "
+            f"grep -Eq \"{ere}\"' _ {{}} \\;")
+
+
 def secret_scan_cmd(root, profile="full"):
     """The portable guest-side command that lists secret-bearing files under root
     (byte-identical to vm_guest_scan_cmd in vm-guest-excludes.sh)."""
@@ -119,6 +143,11 @@ def secret_scan_cmd(root, profile="full"):
     if profile not in _SCAN_PROFILES:
         raise VMError(f"unknown secret-scan profile {profile!r} (full|env)")
     names = " -o ".join(f"-name '{g}'" for g in _SCAN_PROFILES[profile])
+    if profile == "full":
+        # The one content exemption to the *.local.json name (HIMMEL-3252).
+        names = names.replace(
+            "-name '*.local.json'",
+            f"\\( -name '*.local.json' ! \\( {_inert_lanes_test()} \\) \\)")
     # ! -type d: a directory named .env is a virtualenv convention, not a secret.
     # -H follows a symlinked root; nested directory symlinks are followed by the
     # `_s` recursion; -xdev limit: see vm-guest-excludes.sh.

@@ -79,6 +79,8 @@ check_contains "main: a RUN 2 NOTE block yields runs=2, relaunches=1" \
     "$MAIN_OUT" "$(printf 'legN9200\t2\t1\t0\t1\t')"
 check_contains "main: TOTAL row aggregates n/relaunches/blocked/wrapped across both docs" \
     "$MAIN_OUT" "$(printf 'TOTAL(n=2)\t-\t1 (mean 0.50)\t1 (mean 0.50)\t1\t-')"
+check_contains "main: coverage triple beside the TOTAL row" \
+    "$MAIN_OUT" "coverage: discovered=2 parsed=2 skipped=0"
 
 # --- (i) doc_date is the LAST YYYY-MM-DD substring in the filename, not the
 # first: a --since after the (wrong) first date but before the (right) last
@@ -112,6 +114,10 @@ IGNORE_OUT=$("$RELAUNCH" --since 2026-01-01T00:00:00Z 2>/dev/null)
 check_exit "ignore-nonmatching: exits 0" "$?" "0"
 check "ignore-nonmatching: a filename with no legN token/date is not picked up" \
     "$(printf '%s\n' "$IGNORE_OUT" | grep -c '^legN')" "1"
+# HIMMEL-3269: a dated doc the metric does not read (current `<TICKET>-N<k>-`
+# naming) is counted as skipped with its reason, not silently absent
+check "ignore-nonmatching: the unread doc shows up in the coverage triple with its reason" \
+    "$(printf '%s\n' "$IGNORE_OUT" | grep '^coverage:')" "coverage: discovered=2 parsed=1 skipped=1 (no-leg-token=1)"
 
 # --- (m) leg numbers of differing digit counts sort numerically, not
 # lexicographically (legN9 < legN10 < legN207 < legN1000)
@@ -126,6 +132,24 @@ check "sort-order: legs are ordered numerically by leg number, not lexicographic
 # whose header declares POSIX bash 3.2+
 SORT_V_COUNT=$(grep -c 'sort -V' "$RELAUNCH")
 check "portability: leg-relaunch.sh does not use GNU-only sort -V" "$SORT_V_COUNT" "0"
+
+# --- (o) unreadable: a listed-but-unreadable doc is named `unreadable` in the
+# coverage line, not counted as parsed with a default run count (HIMMEL-3269 CR
+# round 1). Skipped when chmod cannot make a file unreadable (running as root).
+UNR_DIR=$(mktemp -d "${TMPDIR:-/tmp}/relaunch-unreadable.XXXXXX") || { echo "FAIL - unreadable: mktemp -d"; exit 1; }
+cp "$HERE"/fixtures/leg-relaunch/main/* "$UNR_DIR"/ || { echo "FAIL - unreadable: cp fixture"; exit 1; }
+UNR_FILE=$(find "$UNR_DIR" -type f | sort | head -1)
+[ -n "$UNR_FILE" ] || { echo "FAIL - unreadable: no fixture file copied"; exit 1; }
+chmod 000 "$UNR_FILE" || { echo "FAIL - unreadable: chmod 000"; exit 1; }
+if [ -r "$UNR_FILE" ]; then
+    echo "ok - unreadable: SKIPPED (chmod 000 leaves the file readable, e.g. running as root)"
+else
+    export SCORECARD_HANDOVER_DIR="$UNR_DIR"
+    UNR_OUT=$("$RELAUNCH" --since 2026-01-01T00:00:00Z 2>/dev/null)
+    check "unreadable: the coverage line names the unreadable doc and does not count it parsed" \
+        "$(printf '%s\n' "$UNR_OUT" | grep '^coverage:')" "coverage: discovered=2 parsed=1 skipped=1 (unreadable=1)"
+fi
+chmod 600 "$UNR_FILE"; rm -rf "$UNR_DIR"
 
 echo "---"
 if [ "$fails" -eq 0 ]; then

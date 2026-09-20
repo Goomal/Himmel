@@ -45,6 +45,7 @@
 // reflects the reconcile instead of reading the stale on-disk entry.
 
 const os = require('os');
+const { spawnSync } = require('child_process');
 const path = require('path');
 const stateLib = require('./state.js');
 const probesLib = require('./probes.js');
@@ -85,6 +86,18 @@ function expandHome(p) {
   if (p.slice(0, 2) === '~/') return path.join(home, p.slice(2));
   if (p.slice(0, 2) === '~\\') return path.join(home, p.slice(2).replace(/\\/g, '/'));
   return p;
+}
+
+// HIMMEL-3307: bitbucket-cli-build is opt-in ONLY for a target that does not
+// use Bitbucket Cloud. Same rule scripts/lib/forge.sh forge_detect applies: an
+// explicit FORGE=bitbucket, else an `origin` remote on bitbucket.org.
+// ponytail: looks at `origin` only (like forge_detect); a Bitbucket remote under
+// another name, or an origin that cannot be read (no repo, git missing, 5 s
+// timeout), reads as "not Bitbucket" and the row downgrades to n/a.
+function targetUsesBitbucket(targetPath) {
+  if (String(process.env.FORGE || '').toLowerCase() === 'bitbucket') return true;
+  const r = spawnSync('git', ['-C', targetPath, 'remote', 'get-url', 'origin'], { encoding: 'utf8', timeout: 5000 });
+  return r.status === 0 && /bitbucket\.org[/:]/i.test(r.stdout || '');
 }
 
 // The ONE place per-item probe ctx is constructed. Special case (and the
@@ -387,6 +400,37 @@ function statusReport({ manifest, scope, targetPath, answers, itemIds, state: pa
       if (item.id === 'gemini-cli') {
         severity = 'n/a';
         detail = `${probe.detail} — opt-in (npm install -g @google/gemini-cli)`;
+      }
+      // HIMMEL-3307: three items a clean STARTER install left red although
+      // nothing was wrong. Each is downgraded ONLY on a probe-flagged clean
+      // absence (or, for bitbucket-cli-build, a plain absence: its probe is a
+      // file-exists check with nothing finer to flag) — a half-filled .env, a
+      // HANDOVER_DIR pointing nowhere, or an external-handover profile with the
+      // var unset never carries the flag and stays a loud red.
+      //   jira-env-keys        — Jira is optional; a starter install never
+      //                          writes <himmel>/.env.
+      //   bitbucket-cli-build  — adopt never builds scripts/bitbucket; only a
+      //                          Bitbucket Cloud origin needs it (setup.sh
+      //                          tolerates a failed build for the same reason).
+      //   handover-wiring      — inline handover keeps state in <repo>/handovers,
+      //                          created lazily on the first handover write, so
+      //                          there is nothing to "wire" yet. Distinct wording
+      //                          (not "opt-in": the handover system IS in use,
+      //                          its directory just does not exist yet). Gated
+      //                          on the recorded profile saying `inline`; with
+      //                          no answers to consult it fails open to red.
+      if (item.id === 'jira-env-keys' && probe.cleanAbsence) {
+        severity = 'n/a';
+        detail = `${probe.detail} — opt-in (Jira integration: add JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY to <himmel>/.env to use the Jira CLI)`;
+      }
+      if (item.id === 'bitbucket-cli-build' && !targetUsesBitbucket(targetPath)) {
+        severity = 'n/a';
+        detail = `${probe.detail} — opt-in (Bitbucket CLI: needed only when the repo origin is a Bitbucket Cloud remote; build with: cd scripts/bitbucket && npm install && npm run build)`;
+      }
+      if (item.id === 'handover-wiring' && probe.cleanAbsence
+          && answers && typeof answers === 'object' && answers.handover && answers.handover.mode === 'inline') {
+        severity = 'n/a';
+        detail = `${probe.detail} — not initialized yet (inline handover: the repo-local handovers/ dir is created on the first handover write; nothing to wire; turns green once it exists)`;
       }
       // HIMMEL-2176 Task 7: cadence-armed's/engine-allowlist's/bridge-health's
       // OWN probes (probes.js) each mark the ordinary "never turned on"

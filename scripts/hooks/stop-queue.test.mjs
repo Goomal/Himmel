@@ -13,7 +13,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync, spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, utimesSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, renameSync, rmSync, statSync, utimesSync } from 'node:fs';
 import { join, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { makeTmpDir } from '../lib/test-tmpdir.mjs';
@@ -21,7 +21,7 @@ import { makeTmpDir } from '../lib/test-tmpdir.mjs';
 import {
   DEFAULT_TTL_MS, DEFAULT_JOB_TIMEOUT_MS, MAX_ATTEMPTS, MAX_PAYLOAD_BYTES,
   queueDir, sanitizeKey, entryKey, enqueue, drain, work, isExpired,
-  lockIsStale, workerIsLive, acquireLock, status, parseEnqueueArgs, snapshotEnv, scrubSecrets, jobEnv, redactSecrets,
+  lockIsStale, workerIsLive, acquireLock, releaseLock, STALE_LOCK_MS, status, parseEnqueueArgs, snapshotEnv, scrubSecrets, jobEnv, redactSecrets,
   snapshotOwns,
 } from './stop-queue.mjs';
 
@@ -1331,6 +1331,316 @@ test('a reclaim gate left by a dead worker does not wedge the lock', () => {
     utimesSync(gate, old, old);
     assert.equal(acquireLock(dir), true, 'a dead worker gate wedged the lock');
     assert.equal(existsSync(gate), false, 'the gate was left behind');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// [HIMMEL-3275] The reclaim gate serialises takeovers, but the gate itself was
+// cleared on AGE alone with a path-keyed rmSync. A worker that HOLDS the gate
+// and is merely slow — SIGSTOP, a starved host — is indistinguishable from one
+// that died inside the takeover, so the next worker removes the gate it is
+// still holding and walks into it: two workers inside the reclaim gate at once,
+// the one thing the gate exists to prevent. Worker A parks inside its gate, the
+// gate is dated past RECLAIM_STALE_MS, and B arrives.
+//
+// The other half of the same window — two workers both judging one gate
+// aged-out, the slower removing the gate the faster just took — is the SAME
+// path-keyed removal one instant later, and the fix removes that removal
+// entirely (nothing clears an owned gate; it is adopted in place). It is not
+// separately expressible in this harness: it needs a worker parked between its
+// age judgement and its clear WHILE another holds a newly-taken gate, and a
+// parked outer call cannot be resumed from inside the nested one in synchronous
+// code. Read the absence of any gate rmSync in acquireLock for that half.
+test('a worker cannot clear the reclaim gate a live worker is holding', () => {
+  const dir = scratch();
+  try {
+    mkdirSync(join(dir, 'worker.lock'), { recursive: true });
+    writeFileSync(join(dir, 'worker.lock', 'pid'), '0');
+    assert.equal(lockIsStale(dir), true, 'precondition: the seeded lock must read stale');
+    const gate = join(dir, 'worker.lock.reclaim');
+    let inside = 0;
+    let aged = false;
+    let heldGate = null;
+    let gateKept = null;
+    const a = acquireLock(dir, {
+      insideGate: () => {
+        inside += 1;
+        assert.equal(existsSync(gate), true, 'precondition: the takeover must hold a gate');
+        heldGate = statSync(gate).ino;
+        // A is ALIVE and holds the gate — it is only slow. Age it past
+        // RECLAIM_STALE_MS, which is the ticket's own SIGSTOP case.
+        const old = new Date(Date.now() - 5 * 60 * 1000);
+        utimesSync(gate, old, old);
+        aged = Date.now() - statSync(gate).mtimeMs > 30 * 1000;
+        acquireLock(dir, { insideGate: () => { inside += 1; } });
+        gateKept = existsSync(gate) && statSync(gate).ino === heldGate;
+      },
+    });
+    assert.equal(aged, true, 'precondition: the gate must read older than RECLAIM_STALE_MS');
+    assert.equal(inside, 1, `${inside} workers were inside the reclaim gate at once`);
+    assert.equal(gateKept, true, 'the live gate was replaced by the arriving worker');
+    assert.equal(a, true, 'the gate holder should have completed its takeover');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// [HIMMEL-3275] The second residual window: releaseLock did not take the gate,
+// so a stale-LOOKING lock whose holder is still alive (the age cap, or a reused
+// pid) could be released between the in-gate staleness check and the rename —
+// and a third worker takes a fresh lock in that gap. The takeover then renames
+// away a lock that is no longer the one it judged: the live one. Removing the
+// lock has to be keyed on the INSTANCE, not on the path.
+test('a worker cannot remove a lock that was replaced after it judged it stale', () => {
+  const dir = scratch();
+  try {
+    mkdirSync(join(dir, 'worker.lock'), { recursive: true });
+    writeFileSync(join(dir, 'worker.lock', 'pid'), '0');
+    assert.equal(lockIsStale(dir), true, 'precondition: the seeded lock must read stale');
+    let holders = 0;
+    let seam = false;
+    const a = acquireLock(dir, {
+      beforeReclaimRename: () => {
+        seam = true;
+        // The holder is alive and releases...
+        rmSync(join(dir, 'worker.lock'), { recursive: true, force: true });
+        // ...and a third worker takes a fresh lock before the takeover resumes.
+        if (acquireLock(dir)) holders += 1;
+      },
+    });
+    if (a) holders += 1;
+    assert.equal(seam, true, 'the takeover never reached the removal');
+    assert.equal(holders, 1, `${holders} workers hold the lock`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// [HIMMEL-3275] A guard, not a race: creating a lock or a gate must never
+// destroy a directory that is already there, not even an EMPTY one. The
+// identity marker made "create it already populated, so an existing object is
+// never empty" tempting — but a rename onto an empty directory REPLACES it, and
+// a pre-HIMMEL-3275 worker's live gate is a bare mkdir that is permanently
+// empty. Creation therefore stays mkdir-exclusive, and an empty object is only
+// ever removed by rmdir, which the kernel refuses on a populated one.
+test('creating a lock or a gate never replaces an existing empty directory', () => {
+  const dir = scratch();
+  try {
+    const lock = join(dir, 'worker.lock');
+    mkdirSync(lock, { recursive: true });        // a holder between mkdir and its first write
+    const lockIno = statSync(lock).ino;
+    assert.equal(acquireLock(dir), false, 'an empty lock directory was taken over on sight');
+    assert.equal(statSync(lock).ino, lockIno, 'the empty lock directory was replaced');
+
+    writeFileSync(join(lock, 'pid'), '0');       // now stale, so the takeover runs
+    const gate = join(dir, 'worker.lock.reclaim');
+    mkdirSync(gate);                             // an older worker's live, marker-less gate
+    const gateIno = statSync(gate).ino;
+    assert.equal(acquireLock(dir), false, 'a fresh empty gate was ignored');
+    assert.equal(statSync(gate).ino, gateIno, 'the empty gate was silently adopted');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// [HIMMEL-3275 codex-1] The third window, found by the panel on this branch's
+// own diff: inside the gate, staleness was judged BEFORE the lock's identity
+// was read. A holder that releases in that gap — and a third worker that takes
+// a fresh lock in it — leave the takeover reading the FRESH worker's marker,
+// which it then claims and deletes. The identity check is only worth anything
+// if the generation is captured before the judgement that acts on it, so a
+// replacement lands on the check rather than on the removal.
+test('a worker cannot remove a lock that was replaced before it read the owner', () => {
+  const dir = scratch();
+  try {
+    mkdirSync(join(dir, 'worker.lock'), { recursive: true });
+    writeFileSync(join(dir, 'worker.lock', 'pid'), '0');
+    assert.equal(lockIsStale(dir), true, 'precondition: the seeded lock must read stale');
+    let holders = 0;
+    let seam = false;
+    const a = acquireLock(dir, {
+      beforeOwnerRead: () => {
+        seam = true;
+        // The holder is alive and releases...
+        rmSync(join(dir, 'worker.lock'), { recursive: true, force: true });
+        // ...and a third worker takes a fresh lock before the takeover resumes.
+        if (acquireLock(dir)) holders += 1;
+      },
+    });
+    if (a) holders += 1;
+    assert.equal(seam, true, 'the takeover never reached the owner read');
+    assert.equal(holders, 1, `${holders} workers hold the lock`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// [HIMMEL-3275 codex-2] The identity marker is moved, not deleted, so a
+// reclaimer that dies between winning the CAS and writing its adopted marker
+// leaves a gate holding only `dead.<id>`: nothing owns it, mkdir refuses it
+// because it exists, and rmdir refuses it because it is not empty. Stale-lock
+// recovery would be wedged PERMANENTLY — every later worker walks the same
+// three refusals. An ownerless gate must therefore be recoverable, and
+// recoverable the same way everything else here is: by CAS, never by a
+// path-keyed removal.
+test('a reclaim gate orphaned by a death mid-takeover does not wedge recovery forever', () => {
+  const dir = scratch();
+  try {
+    mkdirSync(join(dir, 'worker.lock'), { recursive: true });
+    writeFileSync(join(dir, 'worker.lock', 'pid'), '0');
+    assert.equal(lockIsStale(dir), true, 'precondition: the seeded lock must read stale');
+    const gate = join(dir, 'worker.lock.reclaim');
+    mkdirSync(gate);
+    writeFileSync(join(gate, 'dead.9f1c2b40'), '0');   // the marker its CAS moved
+    const old = new Date(Date.now() - 5 * 60 * 1000);
+    utimesSync(gate, old, old);
+    assert.equal(readdirSync(gate).length, 1, 'precondition: the orphaned gate is NOT empty');
+    assert.equal(readdirSync(gate).filter((n) => n.startsWith('own.')).length, 0,
+      'precondition: the orphaned gate carries no owner marker');
+    assert.equal(Date.now() - statSync(gate).mtimeMs > 30 * 1000, true,
+      'precondition: the gate must read older than RECLAIM_STALE_MS');
+    assert.equal(acquireLock(dir), true,
+      'the stale lock could not be reclaimed — the orphaned gate wedged recovery');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// [HIMMEL-3275 round 2, codex-1] Adopting an ownerless gate reads the directory
+// AFTER deciding it has no owner, and the entry it picks is renamed on sight.
+// If a faster worker installs its ownership in that gap, the only entry left is
+// that worker's LIVE `own.<id>` — and renaming it is not a recovery, it is a
+// theft: both workers then believe they hold the gate. The recovery must only
+// ever target a residue, never an ownership marker; when one has appeared, the
+// gate has an owner and there is nothing to recover.
+test('adopting an orphaned gate never renames away a live worker’s ownership marker', () => {
+  const dir = scratch();
+  try {
+    mkdirSync(join(dir, 'worker.lock'), { recursive: true });
+    writeFileSync(join(dir, 'worker.lock', 'pid'), '0');
+    assert.equal(lockIsStale(dir), true, 'precondition: the seeded lock must read stale');
+    const gate = join(dir, 'worker.lock.reclaim');
+    mkdirSync(gate);
+    writeFileSync(join(gate, 'dead.9f1c2b40'), '0');
+    const old = new Date(Date.now() - 5 * 60 * 1000);
+    utimesSync(gate, old, old);
+    assert.equal(readdirSync(gate).filter((n) => n.startsWith('own.')).length, 0,
+      'precondition: the gate must start with no owner marker');
+    assert.equal(Date.now() - statSync(gate).mtimeMs > 30 * 1000, true,
+      'precondition: the gate must read older than RECLAIM_STALE_MS');
+    let seam = false;
+    acquireLock(dir, {
+      beforeResidueRead: () => {
+        seam = true;
+        // A faster worker wins the same recovery and is now INSIDE the gate.
+        renameSync(join(gate, 'dead.9f1c2b40'), join(gate, 'own.5b0e7c12'));
+        writeFileSync(join(gate, 'own.5b0e7c12'), String(process.pid));
+      },
+    });
+    assert.equal(seam, true, 'the recovery never reached the residue read');
+    assert.equal(existsSync(join(gate, 'own.5b0e7c12')), true,
+      'the recovery renamed away the live worker’s ownership marker');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// [HIMMEL-3275 round 2, codex-2] releaseGate wins the CAS and then removes the
+// gate RECURSIVELY, by path — and nothing bounds the gap between the two. A
+// releaser stopped there for longer than RECLAIM_STALE_MS leaves an ownerless
+// gate, which is exactly what the recovery above adopts; the releaser then
+// wakes and deletes the gate that worker is holding. A gate has no pid to prove
+// its holder is alive, so the removal must be one the KERNEL refuses once
+// anything else is there: unlink the marker we won, then rmdir.
+test('a paused gate release cannot delete a gate another worker has adopted', () => {
+  const dir = scratch();
+  try {
+    mkdirSync(join(dir, 'worker.lock'), { recursive: true });
+    writeFileSync(join(dir, 'worker.lock', 'pid'), '0');
+    assert.equal(lockIsStale(dir), true, 'precondition: the seeded lock must read stale');
+    const gate = join(dir, 'worker.lock.reclaim');
+    let seam = false;
+    acquireLock(dir, {
+      beforeGateRemove: () => {
+        seam = true;
+        const residue = readdirSync(gate).filter((n) => n.startsWith('dead.'));
+        assert.equal(residue.length, 1, 'precondition: the released gate holds its moved marker');
+        assert.equal(readdirSync(gate).filter((n) => n.startsWith('own.')).length, 0,
+          'precondition: the released gate is ownerless in this gap');
+        // Another worker recovers the ownerless gate and is now inside it.
+        renameSync(join(gate, residue[0]), join(gate, 'own.5b0e7c12'));
+        writeFileSync(join(gate, 'own.5b0e7c12'), String(process.pid));
+      },
+    });
+    assert.equal(seam, true, 'the release never reached the removal');
+    assert.equal(existsSync(join(gate, 'own.5b0e7c12')), true,
+      'the resumed release deleted the gate the adopting worker holds');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// [HIMMEL-3275 round 3, codex-1] The same class again, in the one release the
+// round-2 sweep cleared on a reason that does not hold: releaseLock's removal
+// was said to be safe because a takeover adopts an ownerless lock only after
+// lockIsStale calls its holder dead, and the holder here is the live releaser.
+// But lockIsStale returns true on heartbeat AGE regardless of pid liveness
+// (`now - mtime > STALE_LOCK_MS`), so a live holder whose heartbeat has aged
+// out reads stale — the takeover adopts, removes, and a replacement is taken,
+// which the resumed release then deletes by path. A pid proves nothing here;
+// the removal has to be one the kernel refuses.
+test('a paused lock release cannot delete a lock another worker has taken', () => {
+  const dir = scratch();
+  try {
+    const lock = join(dir, 'worker.lock');
+    assert.equal(acquireLock(dir), true, 'precondition: this process must hold the lock');
+    const old = new Date(Date.now() - STALE_LOCK_MS - 60_000);
+    utimesSync(join(lock, 'pid'), old, old);
+    assert.equal(lockIsStale(dir), true,
+      'precondition: an aged heartbeat must read stale even though the holder is alive');
+    assert.equal(readFileSync(join(lock, 'pid'), 'utf8').trim(), String(process.pid),
+      'precondition: the stale-reading lock is still held by this live process');
+    let seam = false;
+    releaseLock(dir, {
+      beforeLockRemove: () => {
+        seam = true;
+        // A takeover adopts the now-ownerless lock, judges it stale, removes it...
+        rmSync(lock, { recursive: true, force: true });
+        // ...and a replacement worker takes a fresh lock before the release resumes.
+        assert.equal(acquireLock(dir), true, 'precondition: the replacement must take the lock');
+      },
+    });
+    assert.equal(seam, true, 'the release never reached the removal');
+    assert.equal(existsSync(lock), true, 'the resumed release deleted the replacement lock');
+    assert.equal(readdirSync(lock).filter((n) => n.startsWith('own.')).length, 1,
+      'the replacement lock lost its ownership marker to the resumed release');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// [HIMMEL-3275 round 4, codex-1] The eviction reads the gate's AGE, then its
+// OWNER, and those are two reads of two different things. A worker adopting in
+// the gap between them installs its ownership with one rename — which is the
+// point of the single-step adoption — but the pid that says it is alive lived
+// in the marker's CONTENT, and a rename cannot carry new content. So the
+// contender resumes, finds the new owner's marker holding the PREVIOUS owner's
+// dead pid, calls it dead and evicts a live worker. Liveness has to be readable
+// from the same atomic step that installs ownership, which means the pid
+// belongs in the NAME.
+test('a gate adopted in the age-check gap is not evicted on the previous owner’s pid', () => {
+  const dir = scratch();
+  try {
+    mkdirSync(join(dir, 'worker.lock'), { recursive: true });
+    writeFileSync(join(dir, 'worker.lock', 'pid'), '0');
+    assert.equal(lockIsStale(dir), true, 'precondition: the seeded lock must read stale');
+    const gate = join(dir, 'worker.lock.reclaim');
+    mkdirSync(gate);
+    // The gate's owner is genuinely dead: pid 0, in the name AND in the body,
+    // so the eviction is entitled to fire until the adoption below happens.
+    writeFileSync(join(gate, 'own.0.9f1c2b40'), '0');
+    const old = new Date(Date.now() - 5 * 60 * 1000);
+    utimesSync(gate, old, old);
+    assert.equal(Date.now() - statSync(gate).mtimeMs > 30 * 1000, true,
+      'precondition: the gate must read older than RECLAIM_STALE_MS');
+    const taken = `own.${process.pid}.5b0e7c12`;
+    let seam = false;
+    acquireLock(dir, {
+      afterGateAgeCheck: () => {
+        seam = true;
+        // A faster worker adopts in ONE rename, carrying its live pid — the
+        // whole adoption, with no second step to be caught between.
+        renameSync(join(gate, 'own.0.9f1c2b40'), join(gate, taken));
+      },
+    });
+    assert.equal(seam, true, 'the takeover never reached the age check');
+    assert.equal(existsSync(join(gate, taken)), true,
+      'the eviction took a gate whose live owner adopted it in the age-check gap');
+    assert.equal(readdirSync(gate).filter((n) => n.startsWith('own.')).length, 1,
+      'two ownership markers exist — both workers believe they hold the gate');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

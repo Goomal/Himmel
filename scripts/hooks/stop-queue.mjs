@@ -68,7 +68,7 @@
 
 import { spawn } from 'node:child_process';
 import {
-  mkdirSync, writeFileSync, readFileSync, readdirSync, renameSync, rmSync,
+  mkdirSync, writeFileSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, unlinkSync,
   openSync, closeSync, writeSync, statSync, existsSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
@@ -586,45 +586,124 @@ export function workerIsLive(dir) {
   return existsSync(paths(dir).lock) && !lockIsStale(dir);
 }
 
+// A filesystem cannot be asked "is the thing at this path still the thing I
+// judged" — every removal primitive acts on the PATH. So identity is carried in
+// a NAME: each lock and each reclaim gate holds a marker file `own.<id>`, and
+// the single way to become entitled to remove or replace that object is to win
+// `rename(own.<id> -> dead.<id>)`. rename fails ENOENT once the source is gone,
+// so the KERNEL decides who won, exactly once, and the loser learns it is
+// looking at an instance that is no longer the one it judged. (HIMMEL-3275)
+const OWN_PREFIX = 'own.';
+
+// The pid lives in the NAME, `own.<pid>.<uuid>`, and not in the marker's body.
+// A rename installs ownership in one step but cannot carry new CONTENT with it,
+// so a body-borne pid always describes the PREVIOUS owner for as long as it
+// takes the new one to write — and a contender reading in that gap calls a live
+// worker dead and evicts it. Putting the pid in the name makes the single step
+// that installs ownership the same single step that publishes liveness, and it
+// removes the follow-up write a loser could otherwise use to resurrect a marker
+// it had already been claimed out of. (HIMMEL-3275)
+function ownId() {
+  return `${process.pid}.${randomUUID()}`;
+}
+
+function readOwner(objDir) {
+  let names = [];
+  try { names = readdirSync(objDir); } catch { return null; }
+  const name = names.filter((n) => n.startsWith(OWN_PREFIX)).sort()[0];
+  if (!name) return null;
+  const id = name.slice(OWN_PREFIX.length);
+  return { id, pid: Number(id.split('.')[0]) || 0 };
+}
+
+// The CAS. Exactly one caller can move a given marker; everyone else gets
+// ENOENT and must treat the object as somebody else's.
+function claimOwner(objDir, id) {
+  try {
+    renameSync(join(objDir, `${OWN_PREFIX}${id}`), join(objDir, `dead.${id}`));
+    return true;
+  } catch { return false; }
+}
+
+// Creation stays `mkdir` — NOT a rename of a pre-populated directory. Renaming
+// over an empty directory REPLACES it, and a pre-HIMMEL-3275 worker's live gate
+// is a bare mkdir that is permanently empty, so a rename-create would evict a
+// live gate belonging to an older worker with no age check and no CAS at all.
+// mkdir refuses any existing directory, empty or not.
+function createOwned(target, extra = {}) {
+  const id = ownId();
+  try { mkdirSync(target, { mode: 0o700 }); } catch { return null; }
+  try {
+    // Identity first: the gap between the mkdir and this write is the only
+    // instant the object has none, and it is covered by age (a gate younger
+    // than RECLAIM_STALE_MS is respected; a lock with no readable pid is not
+    // stale for a minute).
+    writeFileSync(join(target, `${OWN_PREFIX}${id}`), '', { mode: 0o600 });
+    for (const [name, body] of Object.entries(extra)) {
+      writeFileSync(join(target, name), body, { mode: 0o600 });
+    }
+    return id;
+  } catch {
+    try { rmSync(target, { recursive: true, force: true }); } catch { /* best effort */ }
+    return null;
+  }
+}
+
+// The generation of the lock THIS process holds. releaseLock removes the lock
+// only while it is still that instance, which is what stops a release arriving
+// mid-takeover from destroying the lock a later worker has already created.
+let heldLockId = null;
+
 // `hooks` is a test seam: it lets a test park one worker between two steps of
 // the takeover and run a second worker in the gap, deterministically.
 export function acquireLock(dir, hooks = {}) {
   const p = paths(dir);
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    const mine = createOwned(p.lock, { pid: String(process.pid) });
+    if (mine) { heldLockId = mine; return true; }
+    if (!existsSync(p.lock)) return false;    // creation failed for some other reason
+    if (!lockIsStale(dir)) return false;      // a live worker owns it — this is the bound
+    if (hooks.afterStaleCheck) hooks.afterStaleCheck();
+    // Removing a stale lock has to be ATOMIC WITH the judgement that it is
+    // stale, and neither rmSync nor rename is: both act on the PATH, not on
+    // the lock that was judged. A worker that saw the stale lock and then
+    // lost the CPU removes whatever sits at that path when it wakes — the
+    // live lock the faster worker just created — and both proceed, which is
+    // two workers draining at once, the one thing the lock exists to prevent
+    // (HIMMEL-3273). So takeovers are serialised behind a reclaim gate, and
+    // staleness is decided again INSIDE it; and the removal itself is keyed on
+    // the lock's own marker, so a holder that releases while we are in the gate
+    // cannot hand our rmSync somebody else's lock (HIMMEL-3275).
+    const gate = takeReclaimGate(p, hooks);
+    if (!gate) return false;   // another worker is mid-takeover; the lock is its to take
     try {
-      mkdirSync(p.lock, { mode: 0o700 });
-      writeFileSync(p.lockPid, String(process.pid), { mode: 0o600 });
-      return true;
-    } catch (e) {
-      if (e.code !== 'EEXIST') return false;
-      if (!lockIsStale(dir)) return false;      // a live worker owns it — this is the bound
-      if (hooks.afterStaleCheck) hooks.afterStaleCheck();
-      // Removing a stale lock has to be ATOMIC WITH the judgement that it is
-      // stale, and neither rmSync nor rename is: both act on the PATH, not on
-      // the lock that was judged. A worker that saw the stale lock and then
-      // lost the CPU removes whatever sits at that path when it wakes — the
-      // live lock the faster worker just created — and both proceed, which is
-      // two workers draining at once, the one thing the lock exists to prevent
-      // (HIMMEL-3273). So takeovers are serialised behind a reclaim gate, and
-      // staleness is decided again INSIDE it: while we hold the gate no other
-      // worker can remove the lock, and nobody can create one over an existing
-      // directory, so what we judged is what we remove.
-      const gate = takeReclaimGate(p);
-      if (!gate) return false;   // another worker is mid-takeover; the lock is its to take
-      try {
-        if (hooks.insideGate) hooks.insideGate();
-        if (!existsSync(p.lock)) continue;      // cleared meanwhile — just create it
-        if (!lockIsStale(dir)) return false;    // replaced by a live worker — leave it
-        const parked = `${p.lock}.stale-${randomUUID().slice(0, 8)}`;
+      if (hooks.insideGate) hooks.insideGate();
+      if (!existsSync(p.lock)) continue;      // cleared meanwhile — just create it
+      if (hooks.beforeOwnerRead) hooks.beforeOwnerRead();
+      // Capture the GENERATION before judging it. Read the owner AFTER the
+      // staleness check and a release-and-reacquire in that gap hands this
+      // takeover the FRESH worker's marker, which it then claims and deletes —
+      // acting on a judgement made about a lock that is already gone. With the
+      // read first, a replacement lands on the check below instead: the new
+      // lock is live, so the takeover stops.
+      let owner = readOwner(p.lock);
+      if (!owner) {
+        // No marker: a lock this code did not create (an older worker), or one
+        // whose creator died in the instant before its first write. Adopt it
+        // here, under the gate, where no other takeover can be running — so
+        // the removal below is identity-keyed like every other.
+        const adopted = ownId();
         try {
-          renameSync(p.lock, parked);
-        } catch {
-          continue;   // gone between the check and the rename; look again
-        }
-        try { rmSync(parked, { recursive: true, force: true }); } catch { /* best effort */ }
-      } finally {
-        try { rmSync(gate, { recursive: true, force: true }); } catch { /* best effort */ }
+          writeFileSync(join(p.lock, `${OWN_PREFIX}${adopted}`), '', { mode: 0o600, flag: 'wx' });
+        } catch { continue; }
+        owner = { id: adopted };
       }
+      if (!lockIsStale(dir)) return false;    // replaced by a live worker — leave it
+      if (hooks.beforeReclaimRename) hooks.beforeReclaimRename();
+      if (!claimOwner(p.lock, owner.id)) continue;   // no longer the lock we judged
+      try { rmSync(p.lock, { recursive: true, force: true }); } catch { /* best effort */ }
+    } finally {
+      releaseGate(gate, hooks);
     }
   }
   return false;
@@ -632,39 +711,145 @@ export function acquireLock(dir, hooks = {}) {
 
 // The reclaim gate is a directory created with mkdir, so exactly one worker
 // holds it. It is held for a handful of syscalls, so a gate older than
-// RECLAIM_STALE_MS was left by a worker that died inside the takeover, and is
-// cleared so it cannot wedge the queue.
-// ponytail: clearing an aged-out gate is itself a path-keyed removal, so two
-// workers that judge the SAME gate aged-out can both clear it, and the slower
-// one removes the gate the faster one just took. The age alone decides, so a
-// live holder paused inside the takeover for over RECLAIM_STALE_MS (SIGSTOP, a
-// starved host) loses its gate the same way. Either needs a worker stuck or
-// dead mid-takeover AND two more to wake in the same instant.
-// A stale lock whose holder is still alive (age cap, or a reused pid) and
-// releases between the in-gate check and the rename is the other: releaseLock
-// does not take the gate. Both are far narrower than the window this closes,
-// and neither is closed here — a directory alone cannot make removing "the
-// gate I judged" atomic, which is the same gap this gate exists to close.
+// RECLAIM_STALE_MS was left by a worker that died inside the takeover — but AGE
+// ALONE MUST NOT DECIDE, because a worker merely stopped inside the takeover
+// (SIGSTOP, a starved host) reads exactly the same. So an aged-out gate is
+// taken over only when its owner's pid is gone AND this worker wins the marker
+// rename, and it is then adopted IN PLACE: nothing is removed, so there is no
+// moment when a slower worker's removal could take out the gate a faster one
+// has just created.
+// ponytail: this makes the CONSEQUENCE of a wrong staleness judgement safe; it
+// does not make the judgement correct. A live holder whose pid has been reused
+// still reads dead (see lockIsStale), and no filesystem can answer "is this pid
+// still the holder I think it is" — the marker only guarantees that whoever
+// acts on that answer is acting on the instance it judged, and that exactly one
+// worker does. The cost is liveness: a gate whose owner is alive but wedged —
+// or whose pid has been reused by an unrelated live process — is never taken
+// over, so no takeover happens until that process exits. A stalled takeover is
+// the safe failure here; two workers draining at once is not.
+// The other residual is a gate that carries no marker at all, in two shapes,
+// and neither is cleared on age: an older worker's gate is EMPTY, so rmdir
+// clears it and the kernel refuses that call on any populated one — it can
+// never remove a gate this code created; and a gate orphaned by a death
+// mid-takeover holds only a moved marker, which is CAS-renamed into this
+// worker's own ownership rather than removed, and only ever a marker that is
+// NOT an `own.*` — an ownership marker appearing there means the gate has an
+// owner, not that it needs recovering. So no path here removes a gate or a lock
+// without first winning the CAS on it, or without the kernel confirming the
+// directory is empty.
+// ponytail: one gap in that rule is left (HIMMEL-3294), and it is the one POSIX
+// cannot close without an flock: releaseGate — and releaseLock, which removes
+// by the same identity-keyed unlink-then-rmdir — unlinks the marker it won and
+// then rmdirs, and a release stopped BETWEEN those two calls can rmdir a gate
+// or a lock that a new worker has created but not yet marked: the same
+// mkdir-to-first-write instant createOwned names above, now reachable from a
+// second direction. Both sides are two adjacent syscalls, and unlike every
+// other window here age cannot cover it, because the object it would judge is
+// younger than any threshold. releaseLock's heartbeat unlink is a third
+// instance of the shape and the only benign one: lose the CAS after it and the
+// unlink has removed a replacement's `pid`, which costs that replacement 60 s
+// of protection under the no-readable-pid rule and is rewritten by the next
+// heartbeat — a transient that cannot end with two workers draining.
 const RECLAIM_STALE_MS = 30 * 1000;
-function takeReclaimGate(p) {
+function takeReclaimGate(p, hooks = {}) {
   const gate = `${p.lock}.reclaim`;
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      mkdirSync(gate, { mode: 0o700 });
-      return gate;
-    } catch (e) {
-      if (e.code !== 'EEXIST') return null;
-      let age;
-      try { age = Date.now() - statSync(gate).mtimeMs; } catch { continue; }
-      if (age <= RECLAIM_STALE_MS) return null;
-      try { rmSync(gate, { recursive: true, force: true }); } catch { /* best effort */ }
+    const mine = createOwned(gate);
+    if (mine) return { dir: gate, id: mine };
+    let age;
+    try { age = Date.now() - statSync(gate).mtimeMs; } catch { continue; }
+    if (age <= RECLAIM_STALE_MS) return null;   // a takeover is in progress
+    if (hooks.afterGateAgeCheck) hooks.afterGateAgeCheck();
+    const owner = readOwner(gate);
+    if (!owner) {
+      try { rmdirSync(gate); continue; } catch { /* not empty — see below */ }
+      // Not empty, yet nothing owns it: a releaser died inside releaseGate,
+      // between the CAS that moved the marker and the rmdir, leaving only the
+      // moved marker behind. mkdir refuses the directory because it exists
+      // and rmdir because it is not empty, so recovery would wedge here
+      // PERMANENTLY. Recover it the way everything else here is recovered —
+      // by CAS, not by a path-keyed removal: renaming a residue marker to
+      // `own.<id>` elects exactly one winner AND installs its ownership in the
+      // same atomic step, so nothing is removed and there is no instant when a
+      // slower worker could take out a gate a faster one has just adopted.
+      // The rename also touches the directory, so the age clock restarts, and
+      // it carries this worker's pid in the name it renames TO — one step, no
+      // window in which the gate reads owned-by-someone-dead.
+      if (hooks.beforeResidueRead) hooks.beforeResidueRead();
+      // Only a RESIDUE is recoverable. The directory is read after the decision
+      // that it has no owner, so a faster worker can install its ownership in
+      // that gap — and renaming THAT is not a recovery, it is a theft that puts
+      // two workers in one gate. An `own.*` here means the gate has an owner
+      // after all and there is nothing to recover; drop back to the top, where
+      // the rename it just did has already reset the age clock.
+      let residue;
+      try {
+        residue = readdirSync(gate).filter((n) => !n.startsWith(OWN_PREFIX)).sort()[0];
+      } catch { return null; }
+      if (!residue) continue;                   // owned or emptied under us
+      const adopted = ownId();
+      try { renameSync(join(gate, residue), join(gate, `${OWN_PREFIX}${adopted}`)); } catch { return null; }
+      return { dir: gate, id: adopted };
     }
+    if (pidAlive(owner.pid)) return null;       // stopped, not dead — still its gate
+    if (hooks.beforeGateEvict) hooks.beforeGateEvict();
+    // The SAME single-step adoption the recovery above uses, and for the same
+    // reason: claiming the marker and then writing our own left the gate
+    // ownerless in between, which is precisely the state that recovery adopts.
+    // One rename elects exactly one winner AND installs its ownership — pid in
+    // the name, so this worker's liveness is published by the same step — so
+    // the gate never has an instant with no owner, nothing is left over, and
+    // there is no follow-up write for a loser to resurrect its marker with.
+    const adopted = ownId();
+    try {
+      renameSync(join(gate, `${OWN_PREFIX}${owner.id}`), join(gate, `${OWN_PREFIX}${adopted}`));
+    } catch { return null; }                    // another worker took it over
+    return { dir: gate, id: adopted };
   }
   return null;
 }
 
-function releaseLock(dir) {
-  try { rmSync(paths(dir).lock, { recursive: true, force: true }); } catch { /* best effort */ }
+function releaseGate(gate, hooks = {}) {
+  if (!claimOwner(gate.dir, gate.id)) return;   // not ours any more — not ours to remove
+  if (hooks.beforeGateRemove) hooks.beforeGateRemove();
+  // Winning the CAS authorises the removal, but the removal happens AFTER it
+  // and nothing bounds the gap: a releaser stopped here past RECLAIM_STALE_MS
+  // leaves an ownerless gate, which is exactly what the recovery above adopts.
+  // A gate carries no pid to prove its holder is alive, so instead of a
+  // recursive removal by path — which would take that worker's gate with it —
+  // unlink only the marker we just won and let the KERNEL decide: rmdir is
+  // refused the moment anyone else has put anything there. We then leave
+  // empty-handed, which is the safe failure; deleting a live gate is not.
+  try { unlinkSync(join(gate.dir, `dead.${gate.id}`)); } catch { /* adopted meanwhile */ }
+  try { rmdirSync(gate.dir); } catch { /* not empty — it belongs to whoever is in it */ }
+}
+
+export function releaseLock(dir, hooks = {}) {
+  const id = heldLockId;
+  heldLockId = null;
+  if (!id) return;
+  const lock = paths(dir).lock;
+  // Drop the heartbeat BEFORE the CAS, because a lock is judged stale on the
+  // AGE of that heartbeat and not on our liveness (`lockIsStale`): a worker
+  // still running but starved past STALE_LOCK_MS reads dead to everyone else.
+  // Between the CAS below and the removal after it, the lock is ownerless, and
+  // an ownerless lock that reads stale is exactly what a reclaimer adopts. With
+  // no `pid` to age, `lockIsStale` falls back to the lock DIRECTORY's mtime —
+  // which this unlink just refreshed — so the reclaimer backs off for 60 s
+  // instead of removing a lock whose holder is very much alive.
+  try { unlinkSync(paths(dir).lockPid); } catch { /* already gone */ }
+  // The same CAS a takeover uses. Losing it means a takeover has already
+  // claimed this lock, and the directory is then ITS to remove: removing it
+  // here would destroy whatever that worker put at the path next.
+  if (!claimOwner(lock, id)) return;
+  if (hooks.beforeLockRemove) hooks.beforeLockRemove();
+  // Winning the CAS authorises the removal, but — exactly as in `releaseGate`
+  // — the removal happens AFTER it and nothing bounds the gap. So remove by
+  // IDENTITY, not by path: unlink only the marker we just won and let the
+  // kernel refuse the `rmdir` the moment anyone else has put a lock there. A
+  // recursive removal by path would take that worker's lock with it.
+  try { unlinkSync(join(lock, `dead.${id}`)); } catch { /* taken over meanwhile */ }
+  try { rmdirSync(lock); } catch { /* not empty — it is whoever is in it's */ }
 }
 
 function heartbeat(dir) {

@@ -756,4 +756,38 @@ if [ -n "$TIER_GATE" ]; then
     echo "$(date +%F_%T) headed-arm-leg: tier=$TIER_GATE tier-category=$TIER_CATEGORY tier-reason=$TIER_REASON" >> "$LOG"
 fi
 
+# HIMMEL-3270: record what this launch WAS, where a cohort query can find it
+# after the fact. The launch-time facts (profile, role, model) are not
+# recoverable from the transcript, so this is the only moment they exist.
+# One appended line per real launch (never --dry-run) in the himmelctl cache
+# dir, which uninstall already removes wholesale (scripts/install/
+# uninstall-manifest.tsv, row himmelctl-cache). Launch metadata only - the
+# fields below are the whole record; no env value and nothing from
+# ~/.claude.json is ever read into it. Best-effort: a record that cannot be
+# written is noted in $LOG and never stops the launch.
+# ponytail: this records the launch ATTEMPT that reached the exec below;
+# headed-arm.sh can still refuse it (duplicate session name, missing pin).
+# A refused launch of a NEW name has no transcript, so a reader joining on
+# the session name never counts it - but a refused DUPLICATE of a live
+# session's name does match that session's transcript, and its line (which
+# may carry a different profile) sits beside the original: the log is
+# append-only and carries no attempt id, so the reader must not assume one
+# line per session (it is not decided here - HIMMEL-3269 owns the reader).
+# ponytail: with no HIMMELCTL_CACHE_DIR and no HOME nothing is written -
+# falling back to /tmp would leave a file uninstall cannot find (HIMMEL-3260's
+# accepted HOME-unset divergence, not repeated here).
+_ll_cache="${HIMMELCTL_CACHE_DIR:-}"
+[ -z "$_ll_cache" ] && [ -n "${HOME:-}" ] && _ll_cache="$HOME/.claude/himmel"
+if [ -n "$_ll_cache" ]; then
+    _ll_role=leg
+    [ "$RELAY" -eq 1 ] && _ll_role=relay
+    [ "$JUDGE" -eq 1 ] && _ll_role=judge
+    if ! ( umask 077 && mkdir -p "$_ll_cache/launch-logs" && \
+        printf 'headed-arm-leg: profile=%s lane=%s model=%s role=%s session=%s launched=%s\n' \
+            "${PROFILE:-none}" "$LANE" "${MODEL:-default}" "$_ll_role" "$NAME" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            >> "$_ll_cache/launch-logs/$NAME.log" ) 2>/dev/null; then
+        echo "$(date +%F_%T) headed-arm-leg: WARN launch record NOT written under $_ll_cache/launch-logs (the cost cohort cannot see this launch)" >> "$LOG"
+    fi
+fi
+
 exec "$HEADED_ARM" "$NAME" "$DOC" "$SIGNAL" "$DEADLINE" "$LOG" "$MODEL" "$CONTEXT"

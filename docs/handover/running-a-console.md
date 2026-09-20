@@ -182,6 +182,14 @@ threat model and the verbatim block:
 green at that exact head, zero unresolved review threads, attestation trailers
 in the first commit) → `GO` → the leg merges and reports `MERGED #<n> → <sha>`.
 
+The Jira close is the leg's call from the brief, not a default:
+`merge-on-green.sh` transitions the ticket only on `--jira-transition`
+(HIMMEL-3143), and the brief's Ship contract carries `completes-ticket: yes|no`
+(HIMMEL-3271) — `yes` → the leg passes the flag, `no` (the ticket spans further
+PRs) → it omits it. After `MERGED`, re-read the ticket: the flag closes only the
+first `[KEY]` of the PR title, so a multi-key PR needs its other ticket checked
+by hand.
+
 `scripts/handover/console-kit/ready-check.sh <pr> <full-40-hex-head-sha>`
 mechanizes that independent verification (HIMMEL-3163): it re-runs checks
 1-6 (head match + clean merge state, statusCheckRollup all green, zero
@@ -201,7 +209,8 @@ presence, verbatim, is the pass signal for 2973). Open HIMMEL-2977's comments
 and find that citation's line verbatim: a missing citation or a line not
 found is not READY; for the general `GATE ... <status> <date>` shape (every
 ticket except 2973), a found line whose status is not PASS is also not READY.
-The console pulls the primary and the leg closes out its ticket.
+The console pulls the primary and the leg wraps (closing its ticket only if the
+brief's `completes-ticket: yes` says the PR completes it).
 The console sends GO by first running `bash scripts/handover/console-kit/go.sh
 <pr> <full head sha>` — the file IS the GO, the SendMessage is the
 notification: a leg launched by `headed-arm-leg.sh` carries

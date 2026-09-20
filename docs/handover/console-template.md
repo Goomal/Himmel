@@ -206,8 +206,15 @@ only then runs `console-kit/go.sh <pr> <head>` — that write is the ACT of
 granting the GO (HIMMEL-3142: `gh pr merge` itself is gated on that file for
 a console-spawned leg, not merely on hearing from you); answering `GO` over
 SendMessage is a notification to the leg, not the mechanism. The leg merges;
-it reports `MERGED #<n> → <sha>`; you pull the primary and tell the leg to
-close out its ticket.
+it reports `MERGED #<n> → <sha>`; you pull the primary and the leg wraps
+(closing its ticket only if the brief says the PR completes it, below).
+
+The Jira close is the leg's call from the brief, not a default: the Ship
+contract's `completes-ticket: yes|no` line tells the leg to merge with
+`--jira-transition` (`yes`) or without it (`no` — the ticket spans further PRs).
+Fill it in when you write the brief. After `MERGED`, re-read the ticket: the flag
+closes only the first `[KEY]` of the PR title, so a multi-key PR needs its other
+ticket checked by hand.
 
 Never merge with open review threads, and never read a handoff calling a PR
 clean as evidence — query that PR yourself.

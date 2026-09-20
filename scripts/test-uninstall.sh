@@ -2269,6 +2269,214 @@ assert_has 'RED 12: partial read is truncated before fallback preview' \
 assert_not_has 'RED 12: partial read never previews recorded scope' \
     'DRY: claude plugin marketplace remove m1 --scope project' "$out"
 
+
+# ── U17+ (HIMMEL-3251): install-written residue is manifested, classified, shown
+# in --dry-run and removed (code) or named as kept (keep). The fixtures are made
+# by the REAL installers (wire_user_claude_md + the hud config template), so the
+# tests remove what install actually writes.
+U17_SCRIPTS="$(cd "$(dirname "$CLI")" && pwd)"
+U17_TEMPLATE="$U17_SCRIPTS/../docs/setup/user-scope-claude-md-template.md"
+U17_HUD_TEMPLATE="$U17_SCRIPTS/../marketplace/plugins/claude-hud/config/himmel-config.json"
+# shellcheck source=lib/user-claude-md.sh
+. "$U17_SCRIPTS/lib/user-claude-md.sh"
+U17_BEGIN='<!-- BEGIN HIMMEL:working-principles -->'
+# u_residue_fixture <name> — the operator's CLAUDE.md gets the block appended to
+# their own text; ~/.codex/AGENTS.md is created by install (block only); the hud
+# config is the rendered template; trust + adopter scripts are seeded as installed.
+u_residue_fixture() {
+    u_fixture "$1"
+    mkdir -p "$U_HOME/.claude/plugins/claude-hud" "$U_HOME/.codex"
+    printf 'my own rules\n' > "$U_HOME/.claude/CLAUDE.md"
+    printf 'my own rules\n' > "$TMP/u-$1-claude-md-before"
+    wire_user_claude_md "$U17_TEMPLATE" "$U_HOME/.claude/CLAUDE.md" >/dev/null
+    wire_user_claude_md "$U17_TEMPLATE" "$U_HOME/.codex/AGENTS.md" >/dev/null
+    sed 's#<himmel-path>#/fixture/himmel#g' "$U17_HUD_TEMPLATE" > "$U_HOME/.claude/plugins/claude-hud/config.json"
+    printf '{"projects":{"/x":{"hasTrustDialogAccepted":true}}}\n' > "$U_HOME/.claude.json"
+    cp "$U_HOME/.claude.json" "$TMP/u-$1-trust-before"
+}
+u_same() {   # <label> <fileA> <fileB> — byte-identical
+    if cmp -s "$2" "$3"; then echo "PASS $1"; else echo "FAIL $1 — $2 differs from $3"; FAILED=$((FAILED + 1)); fi
+}
+u_absent() {   # <label> <path>
+    if [ ! -e "$2" ] && [ ! -L "$2" ]; then echo "PASS $1"; else echo "FAIL $1 — still present: $2"; FAILED=$((FAILED + 1)); fi
+}
+
+# The fixtures put ~/.claude.json and ~/.codex under the fixture $HOME, which the
+# wet-run fence (HIMMEL-2505) reads as a live operator profile. The $HOME is a
+# temp dir, so lift the fence the way case 23b does — for these calls only.
+u_run_fx() { export HIMMEL_UNINSTALL_REAL_HOME=1; u_run "$@"; unset HIMMEL_UNINSTALL_REAL_HOME; }
+
+# U17 — --dry-run names every residue artifact in the footprint and step 6, and
+# changes nothing.
+u_residue_fixture u17
+cp "$U_HOME/.claude/CLAUDE.md" "$TMP/u17-claude-md-full"
+cp "$U_HOME/.codex/AGENTS.md" "$TMP/u17-agents-md-full"
+cp "$U_HOME/.claude/plugins/claude-hud/config.json" "$TMP/u17-hud-full"
+u_run --dry-run
+assert_rc 'U17 dry-run completes' 0 "$rc"
+assert_has 'U17 footprint lists ~/.claude/CLAUDE.md block' "$U_HOME/.claude/CLAUDE.md — " "$out"
+assert_has 'U17 footprint lists ~/.codex/AGENTS.md block' "$U_HOME/.codex/AGENTS.md — " "$out"
+assert_has 'U17 footprint lists the hud config' "$U_HOME/.claude/plugins/claude-hud/config.json — " "$out"
+assert_has 'U17 footprint names the trust entry as NEVER' "NEVER   $U_HOME/.claude.json — " "$out"
+assert_has 'U17 footprint names the adopter scripts/ as NEVER' "scripts — himmel scripts copied into" "$out"
+assert_has 'U17 dry-run previews the CLAUDE.md strip' "DRY: would strip himmel working-principles block from $U_HOME/.claude/CLAUDE.md" "$out"
+assert_has 'U17 dry-run previews the AGENTS.md strip' "DRY: would strip himmel working-principles block from $U_HOME/.codex/AGENTS.md" "$out"
+assert_has 'U17 dry-run previews the hud config removal' "DRY: would remove himmel hud config $U_HOME/.claude/plugins/claude-hud/config.json" "$out"
+u_same 'U17 dry-run left CLAUDE.md alone' "$U_HOME/.claude/CLAUDE.md" "$TMP/u17-claude-md-full"
+u_same 'U17 dry-run left AGENTS.md alone' "$U_HOME/.codex/AGENTS.md" "$TMP/u17-agents-md-full"
+u_same 'U17 dry-run left the hud config alone' "$U_HOME/.claude/plugins/claude-hud/config.json" "$TMP/u17-hud-full"
+
+# U18 — wet run: the block goes and the operator's own text is byte-identical;
+# an install-created file that held only the block is removed; the hud config
+# goes; the keep rows stay and the footer names them.
+u_residue_fixture u18
+u_run_fx
+assert_rc 'U18 wet run completes' 0 "$rc"
+u_same 'U18 CLAUDE.md is the operator text again, byte-identical' "$U_HOME/.claude/CLAUDE.md" "$TMP/u-u18-claude-md-before"
+u_absent 'U18 install-created AGENTS.md removed' "$U_HOME/.codex/AGENTS.md"
+u_absent 'U18 hud config removed' "$U_HOME/.claude/plugins/claude-hud/config.json"
+u_same 'U18 workspace-trust entry untouched (keep)' "$U_HOME/.claude.json" "$TMP/u-u18-trust-before"
+assert_has 'U18 footer names the trust entry as not touched' "- $U_HOME/.claude.json — " "$out"
+assert_has 'U18 footer names the adopter scripts as not touched' "scripts — himmel scripts copied into" "$out"
+case "$(cat "$U_HOME/.claude/CLAUDE.md")" in
+    *HIMMEL:working-principles*) echo 'FAIL U18 marker still in CLAUDE.md'; FAILED=$((FAILED + 1)) ;;
+    *) echo 'PASS U18 no marker left in CLAUDE.md' ;;
+esac
+
+# U19 — operator text on BOTH sides of the block survives byte-identical.
+u_residue_fixture u19
+printf 'top\n' > "$U_HOME/.claude/CLAUDE.md"
+wire_user_claude_md "$U17_TEMPLATE" "$U_HOME/.claude/CLAUDE.md" >/dev/null
+printf 'bottom\n' >> "$U_HOME/.claude/CLAUDE.md"
+printf 'top\nbottom\n' > "$TMP/u19-expect"
+u_run_fx
+assert_rc 'U19 wet run completes' 0 "$rc"
+u_same 'U19 text above and below the block is untouched' "$U_HOME/.claude/CLAUDE.md" "$TMP/u19-expect"
+
+# U20 — an ambiguous file (two BEGIN markers) is refused, never guessed at:
+# byte-identical, named, rc 2. A file with no block at all is a clean no-op.
+u_residue_fixture u20
+{ cat "$U_HOME/.claude/CLAUDE.md"; printf '%s\n' "$U17_BEGIN"; } > "$TMP/u20-doubled"
+cp "$TMP/u20-doubled" "$U_HOME/.claude/CLAUDE.md"
+cp "$U_HOME/.codex/AGENTS.md" "$TMP/u20-agents"
+cp "$U_HOME/.claude/plugins/claude-hud/config.json" "$TMP/u20-hud"
+u_run_fx
+assert_rc 'U20 doubled marker halts the run' 2 "$rc"
+u_same 'U20 doubled-marker file left byte-identical' "$U_HOME/.claude/CLAUDE.md" "$TMP/u20-doubled"
+assert_has 'U20 refusal names the file' "$U_HOME/.claude/CLAUDE.md" "$out"
+# the halt is honoured inside the step: later files are not touched after it
+u_same 'U20 AGENTS.md not touched after the halt' "$U_HOME/.codex/AGENTS.md" "$TMP/u20-agents"
+u_same 'U20 hud config not touched after the halt' "$U_HOME/.claude/plugins/claude-hud/config.json" "$TMP/u20-hud"
+u_residue_fixture u20b
+printf 'notes mention HIMMEL:working-principles in prose only\n' > "$U_HOME/.claude/CLAUDE.md"
+cp "$U_HOME/.claude/CLAUDE.md" "$TMP/u20b-prose"
+u_run_fx
+assert_rc 'U20b file with no block completes' 0 "$rc"
+u_same 'U20b no-block file untouched' "$U_HOME/.claude/CLAUDE.md" "$TMP/u20b-prose"
+
+# U21 — the hud config is removed only when it is himmel's: an operator's own
+# customLineCommand keeps the file.
+u_residue_fixture u21
+printf '{"display":{"customLineCommand":"echo mine"}}\n' > "$U_HOME/.claude/plugins/claude-hud/config.json"
+cp "$U_HOME/.claude/plugins/claude-hud/config.json" "$TMP/u21-hud"
+u_run_fx
+assert_rc 'U21 wet run completes' 0 "$rc"
+u_same 'U21 operator hud config kept byte-identical' "$U_HOME/.claude/plugins/claude-hud/config.json" "$TMP/u21-hud"
+assert_has 'U21 kept hud config is explained' "not himmel's" "$out"
+# An operator command that merely MENTIONS himmel's script is not himmel's.
+u_residue_fixture u21b
+printf '{"display":{"customLineCommand":"echo scripts/statusline/hud-custom-lines.sh"}}\n' > "$U_HOME/.claude/plugins/claude-hud/config.json"
+cp "$U_HOME/.claude/plugins/claude-hud/config.json" "$TMP/u21b-hud"
+u_run_fx
+assert_rc 'U21b wet run completes' 0 "$rc"
+u_same 'U21b mention-only hud config kept byte-identical' "$U_HOME/.claude/plugins/claude-hud/config.json" "$TMP/u21b-hud"
+# ...while himmel's own command behind the ECON prefix is still recognised.
+u_residue_fixture u21c
+printf '{"display":{"customLineCommand":"HIMMEL_STATUSLINE_ECON=off bash \\"/x/scripts/statusline/hud-custom-lines.sh\\""}}\n' > "$U_HOME/.claude/plugins/claude-hud/config.json"
+u_run_fx
+assert_rc 'U21c wet run completes' 0 "$rc"
+if [ ! -e "$U_HOME/.claude/plugins/claude-hud/config.json" ]; then echo 'PASS U21c ECON-prefixed himmel hud config removed'
+else echo 'FAIL U21c ECON-prefixed himmel hud config still present'; FAILED=$((FAILED + 1)); fi
+
+# U22 — dry and wet print the SAME number of user-settings unwire rows: one per
+# helper (statusLine, HIMMEL_REPO, LUNA_VAULT_PATH, HANDOVER_DIR, hooks).
+u_residue_fixture u22
+u_run --dry-run
+u22_dry=$(printf '%s\n' "$out" | grep -c "^DRY: .* from $HIMMEL_USER_SETTINGS\$")
+u_residue_fixture u22w
+u_run_fx
+u22_wet=$(printf '%s\n' "$out" | grep -c -- "-> $HIMMEL_USER_SETTINGS\$")
+assert_rc 'U22 wet run prints 5 user-settings unwire rows' 5 "$u22_wet"
+assert_rc 'U22 dry-run prints the same 5 rows' 5 "$u22_dry"
+
+# U23 — --skip-settings leaves the rule-file blocks and hud config alone (step 6).
+u_residue_fixture u23
+cp "$U_HOME/.claude/CLAUDE.md" "$TMP/u23-claude-md-full"
+u_run_fx --skip-settings
+assert_rc 'U23 --skip-settings completes' 0 "$rc"
+u_same 'U23 --skip-settings keeps CLAUDE.md' "$U_HOME/.claude/CLAUDE.md" "$TMP/u23-claude-md-full"
+if [ -f "$U_HOME/.claude/plugins/claude-hud/config.json" ]; then echo 'PASS U23 --skip-settings keeps the hud config'
+else echo 'FAIL U23 hud config removed under --skip-settings'; FAILED=$((FAILED + 1)); fi
+
+# U24 — a failed write-through never destroys the only copy of the operator's
+# text: the stripped content is kept in a temp file the error names.
+# chmod 444 stops nobody who is root (a privileged CI or VM run): probe first and
+# skip loudly rather than fail a case whose premise cannot be built there.
+: > "$TMP/u24-probe"; chmod 444 "$TMP/u24-probe"
+if [ -w "$TMP/u24-probe" ]; then
+  echo 'SKIP U24 a chmod 444 file is still writable here (running as root) -- unwritable-target case not exercised'
+else
+  mkdir -p "$TMP/u24tmp"
+  printf 'mine\n' > "$TMP/u24-rules"
+  wire_user_claude_md "$U17_TEMPLATE" "$TMP/u24-rules" >/dev/null
+  cp "$TMP/u24-rules" "$TMP/u24-before"
+  chmod 444 "$TMP/u24-rules"
+  rc=0; out="$(TMPDIR="$TMP/u24tmp" bash "$U17_SCRIPTS/lib/unwire-user-claude-md.sh" "$TMP/u24-rules" 2>&1)" || rc=$?
+  chmod 644 "$TMP/u24-rules"
+  assert_rc 'U24 unwritable target fails' 1 "$rc"
+  u_same 'U24 unwritable target left byte-identical' "$TMP/u24-rules" "$TMP/u24-before"
+  u24_kept="$(find "$TMP/u24tmp" -name 'unwire-ucm.*' | head -n 1)"
+  if [ -n "$u24_kept" ] && [ "$(cat "$u24_kept")" = "mine" ]; then echo 'PASS U24 stripped content kept in the temp file'
+  else echo 'FAIL U24 no recoverable temp file with the operator text'; FAILED=$((FAILED + 1)); fi
+  assert_has 'U24 error names the preserved temp file' "unwire-ucm." "$out"
+fi
+
+# U26 — an unreadable rule file is a failure, never "no block": grep's read error
+# (rc 2) used to be swallowed by `|| true` and read as zero markers. Skipped as
+# root, for whom chmod 000 stops nothing.
+printf 'mine\n' > "$TMP/u26-rules"
+wire_user_claude_md "$U17_TEMPLATE" "$TMP/u26-rules" >/dev/null
+cp "$TMP/u26-rules" "$TMP/u26-before"
+chmod 000 "$TMP/u26-rules"
+if [ -r "$TMP/u26-rules" ]; then
+  echo 'SKIP U26 a chmod 000 file is still readable here (running as root) -- unreadable-target case not exercised'
+else
+  for u26_dry in 1 0; do
+    rc=0; out="$(bash "$U17_SCRIPTS/lib/unwire-user-claude-md.sh" "$TMP/u26-rules" "$u26_dry" 2>&1)" || rc=$?
+    assert_rc "U26 unreadable target fails (dry_run=$u26_dry)" 1 "$rc"
+    assert_has "U26 error says it cannot read the file (dry_run=$u26_dry)" "cannot read" "$out"
+  done
+  chmod 644 "$TMP/u26-rules"
+  u_same 'U26 unreadable target left byte-identical' "$TMP/u26-rules" "$TMP/u26-before"
+fi
+chmod 644 "$TMP/u26-rules"
+
+# U25 — the temp-file build checks BOTH halves: a failing `head` with a
+# succeeding `tail` (no text after END) must not read as a good result and
+# delete the target as "empty".
+mkdir -p "$TMP/u25-bin"
+# Fails only the temp-file build (head -n <start-1>); the `head -n 1` marker-line
+# lookups still work, so the run reaches the write it is meant to poison.
+# shellcheck disable=SC2016 # the stub's own $2/$@ must stay literal
+printf '#!/bin/sh\n[ "$2" = 1 ] && exec %s "$@"\nexit 1\n' "$(command -v head)" > "$TMP/u25-bin/head"
+chmod +x "$TMP/u25-bin/head"
+printf 'one\ntwo\n' > "$TMP/u25-rules"
+wire_user_claude_md "$U17_TEMPLATE" "$TMP/u25-rules" >/dev/null
+cp "$TMP/u25-rules" "$TMP/u25-before"
+rc=0; PATH="$TMP/u25-bin:$PATH" bash "$U17_SCRIPTS/lib/unwire-user-claude-md.sh" "$TMP/u25-rules" >/dev/null 2>&1 || rc=$?
+assert_rc 'U25 failed head halts the strip' 1 "$rc"
+u_same 'U25 target left byte-identical when head fails' "$TMP/u25-rules" "$TMP/u25-before"
+
 echo ""
 if [ "$FAILED" -eq 0 ]; then
     echo "ALL PASS"

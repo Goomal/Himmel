@@ -233,6 +233,16 @@ Three suites ship under HIMMEL-2931:
    `/plugin-eval`'s own preflight, not by a separate installed-version check
    elsewhere.
 
+## `test-ws5-invariants.sh` and renames (HIMMEL-3090, HIMMEL-3125)
+
+T13(b) is **not** rename-blind: its corpus is one full-tree
+`git diff "$BASE...HEAD"` (since #776/#777), so rename pairing applies — a
+pure `git mv` passes, a rename that also adds a trigger line still fails. The
+earlier false positive came from a per-file pathspec that has been replaced.
+The residual is T15: its new-script list is `--diff-filter=A` limited to
+`scripts/`, so a rename from OUTSIDE `scripts/` reads as an addition — but T15
+is advisory (`WARN`, never a CI gate). Read the assertion, then decide.
+
 ## What counts as CI evidence
 
 Public CI runs the suite jobs on every PR, so a green **`shell-unit`**
@@ -240,3 +250,13 @@ check-run **is** evidence a suite actually ran. The **`Mergeable`** check-run
 is not: it lints only the commit message and PR title (see
 [`operator-conventions.md`](../operator-conventions.md)) — never cite it as
 evidence of CI health, review convergence, or suite results.
+
+Three readings that look like evidence and are not:
+
+- `gh pr checks <pr> | awk '$2!="pass"'` mislabels greens as reds because
+  check names contain spaces — read `gh pr view --json statusCheckRollup`.
+- A branch-green `CI-DONE` event names a **commit**, not a PR; it says that
+  head passed, nothing about the PR's current head.
+- `gh api rate_limit` can report thousands of REST calls left while GraphQL is
+  exhausted — read the `X-Ratelimit-*` headers of a real call
+  (`gh api -i graphql …`), not the summary endpoint.

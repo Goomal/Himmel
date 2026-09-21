@@ -79,7 +79,7 @@ run_test "(2b) BANK-STALE: both stdin windows stamp primaries_refreshed_at" '
   printf "%s" "{\"rate_limits\":{\"five_hour\":{\"utilization\":63.4,\"resets_at\":\"R5\"},\"seven_day\":{\"utilization\":12.7,\"resets_at\":\"R7\"}}}" \
     | bash "$PRODUCER";
   s=$(jq -r ".primaries_refreshed_at // empty" "$CLAUDE_USAGE_CACHE");
-  printf "%s" "$s" | grep -Eq "^[0-9]+$" || exit 1;
+  grep -Eq "^[0-9]+$" <<< "$s" || exit 1;
   [ "$s" -le "$(date +%s)" ] || exit 1;
 '
 

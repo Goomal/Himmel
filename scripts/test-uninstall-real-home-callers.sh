@@ -53,6 +53,13 @@ ALLOW_WHY=(
 # comment or a single-quoted `printf` argument (a fixture the file writes) counts as
 # one, so such a file can PASS while lifting the fence with the real HOME
 # (HIMMEL-3345; separating code from quoted text needs a parser).
+# The quoted dirname-of-scratch (`HOME="$(dirname "$td")"`, td a mktemp) is a false flag
+# ON PURPOSE (HIMMEL-3345): teaching this text matcher to trace it was tried and reverted,
+# because every rule that widened what counts as scratch opened a real false pass (six
+# review rounds, the last two Critical: `$(printenv HOME; : "$td")`, `$(cd "$td"; cd; pwd)`,
+# a mktemp under a real dir whose dirname is the real HOME). A caller that needs a scratch
+# HOME should take a second mktemp, not a dirname. The false-pass shapes those rounds found
+# are pinned below as must-flag fixtures; do not delete one to make a widening pass.
 home_is_scratch() {
   local file="$1" line rest name rhs nocmd v changed is_scratch ref_re home_ok=0
   local dq='"[^"]*"' sq="'[^']*'" cs='\$\([^)]*\)' bare='[^[:space:]]*'
@@ -99,7 +106,13 @@ home_is_scratch() {
 # followed by whitespace, a quote, or one of `;&|,)}]` and backtick (no `10` /
 # `1x` / `1.5` / `1-x`; a `1` ended by any other character is a false negative). A
 # closing quote counts as the end of the value, so shell concatenation (`"1"x`, whose
-# value is `1x`) is a false flag. It will NOT catch a fence lift spelled another way (a computed
+# value is `1x`) is a false flag ON PURPOSE (HIMMEL-3345): a version that read it as a
+# concatenation was tried and reverted, because each rule that ended a quoted `1` more
+# precisely let a real lift through (`"1">/dev/null`, `"1"</dev/null`, `"1"$y`, `"1"""`,
+# JS `"1"+""`, `"1"/*x*/`; six review rounds, the last two Critical). The shapes those
+# rounds found are pinned below as must-flag fixtures; do not delete one to make a
+# loosening pass. If a real caller trips this, rewrite the caller (`V=1`), not the matcher.
+# It will NOT catch a fence lift spelled another way (a computed
 # variable name, `Set-Item Env:`, `[Environment]::SetEnvironmentVariable`, a
 # `process.env` object built from a variable name) or the value carried in a
 # variable (`v=1; ... $v`). "Scratch HOME" is home_is_scratch above, with its own
@@ -167,6 +180,95 @@ printf '#!/usr/bin/env bash\n%s=10 bash uninstall.sh --yes\n' "$V" > "$fx/script
 printf '#!/usr/bin/env bash\n%s=1x bash uninstall.sh --yes\n' "$V" > "$fx/scripts/test-value-1x.sh"
 printf '#!/usr/bin/env bash\n%s=1.5 bash uninstall.sh --yes\n' "$V" > "$fx/scripts/test-value-1dot5.sh"
 printf '#!/usr/bin/env bash\n%s=1-extra bash uninstall.sh --yes\n' "$V" > "$fx/scripts/test-value-1dash.sh"
+# HIMMEL-3345: shapes that MUST stay flagged, pinned after the matcher was tried with
+# looser rules (a quoted 1 read as a concatenation, a dirname of a scratch dir read as
+# scratch) and each loosening opened a real false pass. Each of these lifts the fence for
+# real (the shell sets the value to 1, or HOME resolves to the real HOME) and is flagged
+# by the strict matcher. Cited: an independent false-pass review of the loosened matcher
+# (2 Critical) plus the panel's own five rounds. @V@ stands for the variable name.
+# ponytail: shapes origin/main already PASSES (false passes that predate this ticket) are
+# NOT pinned, since they cannot be must-flag without a matcher change: an unquoted
+# redirect after the value (1>/dev/null), the value spelled $'1', ${V:=1}, ${X:-1}, \1
+# or ""1, and a HOME that reaches the real HOME through a second dirname, a dotdot, a
+# literal /home dirname or an unquoted $HOME-in-scratch-ref. HIMMEL-3394 owns them: it
+# inverts the matcher to an allow-list of provably-scratch values. Do not pin them here as
+# "passes": an assertion that a lift passes would enshrine the hole.
+pinned=()
+RH=/ho"me"/someone   # @H@ in a fixture: a literal real home dir, spelled apart so the leak gate skips this source
+pin() {   # pin <file> <line>... -- write one must-flag fixture under scripts/
+  local name="$1" line; shift
+  : > "$fx/scripts/$name"
+  for line in "$@"; do line="${line//@V@/$V}"; printf '%s\n' "${line//@H@/$RH}" >> "$fx/scripts/$name"; done
+  pinned+=("$name")
+}
+CR=$'\r'
+# the two ticket shapes, flagged on purpose: a quoted 1 glued to a word, a dirname of a scratch dir.
+pin ticket-concat-dq-word.sh '@V@="1"x bash uninstall.sh --yes'
+pin ticket-concat-sq-word.sh "@V@='1'x bash uninstall.sh --yes"
+pin ticket-concat-dq-dq.sh '@V@="1""x" bash uninstall.sh --yes'
+pin ticket-dirname-scratch-dq.sh 'td=$(mktemp -d /tmp/x.XXXXXX)' 'HOME="$(dirname "$td")" @V@=1 bash uninstall.sh --yes'
+# a quoted 1 followed by an expansion or an empty string is still 1.
+pin q-var-dq.sh '@V@="1"$y bash uninstall.sh --yes'
+pin q-var-dq-dq.sh '@V@="1""$y" bash uninstall.sh --yes'
+pin q-var-sq.sh "@V@='1'\$y bash uninstall.sh --yes"
+pin q-var-braced.sh '@V@="1""${y}" bash uninstall.sh --yes'
+pin q-empty-dq.sh '@V@="1""" bash uninstall.sh --yes'
+pin q-empty-sq.sh "@V@='1''' bash uninstall.sh --yes"
+pin q-empty-dq-sq.sh "@V@=\"1\"'' bash uninstall.sh --yes"
+pin q-empty-sq-dq.sh "@V@='1'\"\" bash uninstall.sh --yes"
+pin q-empty-dq-dq-sq.sh "@V@=\"1\"\"\"'' bash uninstall.sh --yes"
+pin q-empty-ansi.sh "@V@=\"1\"\$'' bash uninstall.sh --yes"
+pin q-bare-1-dq.sh '@V@=1"" bash uninstall.sh --yes'
+# a quoted 1 followed by a redirect, a control operator or a comment is a lift.
+pin q-redir-dq.sh '@V@="1">/dev/null bash uninstall.sh --yes'
+pin q-redir-sq.sh "@V@='1'>/dev/null bash uninstall.sh --yes"
+pin q-redir-in-dq.sh '@V@="1"</dev/null bash uninstall.sh --yes'
+pin q-redir-env.sh 'env @V@="1">log bash uninstall.sh --yes'
+pin q-amp.sh '@V@="1"&&bash uninstall.sh'
+pin q-paren.sh '( @V@="1") ; bash uninstall.sh'
+pin q-hash.sh '@V@="1"#c bash uninstall.sh --yes'
+pin q-space.sh '@V@="1" bash uninstall.sh --yes'
+pin q-space-sq.sh "@V@='1' bash uninstall.sh --yes"
+pin q-eol.sh 'export @V@="1"'
+pin q-semi.sh '@V@="1";bash uninstall.sh --yes'
+# shellcheck disable=SC1003  # the trailing backslash is the fixture, not an escape attempt
+pin q-continued.sh '@V@="1"\' '  bash uninstall.sh --yes'
+# shellcheck disable=SC1003
+pin q-bs-newline.sh '@V@="1"\' ' bash uninstall.sh --yes'
+pin q-enclosing.sh "sh -c \"@V@='1' bash uninstall.sh --yes\""
+pin q-declare.sh 'declare -x @V@="1"' 'bash uninstall.sh --yes'
+pin q-export.sh 'export @V@="1"' 'bash uninstall.sh --yes'
+pin q-readonly.sh "readonly @V@='1'" 'bash uninstall.sh --yes'
+# JS and PowerShell spellings of a quoted 1 that something follows.
+pin q-js-comment.js 'spawn(c,{env:{@V@:"1"/*x*/}})'
+pin q-js-linecomment.js "spawn(c,{env:{@V@: \"1\"//x" '}})'
+pin q-js-plus.js 'spawn(c,{env:{@V@:"1"+""}})'
+pin q-js-crlf.js "spawn(c,{env:{@V@: \"1\"$CR" "}})$CR"
+pin q-ps-crlf.ps1 "\$env:@V@ = \"1\"$CR" "& uninstall.ps1 -Yes$CR"
+pin q-ps-hash.ps1 '$env:@V@ = "1"#c' '& uninstall.ps1 -Yes'
+# HOME resolves to the real HOME although a scratch dir is named on the line.
+pin h-under-home.sh 'td=$(mktemp -d "$HOME/x.XXXXXX")' 'HOME="$(dirname "$td")" @V@=1 bash uninstall.sh --yes'
+pin h-under-tilde-dq.sh 'td=$(mktemp -d ~/x.XXXXXX)' 'HOME="$(dirname "$td")" @V@=1 bash uninstall.sh --yes'
+pin h-dirname-other.sh 'other=/somewhere/real' 'HOME=$(dirname "$other") @V@=1 bash uninstall.sh --yes'
+pin h-dirname-real-home.sh 'td=$(mktemp -d /tmp/x.XXXXXX)' 'HOME=$(dirname "$HOME") @V@=1 bash uninstall.sh --yes'
+pin h-dirname-operator.sh 'td=$(mktemp -d /tmp/x.XXXXXX)' 'HOME=$(dirname "${td:+$HOME}") @V@=1 bash uninstall.sh --yes'
+pin h-nested-subst.sh 'HOME="$(echo "$(mktemp -d)" >/dev/null; printf %s "$HOME")" @V@=1 bash uninstall.sh --yes'
+pin h-subst-scratch-ref.sh 'td=$(mktemp -d)' 'HOME="$(printf %s "$HOME"; : "$td")" @V@=1 bash uninstall.sh --yes'
+pin h-printenv.sh 'td=$(mktemp -d)' 'HOME="$(printenv HOME; : "$td")"' '@V@=1 bash uninstall.sh --yes'
+pin h-cd-home.sh 'td=$(mktemp -d)' 'HOME="$(cd "$td"; cd; pwd)"' '@V@=1 bash uninstall.sh --yes'
+pin h-cd-up.sh 'td=$(mktemp -d)' 'cd "$td"/..; HOME=$PWD' '@V@=1 bash uninstall.sh --yes'
+pin h-dirname-literal-home.sh 'td=$(mktemp -d @H@/x.XXXXXX)' 'HOME="$(dirname "$td")"' '@V@=1 bash uninstall.sh --yes'
+pin h-dirname-p.sh 'td=$(mktemp -d -p "$USERDIR")' 'HOME="$(dirname "$td")"' '@V@=1 bash uninstall.sh --yes'
+pin h-echo-escaped.sh 'td=$(mktemp -d)' 'HOME="$(eval echo "\\$""HOME"; : "$td")"' '@V@=1 bash uninstall.sh --yes'
+pin h-eval.sh 'td=$(mktemp -d)' 'HOME="$(eval "echo \\${td:+\\$USER_HOME_DIR}")"' '@V@=1 bash uninstall.sh --yes'
+pin h-getent.sh 'td=$(mktemp -d)' 'HOME="$(getent passwd "$USER" | cut -d: -f6; : "$td")"' '@V@=1 bash uninstall.sh --yes'
+pin h-heredoc.sh 'td=$(mktemp -d)' 'HOME="$(cat <<X' '@H@ $td' 'X' ')"' '@V@=1 bash uninstall.sh --yes'
+pin h-pwd.sh 'cd' 'td=$(mktemp -d "$PWD/x.XXXXXX")' 'HOME="$(dirname "$td")"' '@V@=1 bash uninstall.sh --yes'
+pin h-realpath.sh 'td=$(mktemp -d)' 'HOME="$(realpath "$td/../..@H@")"' '@V@=1 bash uninstall.sh --yes'
+pin h-td-reassigned.sh 'td=$(mktemp -d)' 'td=@H@' 'HOME="$(dirname "$td")/overlord"' '@V@=1 bash uninstall.sh --yes'
+pin h-td-real.sh 'td=$HOME' 'HOME="$td"' '@V@=1 bash uninstall.sh --yes'
+pin h-td-tilde.sh 'td=~' 'HOME="$td"' '@V@=1 bash uninstall.sh --yes'
+pin h-tmpdir.sh 'td=$(TMPDIR=@H@ mktemp -d)' 'HOME="$(dirname "$td")"' '@V@=1 bash uninstall.sh --yes'
 # HIMMEL-3344 (CodeRabbit): a longer identifier ending in the name is not the name.
 printf '#!/usr/bin/env bash\nNOT_%s=1 bash uninstall.sh --yes\n' "$V" > "$fx/scripts/test-prefixed-name.sh"
 # a JS operator-path caller, on the allowlist below.
@@ -218,6 +320,10 @@ check "=1-extra is not a fence lift (not flagged)" \
   "$(printf '%s' "$got" | grep -c 'scripts/test-value-1dash.sh')" "0"
 check "a longer identifier ending in the name is not a fence lift (not flagged)" \
   "$(printf '%s' "$got" | grep -c 'scripts/test-prefixed-name.sh')" "0"
+for name in "${pinned[@]}"; do
+  check "pinned false-pass shape is flagged: $name" \
+    "$(printf '%s' "$got" | grep -cF "scripts/$name ")" "1"
+done
 check "allowlisted file passes" \
   "$(printf '%s' "$got" | grep -c 'scripts/wizard.js')" "0"
 check "file that only unsets/reads the var passes" \

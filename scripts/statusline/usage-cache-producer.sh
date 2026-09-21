@@ -128,7 +128,7 @@ if [ -n "$stdin_five" ] || [ -n "$stdin_seven" ]; then
     fi
   fi
 
-  new_cache=$(jq -n --argjson prev "$prev" \
+  new_cache=$(jq -n --argjson prev "$prev" --argjson ts "$now_epoch" \
     --arg fh "$stdin_five" --arg fhr "$stdin_five_reset" \
     --arg sh "$stdin_seven" --arg shr "$stdin_seven_reset" '
     ($prev // {}) as $p |
@@ -141,7 +141,17 @@ if [ -n "$stdin_five" ] || [ -n "$stdin_seven" ]; then
                          resets_at: (if $shr == "" then null else $shr end) } end),
       extra_usage: ($p.extra_usage // {}),
       oauth_checked_at: ($p.oauth_checked_at // null)
-    }' 2>/dev/null)
+    }
+    # Provenance, same rule as Branch B: the stdin rate_limits header carries
+    # freshly-taken primaries, so stamp when BOTH windows are present and
+    # preserve the prior stamp otherwise. Without this clause the object
+    # literal dropped $p.primaries_refreshed_at on every statusline render,
+    # leaving bank-preflight.sh permanently BANK-STALE on any station whose
+    # cache is written by this branch -- i.e. every one without OAuth
+    # credentials, where Branch B can never run and stamp it either.
+    + (if ($fh != "" and $sh != "") then {primaries_refreshed_at: $ts}
+       elif ($p.primaries_refreshed_at != null) then {primaries_refreshed_at: $p.primaries_refreshed_at}
+       else {} end)' 2>/dev/null)
 
   if [ -z "$new_cache" ]; then
     echo "WARN usage-cache-producer: failed to build cache from stdin rates" >&2

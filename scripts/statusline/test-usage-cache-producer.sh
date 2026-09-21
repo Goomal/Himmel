@@ -72,6 +72,38 @@ run_test "(2) same run -> hud snapshot exactly-2-keys + rounded used_percentage 
   u=$(jq -r ".updated_at // empty" "$HUD_USAGE_SNAPSHOT"); [ -n "$u" ] || exit 1;
 '
 
+run_test "(2b) BANK-STALE: both stdin windows stamp primaries_refreshed_at" '
+  W=$(mktemp -d); export HOME="$W/home"; mkdir -p "$HOME";
+  export CLAUDE_USAGE_CACHE="$W/cache.json"; export HUD_USAGE_SNAPSHOT="$W/hud.json";
+  unset USAGE_OAUTH_CMD;
+  printf "%s" "{\"rate_limits\":{\"five_hour\":{\"utilization\":63.4,\"resets_at\":\"R5\"},\"seven_day\":{\"utilization\":12.7,\"resets_at\":\"R7\"}}}" \
+    | bash "$PRODUCER";
+  s=$(jq -r ".primaries_refreshed_at // empty" "$CLAUDE_USAGE_CACHE");
+  printf "%s" "$s" | grep -Eq "^[0-9]+$" || exit 1;
+  [ "$s" -le "$(date +%s)" ] || exit 1;
+'
+
+run_test "(2c) BANK-STALE: seven_day-only stdin preserves prior stamp, does not mint one" '
+  W=$(mktemp -d); export HOME="$W/home"; mkdir -p "$HOME";
+  export CLAUDE_USAGE_CACHE="$W/cache.json"; export HUD_USAGE_SNAPSHOT="$W/hud.json";
+  unset USAGE_OAUTH_CMD;
+  printf "%s" "{\"five_hour\":{\"utilization\":40},\"seven_day\":{\"utilization\":8},\"primaries_refreshed_at\":1234567890}" > "$CLAUDE_USAGE_CACHE";
+  touch -t 200001010000 "$CLAUDE_USAGE_CACHE";
+  printf "%s" "{\"rate_limits\":{\"seven_day\":{\"utilization\":12.7,\"resets_at\":\"R7\"}}}" | bash "$PRODUCER";
+  [ "$(jq -r ".primaries_refreshed_at" "$CLAUDE_USAGE_CACHE")" = "1234567890" ] || exit 1;
+'
+
+run_test "(2d) BANK-STALE: seven_day-only stdin with no prior stamp mints none" '
+  W=$(mktemp -d); export HOME="$W/home"; mkdir -p "$HOME";
+  export CLAUDE_USAGE_CACHE="$W/cache.json"; export HUD_USAGE_SNAPSHOT="$W/hud.json";
+  unset USAGE_OAUTH_CMD;
+  printf "%s" "{\"five_hour\":{\"utilization\":40},\"seven_day\":{\"utilization\":8}}" > "$CLAUDE_USAGE_CACHE";
+  touch -t 200001010000 "$CLAUDE_USAGE_CACHE";
+  printf "%s" "{\"rate_limits\":{\"seven_day\":{\"utilization\":12.7,\"resets_at\":\"R7\"}}}" | bash "$PRODUCER";
+  jq -e ".primaries_refreshed_at" "$CLAUDE_USAGE_CACHE" >/dev/null && exit 1;
+  exit 0;
+'
+
 run_test "(3) no rate_limits + stubbed OAuth -> fetched primary wins, missing primary falls back, hud gains balance_label" '
   W=$(mktemp -d); export HOME="$W/home"; mkdir -p "$HOME";
   export CLAUDE_USAGE_CACHE="$W/cache.json"; export HUD_USAGE_SNAPSHOT="$W/hud.json";

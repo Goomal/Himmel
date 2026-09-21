@@ -251,6 +251,22 @@ for f in "$CLAUDE_RUNBOOK" "$CODEX_SKILL"; do
     anchor_entry_pattern='^[[:space:]]*bash "\$himmel_repo/scripts/cr/pr-check-context\.sh"[[:space:]]*$'
     anchor_entry_count=$(printf '%s\n' "$ii_calls" | grep -c -E "$anchor_entry_pattern")
     ii_calls=$(printf '%s\n' "$ii_calls" | grep -v -E "$anchor_entry_pattern")
+    # HIMMEL-3359: the himmel-lane spelling of step 0 -- the bare relative
+    # literal `bash scripts/cr/pr-check-context.sh`, the one shape a leg's
+    # allow rule can match -- is the ONE other carve-out, pinned on the FULL
+    # exact line (no args, no prefix, no tail) and asserted EXACTLY ONCE per
+    # twin. It is safe only under the runbook conditions pinned further down
+    # (the lane check and the scripts/cr/ diff check); the script's own
+    # hand-off to the anchor's copy (test-pr-check-context.sh T35) is defense
+    # in depth.
+    lane_entry_pattern='^[[:space:]]*bash scripts/cr/pr-check-context\.sh[[:space:]]*$'
+    lane_entry_count=$(printf '%s\n' "$ii_calls" | grep -c -E "$lane_entry_pattern")
+    ii_calls=$(printf '%s\n' "$ii_calls" | grep -v -E "$lane_entry_pattern")
+    # The step-0 diff check NAMES scripts/guardrails/lib.sh as a pathspec and
+    # invokes nothing, so it is not a himmel-script invocation line; its exact
+    # line is pinned once per twin below.
+    cr_touch_pattern='^[[:space:]]*git diff --name-only refs/remotes/origin/main -- scripts/cr/ scripts/guardrails/lib\.sh[[:space:]]*$'
+    ii_calls=$(printf '%s\n' "$ii_calls" | grep -v -E "$cr_touch_pattern")
     bare=$(printf '%s\n' "$ii_calls" | grep -c -E 'bash scripts/|\. scripts/|-f scripts/')
     split=$(printf '%s\n' "$ii_calls" | grep -c '"/scripts/')
     total=$(printf '%s\n' "$ii_calls" | grep -c 'scripts/[a-zA-Z0-9/._-]*\.sh')
@@ -269,8 +285,8 @@ for f in "$CLAUDE_RUNBOOK" "$CODEX_SKILL"; do
     stale=$(printf '%s\n' "$ii_calls" | grep -c 'CLAUDE_PROJECT_DIR')
     if [ "$bare" -eq 0 ] && [ "$split" -eq 0 ] && [ "$total" -gt 0 ] \
        && [ "$rooted" -eq "$total" ] && [ "$stale" -eq 0 ] \
-       && [ "$anchor_entry_count" -eq 1 ]; then
-        pass "$n: (ii) $rooted/$total himmel-script invocation line(s) rooted at \"<himmel_dir>/scripts/...\", plus exactly 1 step-0 anchor-entry line"
+       && [ "$anchor_entry_count" -eq 1 ] && [ "$lane_entry_count" -eq 1 ]; then
+        pass "$n: (ii) $rooted/$total himmel-script invocation line(s) rooted at \"<himmel_dir>/scripts/...\", plus exactly 1 step-0 anchor-entry line and exactly 1 himmel-lane step-0 line"
     else
         [ "$bare" -eq 0 ] || fail "$n: (ii) $bare bare scripts/ invocation(s) -- a /pr-check run in a foreign repo would source the REVIEWED repo's scripts; root them at \"<himmel_dir>/scripts/...\" (the substituted literal -- \"\$himmel_dir/scripts/...\" is no longer accepted, HIMMEL-2314)"
         [ "$split" -eq 0 ] || fail "$n: (ii) $split split-quote \"\$var\"/scripts/... invocation(s) -- the worktree-isolation guard REFUSES that shape; the quote must span the whole path (\"<himmel_dir>/scripts/...\")"
@@ -278,6 +294,7 @@ for f in "$CLAUDE_RUNBOOK" "$CODEX_SKILL"; do
         [ "$rooted" -eq "$total" ] || fail "$n: (ii) $((total - rooted)) of $total himmel-script invocation line(s) are NOT rooted -- every one must spell the root \"<himmel_dir>/scripts/...\", the substituted literal. The raw-variable form \"\$himmel_dir/scripts/...\" is REJECTED as of HIMMEL-2314: a fence inherits no variables, and the Codex harness runs each block as a separate process, so \$himmel_dir expands to empty and the call becomes an unrooted \`bash /scripts/...\`"
         [ "$stale" -eq 0 ] || fail "$n: (ii) $stale CLAUDE_PROJECT_DIR reference(s) in shell code -- it is UNSET in Bash-tool shells (hook processes only), so the fence aborts with 'parameter null or not set', and the isolation guard refuses it besides (HIMMEL-2226)"
         [ "$anchor_entry_count" -eq 1 ] || fail "$n: (ii) found $anchor_entry_count step-0 anchor-entry line(s) (\`bash \"\$himmel_repo/scripts/cr/pr-check-context.sh\"\`), expected EXACTLY ONE -- zero means the anchor entry point is missing or misspelled, more than one is a duplicate/reintroduction risk (HIMMEL-2335)"
+        [ "$lane_entry_count" -eq 1 ] || fail "$n: (ii) found $lane_entry_count himmel-lane step-0 line(s) (\`bash scripts/cr/pr-check-context.sh\`, exact, no args), expected EXACTLY ONE -- zero means a leg has no matchable step-0 spelling, more than one is a duplicate (HIMMEL-3359)"
     fi
 
     # (ii) regression guard -- pr-check-context.sh invoked EXACTLY ONCE per
@@ -292,11 +309,42 @@ for f in "$CLAUDE_RUNBOOK" "$CODEX_SKILL"; do
     # fence). Counted over $calls (comments already excluded), not $ii_calls
     # (which has the anchor-entry line filtered out for the rooting tally
     # above) -- this check wants BOTH spellings in one number.
+    # HIMMEL-3359: the two step-0 spellings are ALTERNATIVES (a run uses one
+    # of them), so the expected line count is two -- one per spelling, both
+    # pinned above -- and any third line is the stale second call.
     pcc_calls=$(printf '%s\n' "$calls" | grep -c 'scripts/cr/pr-check-context\.sh')
-    if [ "$pcc_calls" -eq 1 ]; then
-        pass "$n: (ii) pr-check-context.sh invoked exactly once"
+    if [ "$pcc_calls" -eq 2 ]; then
+        pass "$n: (ii) pr-check-context.sh invoked exactly once per step-0 spelling"
     else
-        fail "$n: (ii) pr-check-context.sh invoked $pcc_calls time(s), expected EXACTLY ONE -- a second invocation double-writes the HIMMEL-1219 verdict-scratch truncation and, on a delegating run, a second CR-ledger \`delegation\` row (HIMMEL-2335 [codex-1])"
+        fail "$n: (ii) pr-check-context.sh appears on $pcc_calls code line(s), expected EXACTLY TWO (the anchor entry and the himmel-lane entry, alternatives) -- a further invocation double-writes the HIMMEL-1219 verdict-scratch truncation and, on a delegating run, a second CR-ledger \`delegation\` row (HIMMEL-2335 [codex-1])"
+    fi
+
+    # HIMMEL-3359 console ruling: the himmel-lane literal is permitted ONLY on
+    # a diff that touches no scripts/cr/ file (nor scripts/guardrails/lib.sh,
+    # which pr-check-context.sh sources) -- on one that does, an allow-listed
+    # bare literal would auto-run branch bytes that may have deleted their own
+    # hand-off, so step 0 must stay the anchored fence. And only in a himmel
+    # checkout at its root: the lane check proves the cwd shares HIMMEL_REPO's
+    # git dir AND is the worktree root (an empty --show-prefix) before the
+    # relative path is trusted to name himmel's file. Each twin
+    # must carry both checks as ONE runnable line each (exactly once) and
+    # state the conditions in prose; the in-script hand-off is defense in
+    # depth, not the trust root.
+    # ponytail: the prose pins are substring greps -- they prove each phrase
+    # is present somewhere in the twin, not that it sits in the step-0
+    # paragraph or is not negated nearby (HIMMEL-3382).
+    cr_touch_check=$(printf '%s\n' "$calls" | grep -c -E "$cr_touch_pattern")
+    lane_check=$(printf '%s\n' "$calls" | grep -c -E '^[[:space:]]*git rev-parse --path-format=absolute --git-common-dir; printenv HIMMEL_REPO; git rev-parse --show-prefix[[:space:]]*$')
+    if [ "$cr_touch_check" -eq 1 ] && [ "$lane_check" -eq 1 ] \
+       && grep -q 'ONLY when that check exits 0 and prints nothing' "$f" \
+       && grep -q 'ONLY if its first line equals its second line followed by' "$f" \
+       && grep -q 'and its third line is empty' "$f" \
+       && grep -q 'use the canonical fence above' "$f" \
+       && grep -q 'always against refs/remotes/origin/main, even on a stacked PR' "$f" \
+       && grep -q 'defense in depth, not the trust root' "$f"; then
+        pass "$n: (ii) himmel-lane step 0 is gated on the himmel lane and on a diff that touches no scripts/cr/ file (HIMMEL-3359 ruling)"
+    else
+        fail "$n: (ii) himmel-lane step 0 is not gated on the lane and scripts/cr/ conditions -- expected exactly one \`git diff --name-only refs/remotes/origin/main -- scripts/cr/ scripts/guardrails/lib.sh\` code line (found $cr_touch_check), exactly one \`git rev-parse --path-format=absolute --git-common-dir; printenv HIMMEL_REPO; git rev-parse --show-prefix\` code line (found $lane_check), plus the prose 'ONLY when that check exits 0 and prints nothing', 'ONLY if its first line equals its second line followed by', 'and its third line is empty', 'use the canonical fence above', 'always against refs/remotes/origin/main, even on a stacked PR' and 'defense in depth, not the trust root' (HIMMEL-3359 console ruling)"
     fi
 
     # (iii) the HIMMEL-2034 armed-repo predicate still guards the ONE

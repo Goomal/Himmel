@@ -73,7 +73,7 @@ run_test "(2) same run -> hud snapshot exactly-2-keys + rounded used_percentage 
 '
 
 run_test "(2b) BANK-STALE: both stdin windows stamp primaries_refreshed_at" '
-  W=$(mktemp -d); export HOME="$W/home"; mkdir -p "$HOME";
+  W=$(mktemp -d "${TMPDIR:-/tmp}/usage-cache-producer-2b.XXXXXX") || exit 1; export HOME="$W/home"; mkdir -p "$HOME";
   export CLAUDE_USAGE_CACHE="$W/cache.json"; export HUD_USAGE_SNAPSHOT="$W/hud.json";
   unset USAGE_OAUTH_CMD;
   printf "%s" "{\"rate_limits\":{\"five_hour\":{\"utilization\":63.4,\"resets_at\":\"R5\"},\"seven_day\":{\"utilization\":12.7,\"resets_at\":\"R7\"}}}" \
@@ -84,7 +84,7 @@ run_test "(2b) BANK-STALE: both stdin windows stamp primaries_refreshed_at" '
 '
 
 run_test "(2c) BANK-STALE: seven_day-only stdin preserves prior stamp, does not mint one" '
-  W=$(mktemp -d); export HOME="$W/home"; mkdir -p "$HOME";
+  W=$(mktemp -d "${TMPDIR:-/tmp}/usage-cache-producer-2c.XXXXXX") || exit 1; export HOME="$W/home"; mkdir -p "$HOME";
   export CLAUDE_USAGE_CACHE="$W/cache.json"; export HUD_USAGE_SNAPSHOT="$W/hud.json";
   unset USAGE_OAUTH_CMD;
   printf "%s" "{\"five_hour\":{\"utilization\":40},\"seven_day\":{\"utilization\":8},\"primaries_refreshed_at\":1234567890}" > "$CLAUDE_USAGE_CACHE";
@@ -94,7 +94,7 @@ run_test "(2c) BANK-STALE: seven_day-only stdin preserves prior stamp, does not 
 '
 
 run_test "(2d) BANK-STALE: seven_day-only stdin with no prior stamp mints none" '
-  W=$(mktemp -d); export HOME="$W/home"; mkdir -p "$HOME";
+  W=$(mktemp -d "${TMPDIR:-/tmp}/usage-cache-producer-2d.XXXXXX") || exit 1; export HOME="$W/home"; mkdir -p "$HOME";
   export CLAUDE_USAGE_CACHE="$W/cache.json"; export HUD_USAGE_SNAPSHOT="$W/hud.json";
   unset USAGE_OAUTH_CMD;
   printf "%s" "{\"five_hour\":{\"utilization\":40},\"seven_day\":{\"utilization\":8}}" > "$CLAUDE_USAGE_CACHE";

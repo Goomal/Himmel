@@ -4,7 +4,7 @@ import { createRequire } from 'node:module';
 import { chmodSync, existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { makeTmpDir } from '../lib/test-tmpdir.mjs';
 
@@ -1121,26 +1121,334 @@ test('verifyProjectHookIntegrity denies a pinned script whose on-disk content dr
   }
 });
 
-test('verifyProjectHookIntegrity: HIMMEL_HOOK_INTEGRITY_BYPASS_OK=1 always allows', () => {
-  const dir = makeTmpDir('hook-integrity-');
-  const integrityDir = makeTmpDir('hook-integrity-pins-');
+// HIMMEL-3384: the bypass is worktree-only and audited. The old "always
+// allows" contract is gone — a bypass with no linked worktree around it is no
+// bypass at all, and every use that DOES override a deny leaves one audit line.
+function withCwd(dir, fn) {
+  const saved = process.cwd();
+  process.chdir(dir);
   try {
-    const scriptRel = 'scripts/hooks/guard.sh';
-    const scriptPath = join(dir, ...scriptRel.split('/'));
-    require('node:fs').mkdirSync(dirname(scriptPath), { recursive: true });
-    writeFileSync(scriptPath, 'echo tampered\n');
-    writeFileSync(
-      join(integrityDir, 's1.json'),
-      JSON.stringify({ session_id: 's1', pins: { [scriptRel]: 'deadbeef'.repeat(5) } }),
-    );
-    withEnv(
-      { CLAUDE_PROJECT_DIR: dir, HIMMEL_HOOK_INTEGRITY_DIR: integrityDir, HIMMEL_HOOK_INTEGRITY_BYPASS_OK: '1' },
-      () => {
-        assert.equal(verifyProjectHookIntegrity(scriptPath, 's1').ok, true);
-      },
-    );
+    return fn();
   } finally {
-    rmSync(dir, { recursive: true, force: true });
-    rmSync(integrityDir, { recursive: true, force: true });
+    process.chdir(saved);
+  }
+}
+
+function gitOk(cwd, ...args) {
+  const r = spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd, encoding: 'utf8' });
+  assert.equal(r.status, 0, `git ${args.join(' ')}: ${r.stderr}`);
+}
+
+// A primary checkout plus one linked worktree, both holding a TAMPERED guard
+// whose session pin is the original. The record has git_dir (the recorded repo
+// the bypass validates against) but not the v2 anchor fields, so a mismatch
+// always denies rather than re-pinning.
+function makeBypassFixture() {
+  const root = makeTmpDir('hook-bypass-');
+  const primary = join(root, 'primary');
+  const worktree = join(root, 'wt');
+  const integrityDir = join(root, 'pins');
+  const rel = 'scripts/hooks/guard.sh';
+  const mkdirp = (p) => require('node:fs').mkdirSync(p, { recursive: true });
+  mkdirp(join(primary, 'scripts', 'hooks'));
+  mkdirp(integrityDir);
+  writeFileSync(join(primary, ...rel.split('/')), 'echo original\n');
+  gitOk(primary, 'init', '-q');
+  gitOk(primary, 'add', '-A');
+  gitOk(primary, 'commit', '-q', '-m', 'init');
+  gitOk(primary, 'worktree', 'add', '-q', '-b', 'wt', worktree);
+  const pin = gitBlobSha1(readFileSync(join(primary, ...rel.split('/'))));
+  writeFileSync(
+    join(integrityDir, 's1.json'),
+    JSON.stringify({ session_id: 's1', pins: { [rel]: pin }, git_dir: require('node:fs').realpathSync(join(primary, '.git')) }),
+  );
+  writeFileSync(join(primary, ...rel.split('/')), 'echo tampered\n');
+  writeFileSync(join(worktree, ...rel.split('/')), 'echo tampered\n');
+  return {
+    root,
+    primary,
+    worktree,
+    integrityDir,
+    primaryScript: join(primary, ...rel.split('/')),
+    worktreeScript: join(worktree, ...rel.split('/')),
+    audit: join(primary, '.git', 'hook-integrity-bypass.jsonl'),
+  };
+}
+
+function bypassEnv(fx, projectDir) {
+  return {
+    CLAUDE_PROJECT_DIR: projectDir,
+    HIMMEL_HOOK_INTEGRITY_DIR: fx.integrityDir,
+    HIMMEL_HOOK_INTEGRITY_BYPASS_OK: '1',
+  };
+}
+
+const auditLines = (file) => (existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean) : []);
+
+test('bypass in the PRIMARY checkout is not honoured: a tampered pinned guard is still denied', () => {
+  const fx = makeBypassFixture();
+  try {
+    withEnv(bypassEnv(fx, fx.primary), () => {
+      const result = withCwd(fx.primary, () => verifyProjectHookIntegrity(fx.primaryScript, 's1'));
+      assert.equal(result.ok, false);
+    });
+    assert.deepEqual(auditLines(fx.audit), []);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('bypass outside any git checkout is not honoured', () => {
+  const fx = makeBypassFixture();
+  const bare = makeTmpDir('hook-bypass-nogit-');
+  try {
+    withEnv(bypassEnv(fx, fx.worktree), () => {
+      const result = withCwd(bare, () => verifyProjectHookIntegrity(fx.worktreeScript, 's1'));
+      assert.equal(result.ok, false);
+    });
+    assert.deepEqual(auditLines(fx.audit), []);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+    rmSync(bare, { recursive: true, force: true });
+  }
+});
+
+test('bypass in a linked worktree allows the worktree guard and appends exactly one audit line', () => {
+  const fx = makeBypassFixture();
+  try {
+    withEnv(bypassEnv(fx, fx.worktree), () => {
+      const result = withCwd(fx.worktree, () => verifyProjectHookIntegrity(fx.worktreeScript, 's1'));
+      assert.equal(result.ok, true);
+    });
+    const lines = auditLines(fx.audit);
+    assert.equal(lines.length, 1);
+    const entry = JSON.parse(lines[0]);
+    const real = (p) => require('node:fs').realpathSync(p);
+    assert.equal(real(entry.worktree), real(fx.worktree));
+    assert.equal(real(entry.cwd), real(fx.worktree));
+    assert.deepEqual(entry.hook_paths.map(real), [real(fx.worktreeScript)]);
+    assert.equal(entry.session_id, 's1');
+    assert.ok(!Number.isNaN(Date.parse(entry.ts)), 'ts is an ISO time');
+    assert.ok('session' in entry, 'the session-name field is always present (null when unresolvable)');
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('bypass audits only a use that overrides a deny: an untampered guard leaves no line', () => {
+  const fx = makeBypassFixture();
+  try {
+    writeFileSync(fx.worktreeScript, 'echo original\n');
+    withEnv(bypassEnv(fx, fx.worktree), () => {
+      const result = withCwd(fx.worktree, () => verifyProjectHookIntegrity(fx.worktreeScript, 's1'));
+      assert.equal(result.ok, true);
+    });
+    assert.deepEqual(auditLines(fx.audit), []);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('bypass in a linked worktree is not honoured for a hook path outside that worktree', () => {
+  const fx = makeBypassFixture();
+  try {
+    withEnv(bypassEnv(fx, fx.primary), () => {
+      const result = withCwd(fx.worktree, () => verifyProjectHookIntegrity(fx.primaryScript, 's1'));
+      assert.equal(result.ok, false);
+    });
+    assert.deepEqual(auditLines(fx.audit), []);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('bypass is refused when the audit line cannot be written (fail closed)', () => {
+  const fx = makeBypassFixture();
+  try {
+    // A directory where the audit file belongs: appending to it fails for any uid.
+    require('node:fs').mkdirSync(fx.audit);
+    withEnv(bypassEnv(fx, fx.worktree), () => {
+      const result = withCwd(fx.worktree, () => verifyProjectHookIntegrity(fx.worktreeScript, 's1'));
+      assert.equal(result.ok, false);
+    });
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+// HIMMEL-3384 (adversarial round): the worktree, the audit sink and "linked" come
+// from the SESSION's own project dir and its RECORDED repo — never from `git
+// rev-parse` in cwd, which follows a `.git` pointer FILE a worker can rewrite.
+const realp = (p) => require('node:fs').realpathSync(p);
+
+test('C1: a forged scripts/.git pointer in the primary checkout does not make it a linked worktree', () => {
+  const fx = makeBypassFixture();
+  try {
+    const sub = join(fx.primary, 'scripts');
+    writeFileSync(join(sub, '.git'), `gitdir: ${join(fx.primary, '.git', 'worktrees', 'wt')}\n`);
+    withEnv(bypassEnv(fx, fx.primary), () => {
+      const result = withCwd(sub, () => verifyProjectHookIntegrity(fx.primaryScript, 's1'));
+      assert.equal(result.ok, false);
+    });
+    assert.deepEqual(auditLines(fx.audit), []);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('C2: a rewritten worktree .git pointer cannot move the audit line into a decoy repo', () => {
+  const fx = makeBypassFixture();
+  const decoy = join(fx.root, 'decoy');
+  try {
+    require('node:fs').mkdirSync(decoy);
+    gitOk(decoy, 'init', '-q');
+    writeFileSync(join(decoy, 'f'), 'x\n');
+    gitOk(decoy, 'add', '-A');
+    gitOk(decoy, 'commit', '-q', '-m', 'init');
+    gitOk(decoy, 'worktree', 'add', '-q', '-b', 'dwt', join(fx.root, 'dwt'));
+    writeFileSync(join(fx.worktree, '.git'), `gitdir: ${join(decoy, '.git', 'worktrees', 'dwt')}\n`);
+    withEnv(bypassEnv(fx, fx.worktree), () => {
+      const result = withCwd(fx.worktree, () => verifyProjectHookIntegrity(fx.worktreeScript, 's1'));
+      assert.equal(result.ok, false, 'a worktree whose .git no longer points at the recorded repo is refused');
+    });
+    assert.deepEqual(auditLines(join(decoy, '.git', 'hook-integrity-bypass.jsonl')), []);
+    assert.deepEqual(auditLines(fx.audit), []);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('C3: a primary-session hook symlinked to a tampered worktree hook is not vouched for', () => {
+  if (process.platform === 'win32') return;
+  const fx = makeBypassFixture();
+  try {
+    const fs = require('node:fs');
+    fs.unlinkSync(fx.primaryScript);
+    fs.symlinkSync(fx.worktreeScript, fx.primaryScript);
+    withEnv(bypassEnv(fx, fx.primary), () => {
+      const result = withCwd(fx.worktree, () => verifyProjectHookIntegrity(fx.primaryScript, 's1'));
+      assert.equal(result.ok, false);
+    });
+    assert.deepEqual(auditLines(fx.audit), []);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('I1: a symlinked audit sink is refused, so /dev/null-style sinks cannot swallow the line', () => {
+  if (process.platform === 'win32') return;
+  const fx = makeBypassFixture();
+  const scratch = join(fx.root, 'scratch.log');
+  try {
+    writeFileSync(scratch, '');
+    require('node:fs').symlinkSync(scratch, fx.audit);
+    withEnv(bypassEnv(fx, fx.worktree), () => {
+      const result = withCwd(fx.worktree, () => verifyProjectHookIntegrity(fx.worktreeScript, 's1'));
+      assert.equal(result.ok, false);
+    });
+    assert.equal(readFileSync(scratch, 'utf8'), '', 'nothing was written through the link');
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('bypass from a sibling worktree cwd is refused when CLAUDE_PROJECT_DIR is the other worktree', () => {
+  const fx = makeBypassFixture();
+  try {
+    const wt2 = join(fx.root, 'wt2');
+    gitOk(fx.primary, 'worktree', 'add', '-q', '-b', 'wt2', wt2);
+    const script2 = join(wt2, 'scripts', 'hooks', 'guard.sh');
+    writeFileSync(script2, 'echo tampered\n');
+    withEnv(bypassEnv(fx, wt2), () => {
+      const result = withCwd(fx.worktree, () => verifyProjectHookIntegrity(script2, 's1'));
+      assert.equal(result.ok, false);
+    });
+    assert.deepEqual(auditLines(fx.audit), []);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('bypass is honoured in a linked worktree whose path git C-quotes in `worktree list` (a newline)', { skip: process.platform === 'win32' }, () => {
+  const fx = makeBypassFixture();
+  try {
+    const odd = join(fx.root, 'wt\nq');
+    gitOk(fx.primary, 'worktree', 'add', '-q', '-b', 'wt-odd', odd);
+    const oddScript = join(odd, 'scripts', 'hooks', 'guard.sh');
+    writeFileSync(oddScript, 'echo tampered\n');
+    withEnv(bypassEnv(fx, odd), () => {
+      const result = withCwd(odd, () => verifyProjectHookIntegrity(oddScript, 's1'));
+      assert.equal(result.ok, true);
+    });
+    assert.equal(auditLines(fx.audit).length, 1);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('bypass is refused for a legacy record with no git_dir (nothing to validate the worktree against)', () => {
+  const fx = makeBypassFixture();
+  try {
+    writeFileSync(
+      join(fx.integrityDir, 's1.json'),
+      JSON.stringify({ session_id: 's1', pins: { 'scripts/hooks/guard.sh': gitBlobSha1(Buffer.from('echo original\n')) } }),
+    );
+    withEnv(bypassEnv(fx, fx.worktree), () => {
+      const result = withCwd(fx.worktree, () => verifyProjectHookIntegrity(fx.worktreeScript, 's1'));
+      assert.equal(result.ok, false);
+    });
+    assert.deepEqual(auditLines(fx.audit), []);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('bypass is refused when the recorded repo does not list the project dir as a linked worktree', () => {
+  const fx = makeBypassFixture();
+  const other = join(fx.root, 'other');
+  try {
+    require('node:fs').mkdirSync(other);
+    gitOk(other, 'init', '-q');
+    const rec = JSON.parse(readFileSync(join(fx.integrityDir, 's1.json'), 'utf8'));
+    writeFileSync(join(fx.integrityDir, 's1.json'), JSON.stringify({ ...rec, git_dir: join(other, '.git') }));
+    withEnv(bypassEnv(fx, fx.worktree), () => {
+      const result = withCwd(fx.worktree, () => verifyProjectHookIntegrity(fx.worktreeScript, 's1'));
+      assert.equal(result.ok, false);
+    });
+    assert.deepEqual(auditLines(fx.audit), []);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('bypass writes one audit line per honoured hook (the launcher runs once per chain member)', () => {
+  const fx = makeBypassFixture();
+  try {
+    withEnv(bypassEnv(fx, fx.worktree), () => {
+      for (let i = 0; i < 2; i += 1) {
+        assert.equal(withCwd(fx.worktree, () => verifyProjectHookIntegrity(fx.worktreeScript, 's1')).ok, true);
+      }
+    });
+    assert.equal(auditLines(fx.audit).length, 2);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('bypass audit line carries the session name resolved from CLAUDE_PID (null only when unresolvable)', () => {
+  if (!existsSync('/proc/self/cmdline')) return;
+  const fx = makeBypassFixture();
+  const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)', '--', '-n', 'n283-test-session'], { stdio: 'ignore' });
+  try {
+    withEnv({ ...bypassEnv(fx, fx.worktree), CLAUDE_PID: String(child.pid) }, () => {
+      const result = withCwd(fx.worktree, () => verifyProjectHookIntegrity(fx.worktreeScript, 's1'));
+      assert.equal(result.ok, true);
+    });
+    const entry = JSON.parse(auditLines(fx.audit)[0]);
+    assert.equal(entry.session, 'n283-test-session');
+    assert.equal(realp(entry.worktree), realp(fx.worktree));
+  } finally {
+    child.kill();
+    rmSync(fx.root, { recursive: true, force: true });
   }
 });

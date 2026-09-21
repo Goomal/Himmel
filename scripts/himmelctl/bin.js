@@ -31,7 +31,7 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const { spawnSync } = require('child_process');
-const { cacheDir, profileForVault, which, resolvePowershell } = require('./lib/helpers.js');
+const { cacheDir, profileForVault, which, resolvePowershell, displayPath, shellQuote, nodeScriptCmd } = require('./lib/helpers.js');
 const stateLib = require('./lib/state.js');
 const statusReportLib = require('./lib/status-report.js');
 const installEngineLib = require('./lib/install-engine.js');
@@ -196,7 +196,8 @@ commands:
                           every consumer.) Hooks take effect on the next matching
                           event — no restart needed (measured, HIMMEL-1561).
                           Confirm with
-                          'node scripts/trust/shadow-ledger.mjs report':
+                          ${nodeScriptCmd(path.join(himmelRoot(), 'scripts/trust/shadow-ledger.mjs'))} report
+                          (an absolute path, so it runs from any directory):
                           it must show non-zero rows AND a PROVEN collection
                           line. "It is wired" is a different claim from "it is
                           recording", and both are different from "the rate can
@@ -2377,16 +2378,6 @@ function projectTargetDir() {
   return path.resolve(process.cwd());
 }
 
-// Forward-slash a path for DISPLAY in a diagnostic that tells the operator to
-// run something (HIMMEL-2892 CR round 2, [codex-1]). path.join/resolve emit
-// native separators, so on Windows the printed `bash C:\\...\\scripts\\setup.sh`
-// is not pasteable into the Git Bash shell the same line names — the shell eats
-// `\s` — and it is the same collapse wire-pretooluse-hooks.sh forward-slashes
-// its hook commands to avoid. Display only; nothing compares against this.
-function displayPath(p) {
-  return String(p).split(path.sep).join('/');
-}
-
 // realpath, falling back to the resolved path when the entry cannot be
 // stat'ed (a not-yet-created dir, a permission gap) — never throws.
 function realpathOrSelf(p) {
@@ -2435,12 +2426,6 @@ function projectTargetIsHimmelCheckout() {
   return Boolean(targetGit) && Boolean(cloneGit) && targetGit === cloneGit;
 }
 
-// Shell-quote one arg for DISPLAY only (the spawn below uses argv directly,
-// no shell — this only affects the printed `derived:` line).
-function shellQuote(a) {
-  return /\s/.test(a) ? `'${String(a).replace(/'/g, "'\\''")}'` : a;
-}
-
 function displayCommand(cmd) {
   return cmd.argv.map(shellQuote).join(' ');
 }
@@ -2450,8 +2435,12 @@ function displayCommand(cmd) {
 // (the main adopt.sh/setup.sh path AND the T5b existing-vault path) — never
 // after a declined confirm or a failed shell-out (both return before this
 // is reached).
+//
+// HIMMEL-3327: the path is this running bin.js, absolute and quoted — the
+// operator pastes the line from whatever project the install summary was
+// printed for, where a clone-relative `scripts/himmelctl/bin.js` is not found.
 function printUninstallFooter() {
-  console.log('To uninstall later: node scripts/himmelctl/bin.js uninstall');
+  console.log(`To uninstall later: ${nodeScriptCmd(__filename)} uninstall`);
 }
 
 // Spawn the derived command VERBATIM (stdio inherit) and propagate its exit
@@ -2979,11 +2968,14 @@ function lunaConfigUnknownKeysWarning(unknown) {
 
 // HIMMEL-3349: one line per field a pre-schema config gained. `filled` is what
 // luna-config.js added from the defaults; a value the wizard then set from this
-// run's own answer says so instead of claiming the default.
-function lunaConfigMigrationLines(filled, doc) {
+// run's own answer says so instead of claiming the default. HIMMEL-3371:
+// `supplied` is the set of dotted paths the wizard wrote — whether it answered
+// is tracked, not inferred from the value (an answer equal to the default is
+// still an answer).
+function lunaConfigMigrationLines(filled, doc, supplied) {
   return filled.map(({ path: p, value }) => {
     const now = p.split('.').reduce((o, k) => (o === undefined || o === null ? undefined : o[k]), doc);
-    const answered = JSON.stringify(now) !== JSON.stringify(value);
+    const answered = supplied.has(p);
     return `himmelctl: migrated ~/.himmel/config.json: ${p} = ${JSON.stringify(answered ? now : value)} (${answered ? 'wizard answer' : 'default'})`;
   });
 }
@@ -3320,18 +3312,22 @@ function applyLunaSectionsStep(answers) {
   // removed), so a plain JSON.stringify comparison is exact — no need for a
   // deep-equal dependency for a shape this controlled.
   const originalDocJson = JSON.stringify(doc);
+  // HIMMEL-3371: the dotted config paths this run's wizard answers wrote.
+  const supplied = new Set();
   // HIMMEL-3349: a key the user added is theirs — kept untouched (a save below
   // re-serializes it as loaded), named once here, never a failure.
   if (cfg.unknown.length > 0) console.error(lunaConfigUnknownKeysWarning(cfg.unknown));
 
   if (answers.vault && answers.vault.mode !== 'none' && answers.vault.path) {
     doc.luna.vaultPath = expandHome(answers.vault.path);
+    supplied.add('luna.vaultPath');
   }
   // [codex-1] only write a field the profile ACTUALLY supplied — an absent
   // section/answer is left exactly as loaded, never coerced to
   // Boolean(undefined).
   if (lunaSupplied) {
     doc.luna.phi.declared = Boolean(luna.phiDeclared);
+    supplied.add('luna.phi.declared');
     // HIMMEL-2347: materialize the guard inputs a declared personal/medical
     // vault path implies. Independent of phi.declared above (a SEPARATE
     // vault from the one being installed) and of configSaveOk below (these
@@ -3416,11 +3412,13 @@ function applyLunaSectionsStep(answers) {
   const dispositions = adopterProfileLib.resolveCadenceDispositions(answers);
   if (dispositions.pipeline !== undefined) {
     doc.luna.cadence.enabled = dispositions.pipeline === 'armed';
+    supplied.add('luna.cadence.enabled');
   } else {
     console.log('himmelctl: no cadence answer this run — luna.cadence.enabled left untouched on disk');
   }
   if (bridgeSupplied) {
     doc.bridge.enabled = Boolean(bridge.enabled);
+    supplied.add('bridge.enabled');
     if (bridge.enabled) {
       // Explicit acceptance (task brief): bridge.envPath/whisper.{cli,model}
       // are otherwise-inert schema fields — write the operator's actual
@@ -3428,6 +3426,7 @@ function applyLunaSectionsStep(answers) {
       doc.bridge.envPath = bridge.envPath;
       doc.bridge.whisper.cli = bridge.whisperCli || null;
       doc.bridge.whisper.model = bridge.whisperModel;
+      for (const p of ['bridge.envPath', 'bridge.whisper.cli', 'bridge.whisper.model']) supplied.add(p);
     }
   } else {
     console.log('himmelctl: profile carries no bridge section — bridge.* left untouched on disk');
@@ -3460,7 +3459,7 @@ function applyLunaSectionsStep(answers) {
   } else {
     try {
       lunaConfigLib.save(doc);
-      if (migrating) for (const line of lunaConfigMigrationLines(cfg.filled, doc)) console.log(line);
+      if (migrating) for (const line of lunaConfigMigrationLines(cfg.filled, doc, supplied)) console.log(line);
       console.log('himmelctl: wrote ~/.himmel/config.json (luna.vaultPath'
         + (dispositions.pipeline !== undefined ? ', luna.cadence.enabled' : '')
         + (lunaSupplied ? ', luna.phi.declared' : '')
@@ -5587,7 +5586,7 @@ async function cmdEnsure(args) {
           // No recorded answer, and this run cannot ask right now
           // (--dry-run, or non-interactive/piped stdin) — the one thing
           // this gate must never do is treat that silence as consent.
-          console.log("himmelctl: guardrail-block-global has no recorded consent yet — staying manual (run 'himmelctl ensure' interactively once to decide; recommended: yes). Direct fix: node scripts/hooks/guardrail-block.mjs install --node <ABS_NODE> --bash <ABS_BASH>");
+          console.log(`himmelctl: guardrail-block-global has no recorded consent yet — staying manual (run 'himmelctl ensure' interactively once to decide; recommended: yes). Direct fix: ${nodeScriptCmd(path.join(repoRoot(), 'scripts/hooks/guardrail-block.mjs'))} install --node <ABS_NODE> --bash <ABS_BASH>`);
         }
       }
     }

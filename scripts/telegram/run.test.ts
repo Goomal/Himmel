@@ -1,5 +1,5 @@
 import { beforeEach, expect, test } from "bun:test";
-import { buildRunArgs, DEFAULT_MODEL, detectCap, detectContentFilter, detectGlmCap, buildPrompt, killTree, REPO_ROOT, glmChildEnv, sessionEnv, laneModel } from "./run";
+import { buildRunArgs, DEFAULT_MODEL, detectCap, detectContentFilter, detectGlmCap, buildPrompt, killTree, REPO_ROOT, glmChildEnv, sessionEnv, laneModel, spawnSpec, laneEffort } from "./run";
 import { GLM_MODEL_ALIAS } from "./glm-env";
 import { spawn } from "bun";
 import { existsSync, readFileSync } from "node:fs";
@@ -407,4 +407,47 @@ test("detectCap lane semantics", () => {
   expect(detectCap(T1305)).toBe(true);                // off-lane base set unchanged
   expect(detectCap("Claude usage limit reached", "glm")).toBe(true); // base usage-limit kept on-lane
   expect(detectCap(BENIGN, "glm")).toBe(false);
+});
+
+// --- HIMMEL-3482: the lane registry's effort reaches a native dispatch ---
+const REAL_LANES = JSON.parse(readFileSync(join(REPO_ROOT, "scripts", "lanes", "lanes.json"), "utf8"));
+const tierEffort = (id: string) => REAL_LANES.lanes.find((l: { id: string }) => l.id === id).effort;
+// these tests set and clear the operator's ambient effort; put it back after each
+const AMBIENT_EFFORT = process.env.CLAUDE_CODE_EFFORT_LEVEL;
+const restoreEffort = () => {
+  if (AMBIENT_EFFORT === undefined) delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+  else process.env.CLAUDE_CODE_EFFORT_LEVEL = AMBIENT_EFFORT;
+};
+test("spawnSpec carries the lane's effort for a native dispatch (HIMMEL-3482)", () => {
+  try {
+    delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    // default model (a full claude-opus-* id) resolves to the opus lane
+    expect(spawnSpec("p").env.CLAUDE_CODE_EFFORT_LEVEL).toBe(tierEffort("opus"));
+    // an alias override resolves to that lane
+    expect(spawnSpec("p", undefined, undefined, "haiku").env.CLAUDE_CODE_EFFORT_LEVEL).toBe(tierEffort("haiku"));
+    // the lane value beats an ambient one — the registry is the per-dispatch setting
+    process.env.CLAUDE_CODE_EFFORT_LEVEL = "max";
+    expect(spawnSpec("p").env.CLAUDE_CODE_EFFORT_LEVEL).toBe(tierEffort("opus"));
+  } finally { restoreEffort(); }
+});
+test("spawnSpec leaves the ambient effort alone when the lane sets none (HIMMEL-3482 control)", () => {
+  const noEffort = { lanes: [{ id: "opus", class: "claude-tier" }] };
+  try {
+    process.env.CLAUDE_CODE_EFFORT_LEVEL = "high";
+    expect(spawnSpec("p", undefined, undefined, undefined, undefined, undefined, undefined, noEffort).env.CLAUDE_CODE_EFFORT_LEVEL).toBe("high");
+    // a model no lane names resolves to no effort either
+    expect(spawnSpec("p", undefined, undefined, "some-other-model").env.CLAUDE_CODE_EFFORT_LEVEL).toBe("high");
+    delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    expect("CLAUDE_CODE_EFFORT_LEVEL" in spawnSpec("p", undefined, undefined, undefined, undefined, undefined, undefined, noEffort).env).toBe(false);
+  } finally { restoreEffort(); }
+});
+test("spawnSpec: a route's extraEnv effort wins over the lane's (HIMMEL-3482)", () => {
+  expect(spawnSpec("p", undefined, undefined, undefined, undefined, { CLAUDE_CODE_EFFORT_LEVEL: "low" }).env.CLAUDE_CODE_EFFORT_LEVEL).toBe("low");
+});
+test("laneEffort ignores a non-tier lane and a prose effort value (HIMMEL-3482)", () => {
+  expect(laneEffort("glm-4.6", REAL_LANES)).toBeUndefined();
+  expect(laneEffort("opus", { lanes: [{ id: "opus", class: "claude-tier", effort: "codex weekly bank" }] })).toBeUndefined();
+});
+test("laneEffort falls back to no effort on a registry that parses to the wrong shape (HIMMEL-3482)", () => {
+  for (const bad of [{}, null, { lanes: "x" }, { lanes: [null] }]) expect(laneEffort("opus", bad as never)).toBeUndefined();
 });

@@ -246,7 +246,7 @@ run_case sh-t13b-ok-reason-too-short FAIL scripts/start.sh \
     'nohup claude daemon run &  # t13b-ok: short'
 run_case sh-t13b-ok-reason-no-word-char FAIL scripts/start.sh \
     'nohup claude daemon run &  # t13b-ok: --------'
-run_case sh-t13b-ok-reason-digits-only-ok PASS scripts/start.sh \
+run_case sh-t13b-ok-reason-digits-only FAIL scripts/start.sh \
     'nohup claude daemon run &  # t13b-ok: 12345678'
 run_case sh-t13b-ok-no-space-after-hash FAIL scripts/start.sh \
     'nohup claude daemon run &  #t13b-ok: real eight char reason'
@@ -256,6 +256,120 @@ run_case sh-t13b-ok-double-space-after-hash FAIL scripts/start.sh \
     'nohup claude daemon run &  #  t13b-ok: real eight char reason'
 run_case sh-t13b-ok-double-space-after-colon-ok PASS scripts/start.sh \
     'nohup claude daemon run &  # t13b-ok:  real eight char reason'
+
+# HIMMEL-3446: the marker counts only as a genuine trailing comment (a
+# quote/brace-depth aware scan, not raw substring text), with a reason of
+# >= 8 chars containing a run of 3+ letters. Case names below borrow the
+# reviewer's adv1094b marker-attack fixture matrix.
+echo "== HIMMEL-3446: marker must be a real trailing comment, not smuggled text =="
+
+run_case sh-t13b-ok-marker-crlf-ok PASS scripts/start.sh \
+    $'nohup claude daemon run &  # t13b-ok: a real eight char reason\r'
+
+run_case smg-dq-string FAIL scripts/start.sh \
+    'echo "# t13b-ok: a real eight char reason"; nohup claude daemon run &'
+run_case smg-sq-string FAIL scripts/start.sh \
+    "echo '# t13b-ok: a real eight char reason'; nohup claude daemon run &"
+run_case smg-bash-c-arg FAIL scripts/start.sh \
+    "bash -c 'nohup claude daemon run &' '# t13b-ok: a real eight char reason'"
+run_case smg-herestring FAIL scripts/start.sh \
+    "nohup claude daemon run <<< '# t13b-ok: a real eight char reason' &"
+# shellcheck disable=SC2016  # single-quoted on purpose: the fixture line is
+# literal text for the target repo, never expanded here
+run_case smg-param-exp FAIL scripts/start.sh \
+    'echo "${x# t13b-ok: a real eight char reason}"; nohup claude daemon run &'
+# shellcheck disable=SC2016  # single-quoted on purpose: literal fixture text
+run_case smg-cmd-subst FAIL scripts/start.sh \
+    'x=$(echo "# t13b-ok: a real eight char reason"); nohup claude daemon run &'
+run_case smg-word-hash FAIL scripts/start.sh \
+    'echo foo# t13b-ok: a real eight char reason; nohup claude daemon run &'
+run_case smg-escaped-hash FAIL scripts/start.sh \
+    'nohup claude daemon run & \# t13b-ok: a real eight char reason; claude daemon run &'
+run_case smg-slashslash-sh FAIL scripts/start.sh \
+    'true // t13b-ok: a real eight char reason; nohup claude daemon run &'
+
+run_case smg-js-string FAIL src/x.ts \
+    'const s = "// t13b-ok: a real eight char reason"; daemon.start()'
+# shellcheck disable=SC2016  # single-quoted on purpose: literal fixture text
+run_case smg-js-template FAIL src/x.ts \
+    'const s = `# t13b-ok: a real eight char reason`; daemon.start()'
+run_case smg-js-regex FAIL src/x.ts \
+    'if (/# t13b-ok: a real eight char reason/.test(s)) daemon.start()'
+run_case smg-js-leadblock FAIL src/x.ts \
+    '/* // t13b-ok: a real eight char reason */ daemon.start()'
+
+run_case sh-t13b-ok-reason-punct-run FAIL scripts/start.sh \
+    'nohup claude daemon run &  # t13b-ok: .......x'
+run_case sh-t13b-ok-reason-space-padded FAIL scripts/start.sh \
+    'nohup claude daemon run &  # t13b-ok: x         y'
+run_case sh-t13b-ok-nested-marker FAIL scripts/start.sh \
+    'nohup claude daemon run &  # t13b-ok: # t13b-ok: a real reason'
+
+# Item (d), console ruling: everything after a real "# t13b-ok: <reason>" IS
+# a shell comment, so a chained daemon start past it is unreachable code on
+# THIS line, not a smuggle -- this is not a bug to fix, it must keep passing.
+run_case sh-t13b-ok-mid-chain-comment-eats-rest PASS scripts/start.sh \
+    'nohup claude daemon run & # t13b-ok: a real eight char reason ; claude daemon run &'
+
+run_case py-t13b-ok-marker-genuine PASS src/start.py \
+    'daemon.start()  # t13b-ok: a real eight char reason'
+run_case py-t13b-ok-marker-quoted FAIL src/start.py \
+    "s = '# t13b-ok: a real eight char reason'; daemon.start()"
+
+# Real markers already on main (verbatim, HIMMEL-3446 console re-verify: base
+# 08de71f5 predates #1087/58733898 and #1083/a358da5d, which added these).
+# Pinned so the tightened rules keep accepting the genuine shapes that shipped
+# on other legs' branches, not just the synthetic fixture lines above.
+run_case real-1083-test-fleet-daemon-string PASS scripts/handover/console-kit/test-fleet.sh \
+    "    '- 10:27 LIVE — background leg via the daemon'  # t13b-ok: literal fixture text for a mocked leg row, not real automation"
+# shellcheck disable=SC2016  # single-quoted on purpose: literal fixture text, real HIMMEL-3403 argv-match line
+run_case real-1087-argv-match-marker PASS scripts/handover/headed-arm.sh \
+    '        [ "${prev2##*/}" = claude ] && [ "$prev1" = daemon ] && [ "$arg" = run ] && return 0  # t13b-ok: read-only argv match of the Claude Code service, starts nothing'
+run_case real-1087-pgrep-marker PASS scripts/handover/headed-arm.sh \
+    "    pids=\"\$(\"\$PGREP\" -f '[c]laude daemon run' 2>/dev/null)\"  # t13b-ok: read-only pgrep lookup of the Claude Code service, starts nothing"
+
+# KNOWN-GAP (HIMMEL-3455, deferred out of HIMMEL-3446 per console ruling):
+# these two pin TODAY's wrong behaviour, not the desired one -- a future fix
+# should flip both to FAIL and this comment + the ponytail in
+# find_marker_start() should be removed then.
+run_case sh-t13b-known-gap-ansi-c-escape-desync-codex2 PASS scripts/start.sh \
+    "printf '%s' \$'it\' # t13b-ok: genuine reason'; nohup claude daemon run &"
+run_case sh-t13b-known-gap-js-regex-desync-codex1 PASS src/x.ts \
+    'const r = /"/; const s = "// t13b-ok: genuine reason"; daemon.start()'
+
+# HIMMEL-3446 round 3 (console ruling, AE): a substitution opened while
+# already inside a quote must push its OWN nested state instead of being
+# invisible to the scan, and a backslash-escaped space must not count as a
+# real word boundary for the `#` that follows it. Each row below wrongly
+# exempted the daemon-start line under the round-2 scanner.
+echo "== HIMMEL-3446 round 3: nested substitution-in-quote and escaped-space smuggles =="
+# shellcheck disable=SC2016  # single-quoted on purpose: literal fixture text
+run_case smg-nested-cmdsub-in-dq FAIL scripts/start.sh \
+    'x="$(echo " # t13b-ok: a real eight char reason")"; nohup claude daemon run &'
+# shellcheck disable=SC2016  # single-quoted on purpose: literal fixture text
+run_case smg-nested-cmdsub-in-backtick FAIL scripts/start.sh \
+    'x="`echo " # t13b-ok: a real eight char reason"`"; nohup claude daemon run &'
+# shellcheck disable=SC2016  # single-quoted on purpose: literal fixture text
+run_case smg-nested-param-exp-default FAIL scripts/start.sh \
+    'x="${y:-" # t13b-ok: a real eight char reason"}"; nohup claude daemon run &'
+# shellcheck disable=SC2016  # single-quoted on purpose: literal fixture text
+run_case smg-nested-cmdsub-systemctl FAIL scripts/start.sh \
+    'x="$(echo " # t13b-ok: a real eight char reason")"; systemctl --user enable --now foo'
+# shellcheck disable=SC2016  # single-quoted on purpose: literal fixture text
+run_case smg-js-nested-template FAIL src/x.ts \
+    'const x = `${`// t13b-ok: a real eight char reason`}`; daemon.start()'
+run_case smg-escaped-space-word-boundary FAIL scripts/start.sh \
+    'echo foo\ # t13b-ok: a real eight char reason; nohup claude daemon run &'
+
+# Controls that must keep passing after the round-3 fix: a real marker
+# following a LEGIT nested substitution (no smuggle) is still recognized,
+# and an unrelated escaped space earlier on the line does not blind the
+# scanner to a real marker later on.
+# shellcheck disable=SC2016  # single-quoted on purpose: literal fixture text
+run_case sh-t13b-ok-real-marker-after-nested-subst PASS scripts/start.sh \
+    'x="$(echo "value")"; nohup claude daemon run & # t13b-ok: a real eight char reason'
+run_case sh-t13b-ok-real-marker-with-unrelated-escape PASS scripts/start.sh \
+    'echo foo\ bar; nohup claude daemon run & # t13b-ok: a real eight char reason'
 
 if [ "$failures" -ne 0 ]; then
     echo "FAIL: $failures of $cases case(s) failed"

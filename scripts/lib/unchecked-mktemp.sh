@@ -164,6 +164,65 @@
 #      positive). A token boundary (non-identifier char, or end of string)
 #      is now required immediately after "mktemp".
 #
+# HIMMEL-3428 (N339, slice 2) fixes three more gaps an independent
+# adversarial review of the N333 landing found (plus a pre-existing
+# Suggestion), all against the merged head:
+#   1. Rule (c) window regression: the N333 comment-skip fix let the window
+#      scan reach PAST a comment to a real code line that merely MENTIONS
+#      the variable inside `[ ... ]` without actually testing it -- e.g.
+#      `[ "$out" = "$tmp/bin/node.exe" ]` tests `$out`, not `$tmp`; `$tmp` is
+#      just a fragment of the string being compared. The variable reference
+#      must now be a COMPLETE, standalone token in the test -- immediately
+#      followed by a quote or a non-identifier, non-path character (not `/`
+#      or `.`, which mean it is concatenated into a longer string) -- for
+#      rule (c) to count it as a guard. This is a narrower fix than requiring
+#      a specific test operator (`-n`/`-d`/...): it also still accepts the
+#      common bare-truthiness idiom `[ "$T" ]`, which the old AND new rule
+#      both treat as a guard with no judgement about quality (see the
+#      CONTRACT above).
+#   2. A guard written into a trailing `#...` comment on the same line was
+#      still accepted -- `T=$(mktemp) # || exit 1`, `# [ -d "$T" ]`,
+#      `# ${T:?}` -- because rules (a)/(c)/(d) scanned the raw line text,
+#      comment included. A trailing comment is now stripped before those
+#      three rules run (rule (b)'s escape comment is exempt: it lives in a
+#      comment on purpose, so it still scans the raw line). The stripper
+#      tracks single- and double-quote state so a `#` inside a string is
+#      left alone, and treats `$#` and `${#name}` (positional-count /
+#      length-of-parameter syntax) as ordinary code, never a comment start.
+#      It does not track backslash-escaped quotes inside a double-quoted
+#      string (`\"`) -- unbounded shell lexing is out of scope per the file
+#      header; that shape does not occur in this repo.
+#   3. Boundary class: the command-name boundary after "mktemp" (N333 item 3)
+#      missed `<`/`>` (redirects: `mktemp</dev/null`), a line-continuing `\`
+#      (backslash-newline), and a trailing `\r` (CRLF input, including a
+#      multi-line `$(mktemp ...)` whose closing paren is on the next line).
+#      Rather than keep growing an allow-list of boundary characters, the
+#      boundary is the COMPLEMENT of the characters a command name can
+#      itself contain (`[A-Za-z0-9_./-]`) or end-of-string -- which covers
+#      every character above, with nothing new to enumerate by hand. CRLF is
+#      handled once, globally, by stripping a trailing `\r` off every input
+#      line before any scanning -- so heredoc-terminator matching, variable
+#      matching and boundary matching all see the same text a plain LF file
+#      would produce.
+#      A bare `'` is deliberately NOT in the boundary class: shell word
+#      concatenation means `mktemp'-d'` lexes as the single word `mktemp-d`
+#      (the quotes are removed, nothing separates them), a distinct command
+#      name, not `mktemp` followed by a `-d` argument -- so it must not
+#      flag (HIMMEL-3428, reversing an earlier ruling on this branch that
+#      four straight critic-panel rounds disputed). A quote preceded by
+#      whitespace is unaffected: the whitespace itself is already outside
+#      `[A-Za-z0-9_./-]`, so `mktemp '-d'` (a real, separate, quoted
+#      argument) still flags correctly.
+#   4. Suggestion (kept in scope; did not grow the predicate materially):
+#      multi-variable and chained declarations -- `local T U; T=$(mktemp)`,
+#      `local T; local U; T=$(mktemp)`, `local -- T; T=$(mktemp)`,
+#      `local T && T=$(mktemp)` -- are now recognised. The split-declaration
+#      stripper (N333 item 2) now: accepts one-or-more space-separated
+#      names before the separator, accepts a bare `--` (end-of-options)
+#      option token as well as `-x`-style options, accepts `&&` as an
+#      alternative to `;`, and loops (strips repeatedly) so a CHAIN of
+#      declarations is fully peeled before the assignment is scanned.
+#
 # Sourced, never executed. Sets no shell options of its own.
 
 unchecked_mktemp_scan() {
@@ -177,7 +236,12 @@ unchecked_mktemp_scan() {
                                  # its caller).
     }
     {
-        line[NR] = $0
+        # HIMMEL-3428 item 3: strip a trailing CR once, here, so every later
+        # check (heredoc terminator match, boundary match, variable match)
+        # sees the same text a plain LF file would produce.
+        l = $0
+        sub(/\r$/, "", l)
+        line[NR] = l
     }
     # heredoc_word(s) -- if s opens a heredoc (and the opener is not itself
     # inside a "#" comment), return its terminator word and set HEREDOC_DASH
@@ -227,6 +291,49 @@ unchecked_mktemp_scan() {
         if (depth != 0) return ""
         return substr(s, i)
     }
+    # strip_comment(s) -- HIMMEL-3428 item 2: return s with a trailing
+    # `#...` shell comment removed. A `#` starts a comment only when it is
+    # OUTSIDE any quote and is not the parameter-expansion sigil of `$#`
+    # (positional-parameter count) or `${#name}` (length-of-parameter) --
+    # both are left alone, as ordinary code, never a comment start. A `#`
+    # inside single or double quotes is also left alone. This does not
+    # track a backslash-escaped `\"` inside a double-quoted string as
+    # still-quoted (general shell lexing is out of scope -- see the file
+    # header); that shape does not occur in this repo.
+    function strip_comment(s,    i, n, c, prev, prev2, insq, indq) {
+        n = length(s)
+        for (i = 1; i <= n; i++) {
+            c = substr(s, i, 1)
+            if (insq) {
+                if (c == sq) insq = 0
+                continue
+            }
+            if (indq) {
+                if (c == "\"") indq = 0
+                continue
+            }
+            if (c == sq) { insq = 1; continue }
+            if (c == "\"") { indq = 1; continue }
+            if (c == "#") {
+                prev = (i > 1) ? substr(s, i - 1, 1) : ""
+                prev2 = (i > 2) ? substr(s, i - 2, 1) : ""
+                if (prev == "$") continue                    # $# -- positional count
+                if (prev == "{" && prev2 == "$") continue     # ${#name} -- length
+                # codex-2 (/pr-check round 1 on this branch): a `#` is only
+                # a comment START at the beginning of a shell word -- i.e.
+                # at the start of the line, right after whitespace, or right
+                # after a shell operator that ends the previous word (`;`,
+                # `&`, `|`, `(`, `)` -- round 2: these END a word rather than
+                # extending it, so `T=$(mktemp);# || exit 1` is a genuine
+                # commented-out guard, unlike a `#` glued to ordinary text
+                # such as a mktemp template argument (`mktemp
+                # /tmp/name#XXXXXX`), which is not a comment start.
+                if (prev != "" && prev !~ /[ \t;&|()]/) continue
+                return substr(s, 1, i - 1)
+            }
+        }
+        return s
+    }
     END {
         # Pass 1: mark every line inside a heredoc body (skip[i]=1) so the
         # scan below never treats fixture content as executable code. Two
@@ -271,10 +378,18 @@ unchecked_mktemp_scan() {
             # declaration builtin of its OWN, so is_decl below correctly
             # comes out false for it: its exit status is that of the mktemp
             # command substitution, unmasked.
+            # HIMMEL-3428 item 4: one-or-more space-separated names
+            # (`local T U;`), a bare `--` end-of-options token as well as
+            # `-x`-style options (`local -- T;`), `&&` as an alternative to
+            # `;` (`local T && T=...`), and a LOOP so a chain of
+            # declarations (`local T; local U; T=...`) is fully peeled --
+            # not just the first one -- before the assignment is scanned.
+            strip_re = "^[ \t]*(local|export|typeset|readonly|declare)([ \t]+(-[a-zA-Z]+|--))*[ \t]+[A-Za-z_][A-Za-z0-9_]*([ \t]+[A-Za-z_][A-Za-z0-9_]*)*[ \t]*(;|&&)[ \t;]*"
             scan_s = s
-            if (s ~ /^[ \t]*(local|export|typeset|readonly|declare)([ \t]+-[a-zA-Z]+)*[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*;[ \t]*/) {
-                tmp = s
-                sub(/^[ \t]*(local|export|typeset|readonly|declare)([ \t]+-[a-zA-Z]+)*[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*;[ \t]*/, "", tmp)
+            while (scan_s ~ strip_re) {
+                tmp = scan_s
+                sub(strip_re, "", tmp)
+                if (tmp == scan_s) break
                 scan_s = tmp
             }
 
@@ -289,14 +404,28 @@ unchecked_mktemp_scan() {
             # boundary is now an actual shell word terminator: whitespace,
             # a closing paren (bare `$(mktemp)`), a double quote, a
             # backtick, or a command separator -- never a character a
-            # command name can itself contain. (A literal single-quote char
-            # is deliberately left out of this class: it cannot appear in
-            # this awk program source at all without prematurely closing the
-            # single-quoted shell string this whole predicate lives inside
-            # -- see the file header -- and every tested usage already puts
-            # whitespace before a quoted template arg, so whitespace covers
-            # it.)
-            if (scan_s !~ /^[ \t]*((local|export|typeset|readonly|declare)[ \t]+(-[a-zA-Z]+[ \t]+)*)?[A-Za-z_][A-Za-z0-9_]*="?\$\([ \t]*mktemp([ \t)"`;|&]|$)/)
+            # command name can itself contain.
+            # HIMMEL-3428 item 3: rather than keep growing that allow-list
+            # (round 1 of N333 already had to add `-`/`.` handling), the
+            # boundary is the COMPLEMENT of the characters a command
+            # name can itself contain (`[A-Za-z0-9_./-]`) or end-of-string --
+            # which covers `<`/`>` (redirects), a line-continuing `\`, and
+            # (via the global CR strip above) a trailing `\r`, with nothing
+            # to enumerate by hand.
+            # A bare quote character is deliberately kept OUT of the negated
+            # boundary class (added back to the allowed set alongside
+            # `-./`): shell word concatenation means mktemp immediately
+            # followed by a quoted -d, with no separating whitespace, lexes
+            # as the single word mktemp-d, a distinct command name, not
+            # mktemp plus a -d argument, so it must not match here. mktemp
+            # followed by whitespace then a quoted -d (a real, separate
+            # argument) is unaffected -- the whitespace character itself is
+            # already outside the allowed set and matches first.
+            # (No literal quote character appears in this comment or the
+            # regex below by accident -- this whole awk program is itself
+            # single-quoted by its caller, so the one quote the regex needs
+            # is spelled with the close/escaped-quote/reopen idiom instead.)
+            if (scan_s !~ /^[ \t]*((local|export|typeset|readonly|declare)[ \t]+((-[a-zA-Z]+|--)[ \t]+)*)?[A-Za-z_][A-Za-z0-9_]*="?\$\([ \t]*mktemp([^A-Za-z0-9_./'\''-]|$)/)
                 continue
 
             # A declaration builtin (local/export/declare/typeset/readonly)
@@ -305,11 +434,17 @@ unchecked_mktemp_scan() {
             # rule (a) never applies to them. (Rules (c)/(d) are NOT gated by
             # this -- see below -- because they read the actual value of the variable,
             # not the exit status of the builtin.)
-            is_decl = (scan_s ~ /^[ \t]*(local|export|typeset|declare|readonly)([ \t]+-[a-zA-Z]+)*[ \t]+/)
+            is_decl = (scan_s ~ /^[ \t]*(local|export|typeset|declare|readonly)([ \t]+(-[a-zA-Z]+|--))*[ \t]+/)
+
+            # HIMMEL-3428 item 2: rules (a)/(c)/(d) must not see a guard
+            # written into a trailing comment. Rule (b) is exempt -- its
+            # escape lives in a comment on purpose -- so it keeps scanning
+            # the raw scan_s below, unstripped.
+            code_line = strip_comment(scan_s)
 
             # Rule (a): a `||` ANYWHERE on the line guards it, full stop --
             # no judgement about what the right-hand side does.
-            if (!is_decl && scan_s ~ /\|\|/) continue
+            if (!is_decl && code_line ~ /\|\|/) continue
 
             # Rule (b): the escape comment.
             if (index(scan_s, "mktemp-unchecked-ok:") > 0) continue
@@ -324,6 +459,19 @@ unchecked_mktemp_scan() {
 
             guarded = 0
 
+            # ponytail: rule (c) below still treats the captured var as
+            # "tested" when it is only EMBEDDED inside a larger compared
+            # string, e.g. `[ "$out" = "$tmp-suffix" ]` or
+            # `[ "$out" = "prefix$tmp" ]` -- the actual variable under test
+            # there is $out, not $tmp, but the regex has no way to tell
+            # "$tmp is the whole compared operand" from "$tmp is glued into
+            # one". Closing this needs real tokenization of the test
+            # expression, not a boundary-character tweak (codex-1, /pr-check
+            # round 3 on this branch) -- deferred as a known false-negative,
+            # same class as the already-accepted `T13 || echo failed` gap.
+            # Tracked as HIMMEL-3457 (this PR completes HIMMEL-3428, so the
+            # gap cannot defer onto the ticket it completes).
+
             # Rules (c)/(d) on the REMAINDER of the assignment line itself
             # (e.g. `T=$(mktemp -d); : "${T:?x}"`) -- these are VALUE guards
             # (a test of the actual value of the variable, or `${VAR:?...}`), which
@@ -331,9 +479,29 @@ unchecked_mktemp_scan() {
             # builtin masked exit status, so -- unlike rule (a) -- this
             # window applies to every assignment, declaration-prefixed or not
             # (round-4 fix).
-            rem = remainder_after_capture(scan_s)
+            rem = remainder_after_capture(code_line)
             if (rem != "") {
-                if (rem ~ ("(\\[\\[?|test)[ \t].*\\$\\{?" var "[^A-Za-z0-9_]")) guarded = 1
+                # codex-1 (/pr-check round 1 on this branch): `\}?` was
+                # independently optional, so for a braced mention like
+                # `${tmp}/bin/node` the engine could skip matching the
+                # literal `}` and let the following negated boundary class
+                # (which does not exclude `}`) match `}` itself -- treating
+                # a mere mention as a real guard. Two full alternatives --
+                # braced-and-closed, or unbraced -- removes that mismatch.
+                # The braced alternative allows an interior parameter-
+                # expansion modifier (`[^{}]*`, e.g. `${T:-}`, a common
+                # set-u-safe spelling of a real `[ -z ... ]` test) as long
+                # as it is followed by an ACTUAL closing brace -- `[^{}]*`
+                # cannot itself consume `{`/`}`, so the brace can no longer
+                # be skipped the way the old optional form allowed.
+                # codex-1 (/pr-check round 2 on this branch): `[^{}]*` alone
+                # let identifier characters immediately continue the var
+                # name with no boundary, so `${tmp_other}` counted as a
+                # guard for `tmp`. A real modifier never starts with an
+                # identifier character, so requiring either an immediate
+                # close or a non-identifier char right after the var name
+                # closes this without narrowing back to exact-`${VAR}`-only.
+                if (rem ~ ("(\\[\\[?|test)[ \t].*(\\$\\{" var "(\\}|[^A-Za-z0-9_][^{}]*\\})|\\$" var ")[^A-Za-z0-9_/.]")) guarded = 1
                 if (!guarded && rem ~ ("\\$\\{" var ":\\?")) guarded = 1
             }
 
@@ -351,10 +519,15 @@ unchecked_mktemp_scan() {
                     if (t ~ /^[ \t]*$/) continue
                     if (t ~ /^[ \t]*#/) continue
                     seen++
+                    # HIMMEL-3428 item 2: a real code line can still carry a
+                    # trailing comment that only LOOKS like a guard --
+                    # strip it before matching, same as the same-line
+                    # remainder above.
+                    t_code = strip_comment(t)
                     # (c) a test construct referencing the variable.
-                    if (t ~ ("(\\[\\[?|test)[ \t].*\\$\\{?" var "[^A-Za-z0-9_]")) { guarded = 1; break }
+                    if (t_code ~ ("(\\[\\[?|test)[ \t].*(\\$\\{" var "(\\}|[^A-Za-z0-9_][^{}]*\\})|\\$" var ")[^A-Za-z0-9_/.]")) { guarded = 1; break }
                     # (d) `${VAR:?...}` -- colon form only (not `${VAR?...}`).
-                    if (t ~ ("\\$\\{" var ":\\?")) { guarded = 1; break }
+                    if (t_code ~ ("\\$\\{" var ":\\?")) { guarded = 1; break }
                 }
             }
             if (guarded) continue

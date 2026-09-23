@@ -623,6 +623,117 @@ for eol in LF CRLF; do
         "$(bash_rc_of "$WT2" "${cont}'\\x63\\x70' -r /tmp/payload/. \"\$HOME/.claude/\"")"
 done
 
+# 115: a command mentioning the primary checkout's OWN root path as a bare
+# substring, with no .claude reference anywhere, run from an unrelated cwd
+# (WT2), and only incidentally "mentioning settings" via an unrelated
+# filename -> ALLOW. `stat` (not `jq`/`cat`/etc.) is deliberately NOT on the
+# read-only allowlist, so this exercises the live/not-live distinction
+# itself rather than being exempted regardless of it. Before the fix,
+# primary_root_lc matched as an unconstrained bare substring (unlike
+# home_root_lc's existing /.claude adjacency requirement below), so a
+# READ-ONLY command on a scratchpad file merely nested under the primary's
+# path false-denied (HIMMEL-3465).
+assert_rc "115 primary root mention with no .claude reference allows (HIMMEL-3465)" 0 \
+    "$(bash_rc_of "$WT2" "stat \"$PRIMARY/scratch/leg-settings.json\"")"
+
+# 116 control: the same primary root, this time immediately followed by
+# /.claude/settings.json, still denies — proves 115's fix did not widen the
+# genuine live-settings case.
+assert_rc "116 primary root immediately followed by /.claude still denies (control)" 2 \
+    "$(bash_rc_of "$WT2" "stat \"$PRIMARY/.claude/settings.json\"")"
+
+# 117: `ls -t` (sort-by-time) naming a live .claude dir as a plain listing
+# argument, not a copy/move destination -> ALLOW. Before the fix, the
+# -t/--target-directory flag check fired standalone regardless of verb, so
+# any `-t` anywhere near a .claude mention false-denied (HIMMEL-3465).
+assert_rc "117 ls -t on a .claude path allows (HIMMEL-3465)" 0 \
+    "$(bash_rc_of "$WT2" "ls -t \$HOME/.claude/handover/bridge/ | head" HOME="$FAKEHOME")"
+
+# 118 control: cp -t into \$HOME/.claude/ still denies — proves 117's fix did
+# not widen the genuine copy-into-live-settings-dir case (cp is still one of
+# the matched copy/move verbs).
+assert_rc "118 cp -t into \$HOME/.claude/ still denies (control)" 2 \
+    "$(bash_rc_of "$WT2" "cp -t \$HOME/.claude/ /tmp/payload" HOME="$FAKEHOME")"
+
+# 119: the exact command a console session hit today (2026-09-23) — a
+# read-only `jq` query of a generated leg-settings scratchpad file whose
+# basename ends in "settings.json" (a bare substring match on
+# mentions_settings), from a scratchpad path nested under neither the
+# primary's nor $HOME's .claude/ -> ALLOW. Verified against a base-054df92e
+# extraction too: this exact command already ALLOWs at base (rc=0, no stash),
+# so the hook was never the cause of that refusal — jq without -i/--in-place
+# is on the read-only allowlist regardless of the live/not-live question.
+assert_rc "119 jq read of a scratchpad .leg-settings.json file allows" 0 \
+    "$(bash_rc_of "$PRIMARY" "jq '{add:.permissions.additionalDirectories}' /tmp/claude-1000/somesession/scratchpad/HIMMEL-3514-N424-bridge-hardening.leg-settings.json")"
+
+# 120 control: the same read, this time redirected into the PRIMARY's live
+# settings.json (a genuine write) -> DENY — proves 119's exemption only
+# covers the read-only verb, not the file itself. (codex-3 panel finding,
+# round 5, HIMMEL-3517: the earlier version of this control used `jq -i`,
+# which jq does not actually support as a flag — it denied via the hook's
+# textual `-i` scan, not because it was a real write, so it never exercised
+# an actual write path. Replaced with a genuine `>` redirect, a write shape
+# jq truly performs.)
+assert_rc "120 jq read redirected into primary settings.json still denies (control)" 2 \
+    "$(bash_rc_of "$PRIMARY" "jq '{add:.permissions.additionalDirectories}' /tmp/claude-1000/somesession/scratchpad/HIMMEL-3514-N424-bridge-hardening.leg-settings.json > .claude/settings.json")"
+
+# 121: pinned known residual (K ruling 2026-09-23 on K-N431-7980c9b9,
+# HALT-and-simplify). This is the console's OWN verbatim reproduction: a
+# `VAR=path;`-prefixed, `;`-compound, TWO-statement read-only `jq` command,
+# from a PRIMARY-checkout cwd. Two successive panel rounds each found a real
+# bypass in a per-segment allowlist narrow enough to let this shape through
+# (round 2: an assignment shortcut riding past a later write on a
+# newline-embedded segment; round 3: the same class of gap recurring one
+# round later) — rising severity on the same surface, so the per-segment
+# split was reverted back to the blunt "any bare `;` vetoes" behavior rather
+# than patched a third time. This harmless chain now denies too; documented
+# as a known residual rather than chased further (ponytail, upgrade path
+# HIMMEL-3546 — a real fix needs quote-aware tokenization of the whole
+# command, not another metacharacter scan).
+assert_rc "121 VAR=path; jq read; jq read (console repro) still denies (known residual, HIMMEL-3546)" 2 \
+    "$(bash_rc_of "$PRIMARY" "SP=/tmp/claude-1000/somesession/scratchpad; jq '.permissions.additionalDirectories' \$SP/HIMMEL-3514-N424-bridge-hardening.leg-settings.json; jq '.permissions.additionalDirectories' \$SP/HIMMEL-3536-N425-step0-remainder.leg-settings.json")"
+
+# 122 control: the same VAR=path;-prefixed shape, this time with a genuine
+# WRITE (sed -i) as the chained statement — denies, same as 121, now simply
+# because ANY bare `;` vetoes the allowlist unconditionally.
+assert_rc "122 VAR=path; write-in-place still denies (control)" 2 \
+    "$(bash_rc_of "$PRIMARY" "X=/tmp/claude-1000/somesession/scratchpad; sed -i s/a/b/ \$X/settings.json")" # gnu-ok: fixture text parsed by the hook, never executed
+
+# 123 control: a `;`-joined write with NO leading assignment (`cat x; rm -rf
+# ~`-shaped) still denies — same blunt bare-`;` veto as 121/122.
+assert_rc "123 jq read; write-in-place (no assignment) still denies (control)" 2 \
+    "$(bash_rc_of "$PRIMARY" "jq '.permissions.additionalDirectories' /tmp/claude-1000/somesession/scratchpad/HIMMEL-3514-N424-bridge-hardening.leg-settings.json; sed -i s/a/b/ /tmp/claude-1000/somesession/scratchpad/HIMMEL-3514-N424-bridge-hardening.leg-settings.json")" # gnu-ok: fixture text parsed by the hook, never executed
+
+# 124: another known residual of the same class, documented rather than
+# chased (ponytail: this guard matches metacharacters on TEXT after quotes
+# are stripped for the primary/$HOME-path detection above — HIMMEL-3468 —
+# so a `|` INSIDE a quoted jq filter argument, e.g. `test("a|b")`, is
+# indistinguishable from a real shell pipe once quotes are gone; this
+# command also carries a bare `;`, so it denies twice over today). Fixing
+# either needs the same quote-aware tokenization as 121 — HIMMEL-3546.
+assert_rc "124 VAR=path; jq with a quoted-pipe regex filter still denies (ponytail, HIMMEL-3546)" 2 \
+    "$(bash_rc_of "$PRIMARY" "SP=/tmp/claude-1000/somesession/scratchpad; jq '[.permissions.allow[]? | select(test(\"luna|handover\"))]' \$SP/HIMMEL-3514-N424-bridge-hardening.leg-settings.json")"
+
+# 125: PATH-hijack shape (/pr-check critic panel round 1, Critical,
+# 2026-09-23) — `PATH=/tmp/evil; cat ~/.claude/settings.json` would run the
+# later `cat` under an attacker-controlled PATH if the chain were ever
+# allowlisted. The round-1 fix denylisted exec-influencing assignment names
+# inside the (now-reverted) per-segment split; after the revert this denies
+# for the blunter reason every `;`-joined command now denies for, so the
+# security property (still DENY) holds unchanged.
+assert_rc "125 PATH=/tmp/evil; cat live settings.json still denies (HIMMEL-3465)" 2 \
+    "$(bash_rc_of "$PRIMARY" "PATH=/tmp/evil; cat \$PRIMARY/.claude/settings.json")"
+
+# 126: newline-in-segment write shape (/pr-check critic panel round 2,
+# Critical, 2026-09-23) — a `;`-segment that itself embeds a real newline.
+# The round-2 fix closed a gap specific to the (now-reverted) per-segment
+# assignment shortcut; after the revert this denies for the same blunter
+# bare-`;` veto reason as 121-125, so the security property (still DENY)
+# holds unchanged.
+CMD126=$'X=1\nsed -i s/a/b/ .claude/settings.json; jq \'.foo\' .claude/settings.json'
+assert_rc "126 newline-in-segment write still denies (HIMMEL-3465)" 2 \
+    "$(bash_rc_of "$PRIMARY" "$CMD126")"
+
 # Clean up worktree registrations before removing the sandbox (avoids
 # dangling `git worktree` admin records under SANDBOX/primary).
 git -C "$SANDBOX/primary" worktree remove --force "$SANDBOX/primary/.claude/worktrees/feat+x" 2>/dev/null || true

@@ -423,8 +423,13 @@ mentions_primary_or_home() {
             *) c_noquotes=${c_noquotes//"$own_root_lc/"/} ;;
         esac
     fi
+    # Only the primary root's OWN .claude counts as live — matching
+    # primary_root_lc as a bare substring anywhere also matched any command
+    # that merely mentions the primary checkout's resolved path with no
+    # .claude reference at all, over-denying that command (HIMMEL-3465).
+    # Same /.claude-adjacency treatment as home_root_lc below.
     if [ -n "$primary_root_lc" ]; then
-        case "$c_noquotes" in *"$primary_root_lc"*) return 0 ;; esac
+        case "$c_noquotes" in *"$primary_root_lc/.claude"*) return 0 ;; esac
     fi
     # Only the resolved $HOME's OWN .claude counts as live — matching
     # home_root_lc as a bare substring anywhere also matched an unrelated
@@ -454,6 +459,18 @@ mentions_primary_or_home() {
 # read-only programs, invoked alone (no chaining/redirection metacharacter
 # anywhere, so a trailing `&& rm -rf /` can't ride in on an allowlisted
 # first verb).
+# ponytail: a bare `;` vetoes the whole command unconditionally, even when
+# every `;`-separated segment is independently read-only (e.g.
+# `SP=/some/path; jq '...' "$SP/a.json"; jq '...' "$SP/b.json"` denies).
+# HIMMEL-3465/3517 panel rounds 2 and 3 both found a real bypass in a
+# narrower per-segment allowlist (a same-line assignment shortcut riding
+# past a later write on a newline-embedded segment; the same shortcut then
+# recurring for a different segment shape one round later) — rising-severity
+# findings concentrated in that one surface, so panel-first-pass.sh's own
+# HALT-and-simplify signal fired and the per-segment split was reverted back
+# to this blunt veto rather than patched a third time. A real fix needs
+# quote-aware tokenization of the whole command, not another metacharacter
+# scan. Upgrade path: HIMMEL-3546 (quote-aware tokenizer ticket).
 is_readonly_allowlisted() {
     local c="$1" first second
     # shellcheck disable=SC2016 # literal metacharacter text, not expansion
@@ -509,9 +526,13 @@ mentions_dot_claude_dir_dest() {
 # denies when a `.claude` destination is named too, i.e. fail-closed.
 has_write_verb_or_target_flag() {
     local out
+    # -t/--target-directory is a flag of the copy/move-shaped verbs below
+    # (`cp -t`, `install -t`), never a standalone signal — matched on its own
+    # it also caught unrelated tools that reuse -t for something else
+    # (`ls -t` sorts by time; `ls -t ~/.claude/…` false-denied, HIMMEL-3465).
+    # A verb match already returns 0 below, so gating -t on that same verb
+    # list adds no case the verb check doesn't already cover.
     out=$(printf '%s' "$1" | grep -E '(^|[^a-z0-9_])(cp|mv|install|rsync|ln|dd|tee)([^a-z0-9_]|$)') || true
-    [ -n "$out" ] && return 0
-    out=$(printf '%s' "$1" | grep -E '(^|[^a-z0-9_-])(-t|--target-directory)([^a-z0-9_-]|$)') || true
     [ -n "$out" ] && return 0
     return 1
 }

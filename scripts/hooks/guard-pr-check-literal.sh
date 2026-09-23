@@ -141,17 +141,43 @@ case "$tool" in Bash|"") ;; *) exit 0 ;; esac
 # them, so 'scripts/cr/x', scripts/cr/\x and $'scripts/cr/x' all read as
 # what they spell.
 # A backslash-newline is a line continuation: the shell joins it away first.
+# ponytail: this quote-strip is what lets a single-quoted backtick SPAN used
+# as inert markdown-style prose (a `sed -i 's/x/`bash scripts\/cr\/review-
+# round.sh`/'` replacement string, HIMMEL-3517 console repro 2026-09-23)
+# still deny below — once the quotes are gone, that backtick reads exactly
+# like a real command-substitution backtick, and `simple`'s split on backtick
+# (below) then treats the enclosed text as a command word of its own. A real
+# fix needs quote-aware tokenization (know which backtick was inside a
+# quote), not a wider text scan; same shared limitation as
+# block-edit-live-settings.sh's is_readonly_allowlisted() and a quoted `|`.
+# Upgrade path: HIMMEL-3517 follow-up, if this recurs.
 flat=${cmd//$'\\\n'/}
 flat=${flat//[\'\"\\]/}
 # A glob or brace list can spell a guarded name without either substring
 # (scripts/c[r]/pr-chec[k]-context.sh), so it passes on to classification;
 # so does any case of the names, which a case-insensitive filesystem folds.
-names_target() { # names_target <text> - mentions pr-check or a target's stem, in any case
+names_target() { # names_target <text> - mentions pr-check or a target's exact
+    # scripts/cr/<name> path token, in any case. A bare stem substring also
+    # matched inside an unrelated file name that happens to contain it (a
+    # test suite's own name, e.g. test-cr-scores.sh contains "cr-scores"),
+    # which then made every $VAR token elsewhere in the same command look
+    # unresolvable (HIMMEL-3517) - so a target only counts here when its stem
+    # is immediately preceded by "cr/", never as a substring anywhere else.
     local t rc=1
     shopt -s nocasematch
     case "$1" in *pr-check*) rc=0 ;; esac
     for t in $TARGETS; do
-        case "$1" in *"${t%.sh}"*) rc=0 ;; esac
+        # ponytail: this is a PREFIX-stem match (cr/<stem>*), so a filename
+        # that merely STARTS WITH a guarded stem after "cr/" (e.g. a target
+        # named "foo.sh" also matches "cr/foo-other.sh") counts as a mention
+        # even though it names a different file (codex-2 panel finding,
+        # round 5, HIMMEL-3517, deferred by console ruling on
+        # K-N431-7980c9b9). Over-matching here only makes `mentions` MORE
+        # likely to be 1, which routes the command into the slower,
+        # stricter classification path below rather than the early
+        # fast-exit - the safe direction (a false-deny residual, not a
+        # hole). Upgrade path: HIMMEL-3546 (quote/token-aware matching).
+        case "$1" in *[cC][rR]/"${t%.sh}"*) rc=0 ;; esac
     done
     shopt -u nocasematch
     return "$rc"
@@ -257,10 +283,62 @@ for x in $simple; do
     esac
     case "$x" in
         -exec|-ok) runs=1 ;;
-        -execdir|-okdir) runs=1; chdir=1 ;;
+        -execdir|-okdir) runs=1 ;;
     esac
     [[ "$x" =~ ^[[:upper:]_][[:upper:][:digit:]_]*= ]] && wrapped=1
 done
+# -execdir/-okdir moves find's cwd only while running the word right after
+# it; that word only makes a guarded run unverifiable when it could itself
+# run something (an interpreter, a wrapper, or a target's own name) -
+# otherwise (find ... -execdir grep foo {} \;) it never resolves a path
+# itself, so the {} carve-out below still applies (HIMMEL-3517).
+while IFS= read -r line; do
+    read -r -a lw <<<"$line"
+    j=0
+    while [ "$j" -lt "${#lw[@]}" ]; do
+        case "${lw[$j]}" in
+            -execdir|-okdir)
+                nextw=${lw[$((j + 1))]:-}
+                case "${nextw##*/}" in
+                    ''|bash|sh|zsh|dash|ksh|mksh|busybox|toybox|source|.|eval|time|command|builtin|nohup|nice|stdbuf|sudo|env|exec|timeout|xargs)
+                        chdir=1 ;;
+                    *)
+                        # A path-qualified word (./wrapper, bin/wrapper) names
+                        # an arbitrary file whose behavior this hook cannot
+                        # see, and it runs from find's CHANGED cwd - treat it
+                        # the same as an unverifiable runner (codex-2 panel
+                        # finding, HIMMEL-3517). A bare word (no /) resolves
+                        # via PATH to whatever is installed there, which this
+                        # hook cannot see either - only a SMALL, explicit,
+                        # fixed-behavior read-only allowlist gets the relaxed
+                        # (non-chdir-gating) treatment; every other bare word
+                        # is an unverifiable runner too (codex-1 round-4
+                        # panel finding, HIMMEL-3517: an unknown PATH
+                        # executable was previously treated as safe). sed and
+                        # awk are deliberately NOT on this allowlist even
+                        # without -i/--in-place: sed's `e` command and awk's
+                        # `system()` can execute a guarded relative script
+                        # from find's changed cwd with no in-place flag at all
+                        # (codex-1 round-5 panel finding, HIMMEL-3517) - they
+                        # are not fixed-behavior read-only tools, so they stay
+                        # chdir-gated like every other bare word.
+                        case "$nextw" in
+                            */*) chdir=1 ;;
+                            *)
+                                case "${nextw##*/}" in
+                                    grep|cat|head|tail|wc|ls|stat|file|sha256sum|md5sum)
+                                        is_target "${nextw##*/}" && chdir=1 ;;
+                                    *) chdir=1 ;;
+                                esac
+                                ;;
+                        esac
+                        ;;
+                esac
+                ;;
+        esac
+        j=$((j + 1))
+    done
+done <<<"$simple"
 # find runs the found file itself when {} is the -exec command word.
 [[ "$flat" =~ -(exec|execdir|ok|okdir)[[:space:]]+[^[:space:]]*\{\} ]] && bare_runs=1
 [ "$runs" -eq 1 ] || exit 0

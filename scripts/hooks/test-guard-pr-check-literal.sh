@@ -377,6 +377,84 @@ cp marketplace/plugins/* /tmp/x 2>/dev/null
 ls * > /tmp/o.txt
 find . -name '*.md' -exec grep -l foo {} +
 MENTIONS
+
+# ---- HIMMEL-3517: a target's stem inside an unrelated test-*.sh filename
+# must not flag $VAR tokens elsewhere in the same command as unresolved,
+# and -execdir with a non-interpreter command word keeps the {} carve-out.
+# shellcheck disable=SC2016 # command text, verbatim
+run "bash scripts/cr/test-cr-scores.sh \"\$TMP\" -> allow (HIMMEL-3517)" 0 \
+    "$(payload 'bash scripts/cr/test-cr-scores.sh "$TMP"' "$WT")" "$HR"
+# shellcheck disable=SC2016 # command text, verbatim
+run "CR_LEDGER=\$T/l.jsonl bash scripts/cr/test-ledger-append.sh -> allow (HIMMEL-3517)" 0 \
+    "$(payload 'CR_LEDGER=$T/l.jsonl bash scripts/cr/test-ledger-append.sh' "$WT")" "$HR"
+run "find -execdir grep (non-interpreter) -> allow (HIMMEL-3517)" 0 \
+    "$(payload "find . -name '*.md' -execdir grep foo {} \\;" "$WT")" "$HR"
+
+# codex-2 (/pr-check critic panel, Important, 2026-09-23): -execdir's
+# next-word check only flagged a WORD that is_target recognized by name -
+# an arbitrary path-qualified wrapper (./wrapper) matched neither the
+# known-interpreter list nor is_target, so it fell through as "safe" even
+# though it runs from find's changed cwd and can itself resolve and execute
+# a guarded relative script there. Fixed by treating any path-qualified
+# (contains /) next-word as unverifiable, same as a known wrapper -> deny.
+run "find -execdir ./wrapper (path-qualified, unrecognized) -> deny (HIMMEL-3517, codex-2)" 2 \
+    "$(payload "find . -maxdepth 0 -execdir ./wrapper {} \\;" "$WT")" "$HR"
+
+# codex-1 (/pr-check critic panel round 4, Important, 2026-09-23): a BARE
+# (no /) -execdir command word that codex-2's fix above did not deny fell
+# through as safe whenever it was neither a known interpreter nor a guarded
+# target's own name - an arbitrary PATH executable (randomtool) is exactly
+# as unverifiable as a path-qualified wrapper, and it too runs from find's
+# changed cwd. Fixed by requiring a bare word to match a SMALL, explicit,
+# fixed-behavior read-only allowlist (grep, cat, head, tail, wc, ls, stat,
+# file, sha256sum, md5sum) to keep the relaxed {} carve-out; any other bare
+# word is now chdir-gated like a path-qualified one -> deny.
+run "find -execdir randomtool (bare, unrecognized, not allowlisted) -> deny (HIMMEL-3517, codex-1 round 4)" 2 \
+    "$(payload "find . -maxdepth 0 -execdir randomtool {} \\;" "$WT")" "$HR"
+run "find -execdir sed -i (never allowlisted) -> deny (HIMMEL-3517, codex-1 round 4)" 2 \
+    "$(payload "find . -maxdepth 0 -execdir sed -i s/a/b/ {} \\;" "$WT")" "$HR"
+
+# codex-1 (/pr-check critic panel round 5, Important, 2026-09-23): an
+# earlier version of this fix allowlisted sed/awk without -i/--in-place as
+# "read-only". That is false - sed's `e` command and awk's `system()` can
+# execute an arbitrary command, including a guarded relative script, from
+# find's changed cwd with no in-place flag at all. Per the console's ruling
+# on K-N431-7980c9b9 (option 2), sed and awk are dropped from the allowlist
+# ENTIRELY - they now stay chdir-gated the same as every other bare word,
+# in-place or not.
+# No scripts/cr/ mention in either payload below - deliberately, so the
+# deny can only come from the -execdir chdir-gate itself (same isolation as
+# the "randomtool" row above), never from the unrelated direct-mention deny
+# path. At the base (round-4) hook, sed/awk without -i/--in-place stayed
+# off the chdir gate (is_target("sed"/"awk") is false), so these ALLOWED
+# despite sed's `e` command / awk's `system()` being able to execute
+# anything - the exact gap codex-1 flagged in round 5.
+run "find -execdir sed e (no -i, but sed's e command executes) -> deny (HIMMEL-3517, codex-1 round 5)" 2 \
+    "$(payload "find . -maxdepth 0 -execdir sed -n 'e ls' {} \\;" "$WT")" "$HR"
+run "find -execdir awk system() (no -i, but system() executes) -> deny (HIMMEL-3517, codex-1 round 5)" 2 \
+    "$(payload "find . -maxdepth 0 -execdir awk 'BEGIN{system(\"ls\")}' {} \\;" "$WT")" "$HR"
+# Positive controls: the shapes these fixes must NOT widen stay denied.
+# shellcheck disable=SC2016 # command text, verbatim
+run "control: bash scripts/cr/\$X (real unresolved target) -> still deny" 2 \
+    "$(payload 'bash scripts/cr/$X' "$WT")" "$HR"
+
+# Documented residual (console FINDING, 2026-09-23, K-N431-7980c9b9): a
+# `sed -i` edit whose SINGLE-QUOTED sed script contains a backtick span
+# naming a gate-script stem as inert markdown-style prose (not a real
+# command substitution - the surrounding single quotes make the backtick
+# inert to the shell), targeting a literal (resolvable) path, still denies.
+# Quotes are stripped before classification (ponytail comment above
+# `flat=`), so the guard cannot tell that backtick was quoted; it reads
+# identically to a real one. A real fix needs quote-aware tokenization; not
+# attempted here - reported to the console rather than chased under a
+# narrow tightening. (Target is a literal path, not $TMP, so the deny is
+# provably the backtick-span misread and not the unrelated unresolved-var
+# check that a $VAR-suffixed path would also trip.)
+run "ponytail: sed-i backtick span in single-quoted replacement text still denies (HIMMEL-3517)" 2 \
+    "$(payload "sed -i 's/x/y \`bash scripts/cr/review-round.sh\` z/' handover.md" "$WT")" "$HR" # gnu-ok: fixture text fed to the hook as tool_input.command, never executed
+run "control: find -execdir bash <target> -> still deny" 2 \
+    "$(payload "find . -maxdepth 0 -execdir bash scripts/cr/pr-check-context.sh +" "$WT")" "$HR" # gnu-ok: fixture text fed to the hook as tool_input.command, never executed
+
 run "the anchored fence on an edited branch -> no-op" 0 "$(payload "$FENCE_TEXT" "$WT")" "$HR"
 run "HIMMEL_REPO re-pointed before the fence -> deny" 2 \
     "$(payload "export HIMMEL_REPO=.; $FENCE_TEXT" "$WT")" "$HR"

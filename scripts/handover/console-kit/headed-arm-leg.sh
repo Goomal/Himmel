@@ -798,6 +798,88 @@ if [ -n "$PROFILE" ]; then
             exit 2
         fi
     fi
+    # HANDOVER_DIR reaches this wrapper as a plain exported string, which may
+    # carry a trailing slash a caller happened to set. Normalize it once
+    # through `cd -P && pwd -P` (the kit's own canonicaliser, matching
+    # handover-path.sh's physical resolution) so both the root-equality
+    # check below and the .locks deny pattern compare against the SAME
+    # canonical form _leg_doc_dir (also `cd -P && pwd -P`-derived) uses - a
+    # raw trailing-slash HANDOVER_DIR would otherwise silently bypass both
+    # (CR round 3, codex-1), and a symlink component would otherwise let a
+    # doc dir reached through it evade the comparison (CR round 5, codex-2).
+    _leg_handover_dir_norm=""
+    if [ -n "${HANDOVER_DIR:-}" ]; then
+        _leg_handover_dir_norm="$(cd -P "$HANDOVER_DIR" 2>/dev/null && pwd -P)"
+        if [ -z "$_leg_handover_dir_norm" ]; then
+            echo "headed-arm-leg: --profile $PROFILE: HANDOVER_DIR='$HANDOVER_DIR' is not a directory" >&2
+            exit 2
+        fi
+    fi
+    # (HIMMEL-3285) A leg writes its Results bullets to its own handover doc,
+    # which sits outside the leg's working directories whenever the resolved
+    # handover root is external (Mode B) or the doc's own root otherwise -
+    # the auto-mode classifier inconsistently refuses those writes as
+    # Out-of-Place Publication. Grant only the DOC's own directory, never the
+    # whole handover root: console-kit/go.sh's merge GO is authenticated only
+    # by the EXISTENCE of <handover_root>/.locks/go/<pr>.<sha> (go-gate.sh,
+    # merge-on-green.sh), with no hook guarding that path today - widening a
+    # leg's grant to the root would auto-approve its own Write there, letting
+    # a leg mint its own merge GO. The doc's directory is a strict subdir of
+    # the leg's own bucket (handovers/<user>/<repo>/...), which never
+    # contains .locks/ (that sits at the handover ROOT) - verified below
+    # rather than assumed, so a doc placed directly AT the root can never
+    # collapse this grant back to the whole root (CR round 2, codex-1).
+    # A doc directory that EQUALS the handover root, or is an ANCESTOR of it
+    # (CR round 4, codex-1, fixed per HIMMEL-3544), must never be granted:
+    # additionalDirectories would then cover the whole root - and its
+    # .locks/ - the exact privilege this grant exists to avoid. Rather than
+    # refusing the launch outright (round-3 behaviour for the equal case),
+    # skip the grant and fall back to today's classifier behaviour for this
+    # leg's own doc writes; the launch still succeeds. Compared as canonical
+    # absolute paths (both `cd -P && pwd -P`-derived, so a symlinked doc
+    # directory resolves physically too) so a lookalike prefix like /a/bc
+    # is never mistaken for an ancestor of /a/b.
+    # When HANDOVER_DIR could not be resolved at all, _leg_handover_dir_norm
+    # is empty and the root/ancestor comparison below cannot run - an
+    # unknown root can never be proven safe, so treat that the same as a
+    # confirmed root/ancestor match rather than falling through to an
+    # ungated grant (CR round 5, codex-1).
+    if [ -n "$DOC" ] && _leg_doc_dir="$(cd -P "$(dirname "$DOC")" 2>/dev/null && pwd -P)"; then
+        _leg_doc_is_root_or_ancestor=0
+        if [ -z "$_leg_handover_dir_norm" ]; then
+            _leg_doc_is_root_or_ancestor=1
+        elif [ "$_leg_doc_dir" = "$_leg_handover_dir_norm" ]; then
+            _leg_doc_is_root_or_ancestor=1
+        else
+            case "$_leg_handover_dir_norm" in
+                "$_leg_doc_dir"/*)
+                    _leg_doc_is_root_or_ancestor=1
+                    ;;
+            esac
+        fi
+        if [ "$_leg_doc_is_root_or_ancestor" -eq 1 ]; then
+            echo "headed-arm-leg: --profile $PROFILE: leg doc directory ($_leg_doc_dir) is the handover root or an ancestor of it, or HANDOVER_DIR could not be resolved (HANDOVER_DIR='${HANDOVER_DIR:-}') - skipping additionalDirectories grant for it" >&2
+        elif ! PROFILE_JSON="$(printf '%s' "$PROFILE_JSON" | jq --arg dir "$_leg_doc_dir" \
+            '.permissions.additionalDirectories = ((.permissions.additionalDirectories // []) + [$dir])')"; then
+            echo "headed-arm-leg: --profile $PROFILE: cannot add the leg doc's directory to additionalDirectories" >&2
+            exit 2
+        fi
+    fi
+    unset -v _leg_doc_dir _leg_doc_is_root_or_ancestor
+    # Belt and braces: even scoped to the doc's own directory, deny Edit/
+    # Write/MultiEdit/NotebookEdit on the handover root's .locks/** outright.
+    # Deny wins over additionalDirectories, so this holds even if a future
+    # change widens the grant back toward the root. Gated the same as the
+    # EnterWorktree deny above: the relay never works in a worktree and
+    # keeps its settings as they are.
+    if [ "$RELAY" -eq 0 ] && [ -n "$_leg_handover_dir_norm" ]; then
+        if ! PROFILE_JSON="$(printf '%s' "$PROFILE_JSON" | jq --arg dir "$_leg_handover_dir_norm" \
+            '.permissions.deny = ((.permissions.deny // []) + (["Edit","Write","MultiEdit","NotebookEdit"] | map(. + "(" + $dir + "/.locks/**)")))')"; then
+            echo "headed-arm-leg: --profile $PROFILE: cannot add the .locks deny to settings JSON" >&2
+            exit 2
+        fi
+    fi
+    unset -v _leg_handover_dir_norm
     # (HIMMEL-2990) Native lane only - the claudex lane keeps its own
     # coordination preface untouched. Resolved even under --dry-run, same
     # reasoning as the profile/mcp resolution above: a jq failure here must

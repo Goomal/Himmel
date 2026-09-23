@@ -32,6 +32,9 @@ const path = require('path');
 const readline = require('readline');
 const { spawnSync } = require('child_process');
 const { cacheDir, profileForVault, which, resolvePowershell, displayPath, shellQuote, nodeScriptCmd } = require('./lib/helpers.js');
+const launcherLib = require('./lib/launcher.js');
+const uninstallWrapperLib = require('./lib/uninstall-wrapper.js');
+const standaloneBundleLib = require('./lib/standalone-bundle.js');
 const stateLib = require('./lib/state.js');
 const statusReportLib = require('./lib/status-report.js');
 const installEngineLib = require('./lib/install-engine.js');
@@ -2446,7 +2449,18 @@ function displayCommand(cmd) {
 // operator pastes the line from whatever project the install summary was
 // printed for, where a clone-relative `scripts/himmelctl/bin.js` is not found.
 function printUninstallFooter() {
-  console.log(`To uninstall later: ${nodeScriptCmd(__filename)} uninstall`);
+  const bundleDir = standaloneBundleLib.bundleDir();
+  let bundleOk = false;
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(bundleDir, 'bundle.json'), 'utf8'));
+    bundleOk = meta && meta.marker === standaloneBundleLib.BUNDLE_MARKER;
+  } catch (_e) { /* no bundle, or not ours */ }
+  if (bundleOk) {
+    console.log(`To uninstall later: ${nodeScriptCmd(__filename)} uninstall (if you delete ${primaryCheckoutRoot()} first, the fallback still works: ${nodeScriptCmd(path.join(bundleDir, 'standalone.js'))} uninstall)`);
+    // ^ nodeScriptCmd already prefixes "node " and quotes the path when needed.
+  } else {
+    console.log(`To uninstall later: ${nodeScriptCmd(__filename)} uninstall`);
+  }
 }
 
 // Spawn the derived command VERBATIM (stdio inherit) and propagate its exit
@@ -4420,18 +4434,9 @@ async function cmdInstall(args) {
 // path/hook/settings key, and reading it from one place keeps the preview and
 // the teardown from drifting. --purge-state is the code-vs-state switch; the
 // default (absent) keeps operator state.
-function deriveUninstallCommand(args = {}) {
-  const scriptsDir = path.join(repoRoot(), 'scripts');
-  if (process.platform === 'win32') {
-    const argv = [resolvePowershell(), '-ExecutionPolicy', 'Bypass', '-File', path.join(scriptsDir, 'uninstall.ps1')];
-    argv.push(args.dryRun ? '-DryRun' : '-Yes');
-    if (args.purgeState) argv.push('-PurgeState');
-    return { argv };
-  }
-  const argv = [resolveBash(), toBashPath(path.join(scriptsDir, 'uninstall.sh')), args.dryRun ? '--dry-run' : '--yes'];
-  if (args.purgeState) argv.push('--purge-state');
-  return { argv };
-}
+// deriveUninstallCommand lives in lib/uninstall-wrapper.js now (HIMMEL-3312
+// S13 item 2), parameterized on repoRoot/bashPath instead of calling
+// repoRoot()/resolveBash() itself.
 
 // HIMMEL-755 sub-ticket E (uninstall-completeness, operator LOCKED
 // 2026-07-17): uninstall.sh/.ps1 already tears down himmel's OWN wiring
@@ -4627,92 +4632,45 @@ function operatorStateBanner(purgeState) {
   })];
 }
 
+// A thin bin.js-side wrapper around lib/uninstall-wrapper.js's
+// runUninstallWrapper (HIMMEL-3312 S13 item 2): builds the header/afterRun
+// closures bin.js owns (the manifest-driven offboard plan + the post-teardown
+// completeness check — both clone-dependent, so standalone.js's own call
+// skips them) and passes resolveBash()/repoRoot(). The TTY/--yes/spawn/
+// launcher-removal logic itself now lives in the wrapper module.
 async function cmdUninstall(args) {
-  const cmd = deriveUninstallCommand(args);
-  console.log('himmelctl: this will offboard himmel from this machine —');
-  console.log('  plugins, scheduled jobs, git hooks, and settings.json wiring.');
-  for (const line of operatorStateBanner(args.purgeState)) console.log(line);
-  console.log(`derived: ${displayCommand(cmd)}`);
-
   // Guard the manifest load: uninstall is the "thin wrapper, always works,
-  // last resort" escape hatch (see the design comment above cmdUninstall) —
-  // a missing/malformed scripts/install/manifest.json must never abort the
+  // last resort" escape hatch (see the design comment above operatorStateBanner)
+  // — a missing/malformed scripts/install/manifest.json must never abort the
   // whole uninstall (loadManifest()/partitionOffboard() throw uncaught
   // otherwise, which main()'s catch turns into a hard exit(1), even under
   // --dry-run). On failure, WARN and skip ONLY the manifest-driven advisory
-  // plan + completeness check; the derive->confirm->spawn teardown below
-  // still runs unconditionally, same as before this sub-ticket existed.
+  // plan + completeness check; the derive->confirm->spawn teardown still
+  // runs unconditionally, same as before this sub-ticket existed.
   let offboard = null;
-  try {
-    const manifest = loadManifest();
-    offboard = partitionOffboard(manifest);
-    printOffboardPlan(offboard.unwireItems, offboard.adviseItems, offboard.keepItems);
-  } catch (e) {
-    console.error(`himmelctl: WARN: could not read manifest.json (${e.message}) — skipping offboard plan/completeness check`);
-  }
-
-  // --dry-run asks nothing and removes nothing: it runs the executor in its own
-  // --dry-run, which prints every path/plugin/hook/settings key it WOULD touch
-  // (HIMMEL-3058). No HIMMEL_UNINSTALL_REAL_HOME here — the wet-run fence is
-  // for wet runs; a dry run is never fenced. No completeness check or launcher
-  // removal either: nothing was torn down.
-  if (args.dryRun) return runSpawn(cmd);
-
-  // HIMMEL-2755: EOF and an explicit "n" are DIFFERENT facts and a caller that
-  // records an offboard must be able to tell them apart. A closed/non-tty
-  // stdin without --yes is a REFUSAL (rc=2, fail-closed, same code and same
-  // remedy as uninstall.sh's own non-interactive abort), not a decline.
-  if (!args.yes) {
-    // WHY (HIMMEL-2755): a pipe cannot consent AND must not be able to stall
-    // a teardown; uninstall.sh:676's [ -t 0 ] && [ -t 1 ] is the twin.
-    if (!process.stdin.isTTY || !process.stdout.isTTY) {
-      console.error('himmelctl: ERROR: non-interactive run without --yes — aborting (fail-closed).');
-      console.error('  Re-run with --yes to confirm, or --dry-run to preview.');
-      return 2;
+  const header = (purgeState) => {
+    console.log('himmelctl: this will offboard himmel from this machine —');
+    console.log('  plugins, scheduled jobs, git hooks, and settings.json wiring.');
+    for (const line of operatorStateBanner(purgeState)) console.log(line);
+    try {
+      const manifest = loadManifest();
+      offboard = partitionOffboard(manifest);
+      printOffboardPlan(offboard.unwireItems, offboard.adviseItems, offboard.keepItems);
+    } catch (e) {
+      console.error(`himmelctl: WARN: could not read manifest.json (${e.message}) — skipping offboard plan/completeness check`);
     }
-    const EOF = '\u0000himmelctl-eof';
-    const ans = await askConfirmSafe('Proceed? [y/N] ', EOF);
-    if (ans === EOF) {
-      console.error('himmelctl: ERROR: non-interactive run without --yes — aborting (fail-closed).');
-      console.error('  Re-run with --yes to confirm, or --dry-run to preview.');
-      return 2;
-    }
-    // Default-No (HIMMEL-3328): a bare Enter or anything but y/yes declines.
-    if (!/^\s*(y|yes)\s*$/i.test(ans)) {
-      console.log('himmelctl: declined; nothing run.');
-      return 3;
-    }
-  }
-  // HIMMEL-2505: this is the ONE spawn that runs uninstall.sh/.ps1 WET, after
-  // the human's own confirm above — tell it so its own live-operator-HOME
-  // fence doesn't refuse the very machine the operator just confirmed
-  // offboarding. The dry-run/plan path above never reaches here.
-  const rc = runSpawn(cmd, { env: { ...process.env, HIMMEL_UNINSTALL_REAL_HOME: '1' } });
-  if (offboard) checkUninstallCompleteness(offboard.unwireItems);
-  // HIMMEL-1446 r4 (codex-1/codex-adv converged blocker): strip the managed
-  // PATH launchers ONLY when the teardown succeeded. A failed teardown (rc!=0)
-  // leaves the machine in a partial state and the user will likely retry, so
-  // removing the launchers now would strand the machine with no working
-  // `himmelctl` for the retry. Preserve them and WARN naming the failure.
-  if (rc === 0) {
-    removeHimmelctlLaunchers();
-  } else {
-    console.error(`himmelctl: WARN: uninstall teardown exited ${rc} — PATH launchers left in place; fix the failure and re-run \`himmelctl uninstall\`.`);
-  }
-  return rc;
+  };
+  const afterRun = () => {
+    if (offboard) checkUninstallCompleteness(offboard.unwireItems);
+  };
+  return uninstallWrapperLib.runUninstallWrapper(args, { bashPath: resolveBash(), repoRoot: repoRoot(), header, afterRun });
 }
 
 // ── PATH launcher (HIMMEL-1446) ──────────────────────────────────────────
 //
-// setup.sh already treats ~/.local/bin as himmel's shared user-bin directory
-// (uv, jira, pre-commit). Reuse it rather than inventing another PATH surface.
-// HIMMELCTL_BIN_DIR / HIMMELCTL_SHIM_PLATFORM are hermetic-test seams; normal
-// runs always use ~/.local/bin and the real process platform.
-function himmelctlBinDir() {
-  if (process.env.HIMMELCTL_BIN_DIR) return path.resolve(process.env.HIMMELCTL_BIN_DIR);
-  return path.join(process.platform === 'win32' ? os.homedir() : (process.env.HOME || os.homedir()), '.local', 'bin');
-}
-
+// himmelctlBinDir lives in lib/launcher.js now (HIMMEL-3312 S13 item 1).
+// HIMMELCTL_SHIM_PLATFORM is a hermetic-test seam; normal runs always use the
+// real process platform.
 function himmelctlShimPlatform() {
   return process.env.HIMMELCTL_SHIM_PLATFORM || process.platform;
 }
@@ -4765,7 +4723,8 @@ function printHimmelctlPathInstruction(binDir, platform) {
 //    to ExecutionPolicy=Restricted → bare `himmelctl` throws PSSecurityException.
 //    Letting PowerShell resolve the .cmd avoids that. A stale marked .ps1 from a
 //    prior install is removed (removeMarkedLauncher).
-const SHIM_MARKER = 'generated by himmelctl (HIMMEL-1446)';
+// SHIM_MARKER, fileCarriesMarker, writeMarkedLauncher, removeMarkedLauncher and
+// removeHimmelctlLaunchers now live in lib/launcher.js (HIMMEL-3312 S13 item 1).
 
 // Resolve the PRIMARY checkout root — the parent of `git rev-parse
 // --git-common-dir` — so a launcher written from a linked feature worktree
@@ -4814,89 +4773,25 @@ function sameFsEntry(a, b) {
   }
 }
 
-// True iff <filePath> exists and its contents carry our ownership marker. An
-// absent file is "not marked" (ENOENT -> false); any other read error throws.
-function fileCarriesMarker(filePath) {
-  let content;
-  try {
-    content = fs.readFileSync(filePath, 'utf8');
-  } catch (e) {
-    if (e && e.code === 'ENOENT') return false;
-    throw e;
-  }
-  return content.includes(SHIM_MARKER);
-}
-
-// Write <contents> to <dest> (optional <mode> for chmod), but ONLY when dest is
-// absent OR already carries our ownership marker. A third-party file, an
-// operator's hand-written launcher, or a symlink (lstat, never followed) is
-// refused with a clear message — never clobbered. Writes go via a sibling tmp +
-// atomic rename, so a crash mid-write or a failed write can never leave a
-// partial launcher at dest (the orphaned tmp is a hidden dotfile). Returns true
-// on success, false on a refused collision. Throws on I/O error. (codex-adv-3.)
-function writeMarkedLauncher(dest, contents, mode) {
-  // Existence is probed with lstatSync, NOT fs.existsSync (HIMMEL-1446 r4 glm-2):
-  // existsSync FOLLOWS symlinks, so a BROKEN (dangling) symlink at dest returns
-  // false, skipping the symlink/ownership check and letting renameSync clobber
-  // the link — violating the never-clobber-a-symlink contract. lstatSync never
-  // follows, so ANY symlink (broken included) reaches the isSymbolicLink()
-  // refusal. ENOENT (truly absent) is the only skip-to-write case.
-  let st = null;
-  try {
-    st = fs.lstatSync(dest);
-  } catch (e) {
-    if (e && e.code !== 'ENOENT') throw e; // ENOENT -> st stays null: absent, safe to write
-  }
-  if (st) {
-    if (st.isSymbolicLink()) {
-      console.error(`himmelctl: refusing to overwrite symlink ${dest} (remove it first if you want himmelctl to manage it)`);
-      return false;
-    }
-    if (!fileCarriesMarker(dest)) {
-      console.error(`himmelctl: refusing to overwrite ${dest} (not a himmelctl-managed file — move it aside first)`);
-      return false;
-    }
-  }
-  const tmp = path.join(path.dirname(dest), `.${path.basename(dest)}.${process.pid}.tmp`);
-  const recorded = provBefore(dest, { kind: 'shim', scope: 'user', cls: 'code' });
-  try {
-    fs.writeFileSync(tmp, contents, 'utf8');
-    if (mode !== undefined) fs.chmodSync(tmp, mode);
-    fs.renameSync(tmp, dest);
-    recorded();
-  } catch (e) {
-    try { fs.unlinkSync(tmp); } catch (_e) { /* best-effort tmp cleanup */ }
-    throw e;
-  }
-  return true;
-}
-
-// Remove <filePath> only if it carries our ownership marker; an unmarked file
-// (a third-party `himmelctl`) or a symlink is left untouched. Absent file is a
-// no-op. Used by the shim (stale .ps1 cleanup) and cmdUninstall.
-function removeMarkedLauncher(filePath) {
-  let st;
-  try {
-    st = fs.lstatSync(filePath);
-  } catch (e) {
-    if (e && e.code === 'ENOENT') return;
-    throw e;
-  }
-  if (st.isSymbolicLink()) return; // never follow/remove an unowned symlink
-  if (!fileCarriesMarker(filePath)) return; // never remove an unmarked file
-  fs.unlinkSync(filePath);
-}
-
 function applyHimmelctlPathShim(args) {
-  const binDir = himmelctlBinDir();
+  const binDir = launcherLib.himmelctlBinDir();
   const platform = himmelctlShimPlatform();
-  const target = path.join(primaryCheckoutRoot(), 'scripts', 'himmelctl', 'bin.js');
+  const repoRootPath = primaryCheckoutRoot();
+  const target = path.join(repoRootPath, 'scripts', 'himmelctl', 'bin.js');
+  const fallback = path.join(standaloneBundleLib.bundleDir(), 'standalone.js');
   if (args.dryRun) {
     console.log(`DRY: himmelctl launcher -> ${target} (would write to ${binDir})`);
+    console.log(`DRY: standalone uninstaller -> ${standaloneBundleLib.bundleDir()}`);
     prov(['create', 'shim', path.join(binDir, platform === 'win32' ? 'himmelctl.js' : 'himmelctl'), '--scope', 'user', '--class', 'code', '--dry-run']);
     printHimmelctlPathInstruction(binDir, platform);
     return true;
   }
+
+  // The bundle is written BEFORE the launcher (design §3.3): a launcher must
+  // never point at a fallback that does not exist yet. Best-effort, same
+  // posture as the launcher write itself — a failed bundle write WARNs
+  // (inside writeStandaloneBundle) and never blocks the PATH launcher.
+  standaloneBundleLib.writeStandaloneBundle(repoRootPath);
 
   try {
     fs.mkdirSync(binDir, { recursive: true });
@@ -4905,11 +4800,16 @@ function applyHimmelctlPathShim(args) {
     // own `if (require.main === module)` guard (HIMMEL-2438) never fires and
     // main() silently never runs (rc 0, no output). A child process always
     // has its own require.main === itself, so the guard passes as intended.
-    const jsBody = `'use strict';\n// ${SHIM_MARKER}\nconst { status } = require('child_process').spawnSync(process.execPath, [${JSON.stringify(target)}, ...process.argv.slice(2)], { stdio: 'inherit' });\nprocess.exit(status === null ? 1 : status);\n`;
-    if (!writeMarkedLauncher(path.join(binDir, 'himmelctl.js'), jsBody)) return false;
+    //
+    // design §7: two absolute paths are embedded at write time — the clone
+    // target and the bundle fallback — and the first that exists on disk at
+    // RUN time (not write time) is used, so a launcher written while the
+    // clone is present still falls back correctly once it is later deleted.
+    const jsBody = `'use strict';\n// ${launcherLib.SHIM_MARKER}\nconst fs = require('fs');\nconst t = ${JSON.stringify(target)};\nconst f = ${JSON.stringify(fallback)};\nconst e = fs.existsSync(t) ? t : fs.existsSync(f) ? f : t;\nconst { status } = require('child_process').spawnSync(process.execPath, [e, ...process.argv.slice(2)], { stdio: 'inherit' });\nprocess.exit(status === null ? 1 : status);\n`;
+    if (!launcherLib.writeMarkedLauncher(path.join(binDir, 'himmelctl.js'), jsBody)) return false;
     if (platform === 'win32') {
-      const cmdBody = `@echo off\r\nREM ${SHIM_MARKER}\r\nnode "%~dp0himmelctl.js" %*\r\n`;
-      if (!writeMarkedLauncher(path.join(binDir, 'himmelctl.cmd'), cmdBody)) return false;
+      const cmdBody = `@echo off\r\nREM ${launcherLib.SHIM_MARKER}\r\nnode "%~dp0himmelctl.js" %*\r\n`;
+      if (!launcherLib.writeMarkedLauncher(path.join(binDir, 'himmelctl.cmd'), cmdBody)) return false;
       // No himmelctl.ps1 (codex-adv-1): a stale marked .ps1 from a prior install
       // is removed; an unmarked/symlinked one is left untouched. Removal is a
       // best-effort cleanup of a LEGACY artifact, not part of writing the PATH
@@ -4917,14 +4817,14 @@ function applyHimmelctlPathShim(args) {
       // fail the shim write (HIMMEL-1446 r4 glm-4: previously caught by the
       // surrounding try/catch and misreported as "failed to write PATH launcher").
       try {
-        removeMarkedLauncher(path.join(binDir, 'himmelctl.ps1'));
+        launcherLib.removeMarkedLauncher(path.join(binDir, 'himmelctl.ps1'));
       } catch (e) {
         console.error(`himmelctl: WARN: could not remove stale launcher ${path.join(binDir, 'himmelctl.ps1')} (${e.message}) — the PATH launcher was written; remove the stale file manually if needed`);
       }
     } else {
       const launcher = path.join(binDir, 'himmelctl');
-      const shBody = `#!/usr/bin/env sh\n# ${SHIM_MARKER}\nexec node "$(dirname "$0")/himmelctl.js" "$@"\n`;
-      if (!writeMarkedLauncher(launcher, shBody, 0o755)) return false;
+      const shBody = `#!/usr/bin/env sh\n# ${launcherLib.SHIM_MARKER}\nexec node "$(dirname "$0")/himmelctl.js" "$@"\n`;
+      if (!launcherLib.writeMarkedLauncher(launcher, shBody, 0o755)) return false;
     }
   } catch (e) {
     console.error(`himmelctl: failed to write PATH launcher in ${binDir}: ${e.message}`);
@@ -4936,22 +4836,7 @@ function applyHimmelctlPathShim(args) {
   return true;
 }
 
-// HIMMEL-1446 r2 (glm-1): uninstall.sh/.ps1 tears down himmel's machine wiring
-// but does not know about the PATH launchers install/update wrote into binDir
-// (~/.local/bin), so they'd go stale (dangling once the clone is deleted).
-// Remove each known launcher name that carries our ownership marker; never
-// touch an unmarked or symlinked file. Best-effort: WARNs on errors and never
-// changes cmdUninstall's exit code.
-function removeHimmelctlLaunchers() {
-  const binDir = himmelctlBinDir();
-  for (const name of ['himmelctl.js', 'himmelctl', 'himmelctl.cmd', 'himmelctl.ps1']) {
-    try {
-      removeMarkedLauncher(path.join(binDir, name));
-    } catch (e) {
-      console.error(`himmelctl: WARN: could not remove launcher ${path.join(binDir, name)} (${e.message}) — skipping`);
-    }
-  }
-}
+// removeHimmelctlLaunchers lives in lib/launcher.js now (HIMMEL-3312 S13 item 1).
 
 // ── update (HIMMEL-893) ──────────────────────────────────────────────────
 //
@@ -5102,7 +4987,24 @@ async function cmdStatus(args) {
   // only — the --json summary shape above is byte-stable.
   const notSetUp = report.items.filter((r) => r.desired === true && r.severity === 'n/a').length;
   console.log(`${report.summary.red} red, ${report.summary.degraded} degraded, ${report.summary.green} green, ${report.summary.na} n/a${notSetUp > 0 ? ` (${notSetUp} of them desired but not set up: see the n/a rows above)` : ''}`);
+  printOrphanedBundleInfo();
   return 0;
+}
+
+// HIMMEL-3312 S13 item 7 ("himmelctl doctor"): the health-check surface for
+// a machine that already deleted its clone is `himmelctl status` — there is
+// no separate `doctor` verb in this CLI. A bundle whose ledger-recorded
+// himmel_root is gone is not itself a fault (that IS the standalone path's
+// whole point), so it stays out of the red/degraded/green/n/a item report
+// (and out of --json, whose shape test-wizard-status-golden.sh pins) — this
+// is a one-line INFO surfaced only in the text report.
+function printOrphanedBundleInfo() {
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(standaloneBundleLib.bundleDir(), 'bundle.json'), 'utf8'));
+    if (meta.marker === standaloneBundleLib.BUNDLE_MARKER && meta.himmel_root && !fs.existsSync(meta.himmel_root)) {
+      console.log(`INFO  standalone-uninstaller  clone gone (${meta.himmel_root}); undo with: ${nodeScriptCmd(path.join(standaloneBundleLib.bundleDir(), 'standalone.js'))} uninstall --purge-state`);
+    }
+  } catch (_e) { /* no bundle, or not ours */ }
 }
 
 // ── gaps (HIMMEL-2348 deliverable 2) ─────────────────────────────────────

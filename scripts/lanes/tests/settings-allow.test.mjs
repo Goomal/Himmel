@@ -49,9 +49,15 @@ const ANCHOR_LITERALS = [
 // A model of the documented rule forms, not the harness matcher: `X:*` = X or
 // X plus a space-separated tail; a body with `*` is a glob whose `*` matches
 // any characters (slashes and spaces included), and a trailing ` *` also
-// matches the bare prefix; anything else is exact. It errs toward matching
-// MORE than the harness, which is the safe direction for a "matches nothing"
-// assertion.
+// matches the bare prefix; anything else is exact. It can UNDER-match the
+// real harness — a command that differs only by a run of extra whitespace
+// (a double space the harness may still treat as a separator), or one that
+// reaches a guarded literal through an indirection the harness's own matcher
+// may still resolve (e.g. `xargs bash scripts/cr/x.sh`), can read here as "no
+// rule matches" even though the real matcher would catch it. That is the
+// UNSAFE direction for a "matches nothing" RED assertion: a false negative
+// hides a gap instead of manufacturing one. Treat a RED row that passes here
+// as a lower bound on what the harness refuses, not proof of it.
 function ruleMatches(rule, command) {
   const body = /^Bash\(([\s\S]*)\)$/.exec(rule)?.[1];
   if (body === undefined) return false;

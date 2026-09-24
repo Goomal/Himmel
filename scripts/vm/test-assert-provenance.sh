@@ -186,6 +186,32 @@ mkdir -p "$UD"; echo unit >"$UD/kept.service"; echo new >"$UD/himmel-qmd.service
 run_assert core 0
 has "a unit new since A is left behind" 'CHECK removal too-little FAIL user-units-removed .*himmel-qmd.service'
 
+# ---- 6b. HIMMEL-3541: the standalone uninstall bundle and provenance-backups/
+# are himmel's own, but --purge-state-only removals (uninstall.sh keeps both by
+# design on a plain uninstall) -- a plain run must not flag them as residue.
+UB="$H/.himmel/uninstall" PB="$H/.himmel/provenance-backups"
+fresh
+inv C d "$UB"; inv C f "$UB/bundle.json" bj
+inv C d "$PB"; inv C f "$PB/provenance.jsonl.bak" bak
+run_assert core 0
+hasnt "plain: the uninstall bundle is not residue" 'CHECK residue [a-z-]+ FAIL [a-z]+:~/\.himmel/uninstall'
+hasnt "plain: provenance-backups is not residue" 'CHECK residue [a-z-]+ FAIL [a-z]+:~/\.himmel/provenance-backups'
+
+# ---- 6c. HIMMEL-3541 sizing: three more named/cited residue exemptions --
+# npm's own update-notifier file, the emptied project scripts/{guardrails,lib}
+# dirs (manifest class NEVER for the containing tree), and the ~/.codex
+# directory itself (himmel only ever owns the AGENTS.md file inside it).
+NU="$H/.npm/_update-notifier-last-checked" PSG="$H/proj/scripts/guardrails" PSL="$H/proj/scripts/lib" CX="$H/.codex"
+fresh
+inv C f "$NU" ts
+inv C d "$PSG"; inv C d "$PSL"
+inv C d "$CX"
+run_assert core 0
+hasnt "plain: npm update-notifier file is not residue" 'CHECK residue [a-z-]+ FAIL [a-z]+:~/\.npm/_update-notifier-last-checked'
+hasnt "plain: emptied proj/scripts/guardrails is not residue" 'CHECK residue [a-z-]+ FAIL [a-z]+:~/proj/scripts/guardrails'
+hasnt "plain: emptied proj/scripts/lib is not residue" 'CHECK residue [a-z-]+ FAIL [a-z]+:~/proj/scripts/lib'
+hasnt "plain: the ~/.codex directory itself is not residue" 'CHECK residue [a-z-]+ FAIL [a-z]+:~/\.codex —'
+
 # ---- 7. cadence-crontab-armed-at-B (profile all only).
 fresh
 printf '17 3 * * * /bin/true # seed\n' >"$LB/seed-state/crontab.txt"; cp "$LB/seed-state/crontab.txt" "$FAKE_CRON"

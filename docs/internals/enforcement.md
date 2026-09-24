@@ -1426,7 +1426,9 @@ network URL passes, unless the same command repoints a remote. In that case
 - or a `git remote add|set-url` clause anywhere in the command line.
 
 A repoint made by an earlier, separate command (`git config remote.x.url …`)
-is not seen; HIMMEL-3407 covers it.
+is still not seen — cross-command state tracking is out of scope for a
+command-text scanner, and HIMMEL-3407's common-dir-owner check (below) only
+reasons about the SAME clause.
 
 Before the verb match, quotes are dropped, backslash escapes are undone
 (`\git`, `gi\t`, `\-C`), backslash-newline continuations are joined, ANSI-C
@@ -1436,11 +1438,81 @@ word the shell runs. Direct-exec mode fails closed on input it cannot read:
 empty or non-JSON stdin, a non-object, a missing `tool_name`, or a
 Bash/PowerShell payload whose command is missing or not a string.
 
-Named residual: config, remote and ref writes that land in the primary's
-SHARED common dir from a LINKED worktree's cwd: (a) `config` / `remote` /
-`branch -u` writes to the shared `$GIT_COMMON_DIR/config`, and (b)
-`update-ref` / `symbolic-ref` on `refs/heads/main`. Follow-up HIMMEL-3407 covers
-them. Spec: `scripts/hooks/test-block-primary-git-writes.sh`.
+**Common-dir owner (HIMMEL-3407).** The TARGETS above resolve to the repo a
+git command is AIMED at — for a write run from a LINKED worktree's own cwd
+(no `-C`/`--git-dir` pointed elsewhere), that is the worktree's OWN root, a
+legitimate feature checkout, so the ordinary verdict allows. But `config` /
+`remote` writes, `branch -u|--set-upstream-to|--unset-upstream|-M|-C|-f|--force`,
+`checkout -B`/`switch -C` onto `main|master`, and `update-ref` /
+`symbolic-ref` on `refs/heads/main|master` land in the worktree's SHARED
+`$GIT_COMMON_DIR`, which the PRIMARY checkout also reads — so a leg could
+repoint `branch.main.remote/merge` or `remote.origin.url` (poisoning the
+console's own `pull --ff-only`) or move `refs/heads/main` itself, all without
+ever writing `-C <primary>`. For exactly those subcommands/flags, the
+target's OWNING primary checkout (`primary_checkout_root` — a no-op for an
+ordinary, non-worktree repo) now gets the SAME `main_checkout_verdict`
+(`_bwimc_git_check_common_owner`). Accepted cost: an ordinary `git config
+<k> <v>` or `git remote add <name> <url>` from a leg's own cwd now denies too
+— it writes the shared config regardless of the key/remote name, and the
+`-C <primary>` form of the same write already denied unconditionally.
+Ordinary worktree git (checkout, commit, merge, `branch` create/delete/plain
+rename without `-M`/`-C`/`-u`/`-f`/`--unset-upstream`, `update-ref`/
+`symbolic-ref` on any OTHER ref) is unaffected.
+
+Two shapes narrow the `config`/`remote` check rather than widen it (adversarial
+review, round 1): `config --global`/`--system`/`--worktree` write a DIFFERENT
+file entirely (not the shared repo config), and are exempt outright; `config
+-f`/`--file <path>` redirects to an ARBITRARY path, resolved and run through
+the same file-target check `--git-dir`/`--work-tree` already use, so `--file
+<primary>/.git/config` still denies while a path outside any repo does not.
+`remote update`/`prune`/`show` are fetch-shaped (refresh, not repoint) and are
+exempt; `get-url` never reaches this arm at all (already read-shaped).
+
+Also fixed the same round: `update-ref`/`symbolic-ref -m <reason>
+refs/heads/main` used to read the `-m` VALUE as the positional ref-name and
+stop there, missing the real ref name entirely — the loop now consumes the
+value like every other value-taking flag in this file does. `--stdin` reads
+its ref updates from stdin, invisible to a command-text scanner, and is
+denied outright rather than silently passed. `branch -M`/`-C` (branch's own
+FORCE rename/copy — bare `-m`/`-c` cannot overwrite an existing branch, so
+they stay ordinary) and `checkout -B`/`switch -C` (force-create-or-reset a
+branch to a start-point, the same "move an existing ref" class spelled
+through a different verb) now trigger the check too.
+
+A second adversarial round found five more issues in that round-1 shape,
+against a differential run of this branch's hook vs main's on identical
+payloads:
+- (bypass) a GLUED `-f<path>` (`config -f<primary>/.git/config …`, no space)
+  is a real git invocation and was not recognised as the file flag at all —
+  the same value the separate-token `-f`/`--file` form already captures is
+  now captured from the glued form too.
+- (fail-open) an unresolvable `--file` target (a `"$VAR"` the scanner cannot
+  read) used to be silently allowed; it now denies as an unresolved git
+  target, like every other arm.
+- (bypass) `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` set as an env prefix or
+  export repoint what file `--global`/`--system` actually write, voiding the
+  scope exemption above — a raw substring scan of the clause for either name
+  now withholds the exemption when present (coarse, but only ever adds a
+  check, never removes one).
+- (false deny) `-u`/`--set-upstream-to`/`--unset-upstream`/`-f`/`-M`/`-C`
+  implicitly target the CURRENT branch when no branch-name operand is given
+  — in a linked worktree that is always the leg's own feature branch (git
+  refuses to check main out in two worktrees at once), never main, so `branch
+  -u origin/x` with no third operand is ordinary and matches the
+  already-allowed `push -u`. The branch arm now requires an EXPLICIT
+  `main`/`master` operand, mirroring update-ref/symbolic-ref's own scoping,
+  before any of these flags trigger the check.
+- (cheap) `switch`'s long form of `-C` is `--force-create`, not modelled
+  before; `--forc` (an unambiguous abbreviation of `--force` that real git
+  accepts) is now matched via the same `_bwimc_is_long_abbrev` helper the
+  option-value arms already use; and a BUNDLED short cluster (`checkout -fB
+  main`) is now recognised by scanning for the flag letter anywhere after a
+  leading dash, the same way `_bwimc_opt_scan`'s own `-t` handling works.
+
+Still unmodelled from a linked worktree's own cwd: `tag` and `reflog
+expire|delete` writes, and any other branch create/delete/rename — same
+residual class, narrower now. Spec:
+`scripts/hooks/test-block-primary-git-writes.sh`.
 
 **KNOWN FAIL-OPEN SHAPES — CLOSED by HIMMEL-2592.** This section previously
 listed TWO open shapes; HIMMEL-2526's sixth and final CR round found four

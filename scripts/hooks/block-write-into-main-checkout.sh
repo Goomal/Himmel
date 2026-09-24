@@ -92,12 +92,21 @@
 # Known limitations:
 #   - Arm (g) (HIMMEL-3401, git subcommands that rewrite a protected
 #     checkout — see its own header for the allowlist + the pull/fetch
-#     carve-out) targets the repo a git command is AIMED at. Writes that land
-#     in the primary's SHARED common dir from a LINKED worktree's cwd are not
-#     modelled: `git config`/`remote set-url`/`branch -u` (shared
-#     $GIT_COMMON_DIR/config) and `update-ref`/`symbolic-ref` on
-#     refs/heads/main (the ref the primary's HEAD names). Named residual,
-#     follow-up HIMMEL-3407.
+#     carve-out) targets the repo a git command is AIMED at, which for a
+#     write run from a LINKED worktree's own cwd (no -C) is the worktree's
+#     OWN root — a legitimate feature checkout that allows, even though
+#     `config`/`remote` writes, `branch -u|--unset-upstream|-M|-C|-f`,
+#     `checkout -B`/`switch -C` onto main|master, and `update-ref`/
+#     `symbolic-ref` on refs/heads/main|master land in the primary's SHARED
+#     $GIT_COMMON_DIR. HIMMEL-3407 closes this for exactly those shapes by
+#     also checking the target's owning primary checkout
+#     (_bwimc_git_check_common_owner) — narrowed to exempt config/remote
+#     shapes that do NOT touch the shared repo config at all
+#     (--global/--system/--worktree, an -f/--file path outside any repo,
+#     remote update/prune/show). Still unmodelled: `tag`/`reflog
+#     expire|delete` writes and any other branch create/delete/rename from a
+#     linked worktree's own cwd, and a remote repoint made by an earlier,
+#     separate command (see the arm's own header, below).
 #   - Command-text scanning, not a shell parser. A verb displaced from
 #     command position (env-prefix, sudo/xargs/timeout wrappers) is missed,
 #     same residual as block-terminal-write-fence.sh's class (a). The `tee`
@@ -1426,6 +1435,31 @@ done < <(_bwimc_split_clauses "$_bwimc_hb")
 # Env assignments are read from the clause prefix (`GIT_DIR=… git`, `env
 # GIT_DIR=… git`) and from an earlier `export` in the same command.
 #
+# COMMON-DIR OWNER (HIMMEL-3407): the TARGETS above are resolved to their own
+# repo root, which for a LINKED worktree's own cwd (no -C/--git-dir pointed
+# elsewhere) is the worktree itself — a legitimate feature checkout that
+# ALLOWS, even though a `config`/`remote` write, `branch -u|--unset-upstream|
+# -M|-C|-f` onto main|master, `checkout -B`/`switch -C` onto main|master, or
+# `update-ref`/`symbolic-ref` on refs/heads/main|master lands in the
+# worktree's SHARED $GIT_COMMON_DIR, which the PRIMARY checkout also reads.
+# For exactly those subcommands/flags, the target's OWNING primary checkout
+# (`primary_checkout_root`; a no-op for an ordinary non-worktree repo) is
+# checked too (`_bwimc_git_check_common_owner`) — so a leg cwd'd into its own
+# worktree can no longer repoint the primary's upstream/HEAD-tracked refs by
+# omitting `-C <primary>`. Narrowed the other way (adversarial review round
+# 1): `config --global/--system/--worktree` write a DIFFERENT file, not the
+# shared repo config, and are exempt; `config -f/--file <path>` is checked
+# against the resolved path itself (the ordinary file-target check), not the
+# repo root, so a path outside any repo is exempt too; `remote update/prune/
+# show` are fetch-shaped and exempt (`get-url` never reaches here — already
+# read-shaped); the branch flags above trigger ONLY with an EXPLICIT
+# main/master operand (round 2 — `-u origin/x` with no branch name given
+# targets the CURRENT branch, never main in a linked worktree, matching the
+# already-allowed `push -u`). `update-ref`/`symbolic-ref -m <reason>` now consumes the
+# reason value instead of misreading it as the ref-name positional, and
+# `--stdin` (refs arrive on stdin, invisible to this scanner) is denied
+# outright rather than silently passed.
+#
 # CARVE-OUT (the console's wrap flow, `git -C <primary> pull --ff-only` +
 # `fetch`), shape-bounded so it cannot be steered at a leg's commits:
 #   pull  — read only with `--ff-only`, flags from a closed list (no
@@ -1456,8 +1490,12 @@ done < <(_bwimc_split_clauses "$_bwimc_hb")
 # to have run, and a write is ALSO checked from every cwd a cd left, so
 # `false && cd <leg>; git merge x` from the primary is still caught; the cost
 # is that `cd <leg> && git merge x` typed from the primary is denied too.
-# Shared-ref writes (tag, reflog expire, update-ref) are equally reachable
-# from the leg's own worktree: that residual is HIMMEL-3407. `git -c alias.x=…` and repo-level
+# Shared-ref writes from the leg's own worktree (no -C) are checked against
+# the common dir's owning primary for `config`/`remote`/`branch
+# -u|--unset-upstream|-M|-C|-f`/`checkout -B`/`switch -C`/`update-ref`/
+# `symbolic-ref` on refs/heads/main|master (HIMMEL-3407, above); `tag`,
+# `reflog expire|delete`, and any other branch create/delete/plain-rename are
+# still reachable that way — narrower residual, same ticket. `git -c alias.x=…` and repo-level
 # hooks are code execution in the leg's own process, not a primary-state
 # write, and are out of scope. `worktree move|remove` of the primary is left
 # to git itself, which refuses to move or remove a main working tree.
@@ -1826,6 +1864,42 @@ _bwimc_git_check_path() {
     fi
 }
 
+# _bwimc_git_check_common_owner DIR LABEL — HIMMEL-3407. `config`/`remote`
+# writes, `branch -u|--unset-upstream|-f`, and `update-ref`/`symbolic-ref` on
+# refs/heads/main|master land in $GIT_COMMON_DIR, which is SHARED by every
+# worktree of one repository. Run from a LINKED worktree's own cwd (no `-C`),
+# DIR is the worktree itself — repo_root_for_path resolves to the worktree's
+# OWN root, a legitimate feature checkout, so _bwimc_git_check_path on DIR
+# alone ALLOWS even though the file these subcommands actually write
+# ($GIT_COMMON_DIR/config, or a shared ref) lives in the PRIMARY's git
+# directory. primary_checkout_root resolves that owning checkout — for an
+# ordinary, non-worktree repo it is a no-op (returns the same root, git-dir ==
+# common-dir there), so calling this unconditionally never changes the
+# verdict for a plain checkout; it only adds a second, correct target for a
+# linked worktree.
+#
+# DIR is resolved to its REPO ROOT (guard_canon_path + repo_root_for_path,
+# the exact walk _bwimc_git_check_path already does) BEFORE calling
+# primary_checkout_root, rather than handed to it raw: primary_checkout_root
+# runs `git -C DIR …`, which requires DIR to be an EXISTING DIRECTORY, but a
+# `--git-dir=<worktree>/.git` target is exactly that worktree's `.git`
+# FILE (git itself follows the gitfile redirection there — verified: `git
+# --git-dir=<wt>/.git status` succeeds against a linked worktree) — handing
+# the file straight to `git -C` fails ("cannot change to … Not a directory"),
+# which would silently skip this whole check for that one spelling. The repo
+# ROOT above the `.git` entry is always a real, `-C`-able directory by
+# construction (repo_root_for_path only returns a directory it saw `-e
+# "$d/.git"` under), so resolving it first closes that gap.
+_bwimc_git_check_common_owner() {
+    local dir="$1" label="$2" canon root owner
+    canon=$(guard_canon_path "$dir" 2>/dev/null) || return 0
+    root=$(repo_root_for_path "$canon" 2>/dev/null) || return 0
+    [ -n "$root" ] || return 0
+    owner=$(primary_checkout_root "$root" 2>/dev/null) || return 0
+    [ -n "$owner" ] || return 0
+    _bwimc_git_check_path "$owner" "$label"
+}
+
 # _bwimc_git_clause CLAUSE_SP — per-clause state machine for arm (g). Reads
 # and updates the command-wide _bwimc_gcwd / _bwimc_gcwd_unres /
 # _bwimc_genv_* globals; must be called as a plain statement (never `$(…)`).
@@ -2084,12 +2158,210 @@ _bwimc_git_clause() {
     if [ "$unres" = 1 ]; then
         _bwimc_deny "unresolved-git-target" "$1" "$dir" ""
     fi
+    local gtarget
     if [ -n "$gitdir" ]; then
         r=$(_bwimc_resolve_abs "$gitdir" "$dir") || _bwimc_deny "unresolved-git-target" "$gitdir" "$dir" ""
         _bwimc_git_check_path "$r" "git-dir $gitdir"
+        gtarget="$r"
     else
         _bwimc_git_check_path "$dir" "repo $dir"
+        gtarget="$dir"
     fi
+    # HIMMEL-3407: config/remote writes, branch -u|--unset-upstream|-M|-C|-f,
+    # checkout -B/switch -C onto main|master, and update-ref/symbolic-ref on
+    # refs/heads/main|master ALSO get checked against the target's owning
+    # PRIMARY checkout (see _bwimc_git_check_common_owner) — closing the gap
+    # where the target IS a linked worktree, whose own repo root looks like
+    # an ordinary feature checkout and allows, while the subcommand actually
+    # writes the shared $GIT_COMMON_DIR the worktree and its primary both
+    # point at.
+    case "$sub" in
+        config)
+            # Adversarial review round 1: config's TARGET file is not always
+            # the shared repo config. --global/--system/--worktree name a
+            # DIFFERENT file entirely (worktree-local under
+            # extensions.worktreeConfig), so they are exempt outright.
+            # -f/--file redirects to an ARBITRARY path, which may or may not
+            # be inside the common dir — resolve it and run it through the
+            # ordinary file-target check (_bwimc_git_check_path), the same
+            # one --git-dir/--work-tree already use, so `--file
+            # <primary>/.git/config` still denies while `--file /tmp/x/cfg`
+            # does not. --blob/--type/--default/--comment also take a value
+            # and must be consumed (skipped) so their value can never be
+            # misread as one of the flags above.
+            #
+            # Adversarial review round 2:
+            #   N1 (bypass) — a glued `-f<path>` (no space) is a real git
+            #     invocation and was not recognised as the file flag at all,
+            #     so its value was never checked. `-f?*` now captures the
+            #     attached form the same way `-f`/`--file`'s separate-token
+            #     value already was.
+            #   N2 (fail-open) — when _bwimc_resolve_abs fails (a dynamic
+            #     `-f "$X"` target), the old code did nothing at all. Every
+            #     other arm in this file denies an unresolved git target
+            #     (`unresolved-git-target`); this one now does too.
+            #   N3 (bypass) — GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM set as an
+            #     env prefix or export REPOINT what file --global/--system
+            #     actually write, so the exemption above is unsound when
+            #     either is present anywhere in the command. A raw substring
+            #     scan of the clause text is coarse but errs toward MORE
+            #     denials, never fewer, and needs no new env-tracking state.
+            local cfg_scope="" cfg_file="" cfg_want=0 cfg_env_override=0
+            case "$1" in *GIT_CONFIG_GLOBAL=*|*GIT_CONFIG_SYSTEM=*) cfg_env_override=1 ;; esac
+            for v in ${args[@]+"${args[@]}"}; do
+                if [ "$cfg_want" != 0 ]; then
+                    [ "$cfg_want" = 1 ] && cfg_file="$v"
+                    cfg_want=0
+                    continue
+                fi
+                case "$v" in
+                    --global|--system|--worktree) cfg_scope="$v" ;;
+                    -f|--file) cfg_want=1 ;;
+                    -f?*) cfg_file="${v#-f}" ;;
+                    --file=*) cfg_file="${v#--file=}" ;;
+                    --blob|--type|--default|--comment) cfg_want=2 ;;
+                esac
+            done
+            if [ -n "$cfg_scope" ] && [ "$cfg_env_override" != 1 ]; then
+                :
+            elif [ -n "$cfg_file" ]; then
+                r=$(_bwimc_resolve_abs "$cfg_file" "$dir") || _bwimc_deny "unresolved-git-target" "$cfg_file" "$dir" ""
+                _bwimc_git_check_path "$r" "config --file $cfg_file"
+            else
+                _bwimc_git_check_common_owner "$gtarget" "config clause $1"
+            fi
+            ;;
+        remote)
+            # Adversarial review round 1: `update`/`prune`/`show` are
+            # fetch-shaped (network/refresh operations, like the pull/fetch
+            # carve-out above) — they do not repoint remote.*.url or any
+            # other config key the ticket cares about. `get-url` never
+            # reaches here at all (already read-shaped in
+            # _bwimc_git_sub_is_read). Everything else (add/set-url/rename/
+            # remove/set-head/…) still checks.
+            local remote_first=""
+            for v in ${args[@]+"${args[@]}"}; do
+                case "$v" in -*) ;; *) remote_first="$v"; break ;; esac
+            done
+            case "$remote_first" in
+                update|prune|show) : ;;
+                *) _bwimc_git_check_common_owner "$gtarget" "remote clause $1" ;;
+            esac
+            ;;
+        branch)
+            # Adversarial review round 2 (N4, false deny): -u/--set-upstream*
+            # implicitly targets the CURRENT branch when no branch-name
+            # operand is given — from a linked worktree that is always the
+            # leg's OWN feature branch (git refuses to check main out in two
+            # worktrees at once), never main, so `branch -u origin/x` and
+            # `branch -f other start` are ordinary and must allow, matching
+            # `push -u`. Only an EXPLICIT `main`/`master` operand makes any
+            # of these flags dangerous (mirrors update-ref/symbolic-ref's own
+            # refs/heads/main|master scoping above) — so this arm now needs
+            # BOTH a dangerous flag AND a main/master operand before it
+            # triggers. N5: `--forc` (an unambiguous abbreviation of
+            # --force, which real git accepts) is matched via
+            # _bwimc_is_long_abbrev, the same helper the option-value arms
+            # above already use for exactly this purpose.
+            local br_danger=0 br_target_main=0
+            for v in ${args[@]+"${args[@]}"}; do
+                case "$v" in
+                    -u|--set-upstream-to|--set-upstream-to=*|--set-upstream|--unset-upstream|-M|-C)
+                        br_danger=1 ;;
+                    --*)
+                        _bwimc_is_long_abbrev "force" "$v" && br_danger=1 ;;
+                    -*)
+                        _bwimc_short_has "$v" ufMC && br_danger=1 ;;
+                    main|master)
+                        br_target_main=1 ;;
+                esac
+            done
+            if [ "$br_danger" = 1 ] && [ "$br_target_main" = 1 ]; then
+                _bwimc_git_check_common_owner "$gtarget" "branch clause $1"
+            fi
+            ;;
+        update-ref|symbolic-ref)
+            # Adversarial review round 1 (HIGH, bypass): the old loop skipped
+            # every `-`-prefixed token but not the VALUE a value-taking flag
+            # consumes, so `update-ref -m msg refs/heads/main HEAD` read "msg"
+            # as if it were the ref-name positional and stopped there,
+            # allowing it — `-m <reason>` is the one value-taking flag either
+            # subcommand has (mirrors _bwimc_git_sub_is_read's own symbolic-ref
+            # skipval). `--stdin` (with or without `-z`) reads its ref updates
+            # from STDIN, which this command-text scanner cannot see at all —
+            # fail closed on it unconditionally rather than silently allow.
+            local gref_want=""
+            for v in ${args[@]+"${args[@]}"}; do
+                if [ -n "$gref_want" ]; then
+                    gref_want=""
+                    continue
+                fi
+                case "$v" in
+                    --stdin)
+                        _bwimc_git_check_common_owner "$gtarget" "$sub --stdin clause $1"
+                        break ;;
+                    -m) gref_want=1 ;;
+                    -*) ;;
+                    refs/heads/main|refs/heads/master)
+                        _bwimc_git_check_common_owner "$gtarget" "$sub clause $1"
+                        break ;;
+                    *) break ;;
+                esac
+            done
+            ;;
+        checkout|switch)
+            # Adversarial review round 1 (LOW): `checkout -B <name>` /
+            # `switch -C <name>` force-create-or-RESET <name> to the given
+            # (or current) start-point — the same "move an existing ref"
+            # class as `branch -M`/`-C` above, just spelled through a
+            # different verb. Only the value-taking flag itself is modelled
+            # (bare `-B`/`-C` and an attached `-Bmain`/`-Cmain`), not a
+            # bundled cluster with other short flags before it (e.g. `-fB
+            # main`) — the same not-a-shell-parser residual as every other
+            # arm in this file; --ignore-other-worktrees and similar bare
+            # flags are simply skipped over.
+            #
+            # Adversarial review round 2 (N5): switch's LONG form of -C is
+            # --force-create (not modelled before), and a BUNDLED short
+            # cluster (`checkout -fB main`) was missed entirely since the
+            # old scan only matched a token whose FIRST characters were the
+            # flag. The cluster is now scanned for the flag letter anywhere
+            # after a leading dash, mirroring _bwimc_opt_scan's own -t
+            # handling: everything in the SAME token after that letter is
+            # its attached value, or — nothing follows — the NEXT token is.
+            local gco_flag gco_want=0 gco_rest
+            case "$sub" in checkout) gco_flag=B ;; *) gco_flag=C ;; esac
+            for v in ${args[@]+"${args[@]}"}; do
+                if [ "$gco_want" = 1 ]; then
+                    case "$v" in
+                        refs/heads/main|refs/heads/master|main|master)
+                            _bwimc_git_check_common_owner "$gtarget" "$sub -$gco_flag clause $1" ;;
+                    esac
+                    gco_want=0
+                    continue
+                fi
+                case "$v" in
+                    --force-create=*)
+                        case "${v#--force-create=}" in
+                            refs/heads/main|refs/heads/master|main|master)
+                                _bwimc_git_check_common_owner "$gtarget" "$sub --force-create clause $1" ;;
+                        esac ;;
+                    --force-create) gco_want=1 ;;
+                    --*) ;;
+                    -*"$gco_flag"*)
+                        gco_rest="${v#*"$gco_flag"}"
+                        if [ -n "$gco_rest" ]; then
+                            case "$gco_rest" in
+                                refs/heads/main|refs/heads/master|main|master)
+                                    _bwimc_git_check_common_owner "$gtarget" "$sub -$gco_flag clause $1" ;;
+                            esac
+                        else
+                            gco_want=1
+                        fi ;;
+                esac
+            done
+            ;;
+    esac
     if [ -n "$wtree" ]; then
         r=$(_bwimc_resolve_abs "$wtree" "$dir") || _bwimc_deny "unresolved-git-target" "$wtree" "$dir" ""
         _bwimc_git_check_path "$r" "work-tree $wtree"

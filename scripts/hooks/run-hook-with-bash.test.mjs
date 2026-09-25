@@ -639,6 +639,265 @@ test('a must-run member over its budget DENIES the chain instead of being skippe
   });
 });
 
+// HIMMEL-3080: a must-run member starved by the SHARED chain budget (an
+// upstream non-must-run member ate it) must get its own dedicated evaluation
+// window rather than being denied unevaluated at whatever floor was left. The
+// guard here needs 900ms to decide — more than the MIN_MEMBER_TIMEOUT_MS
+// floor (500ms) the old clamp would have left it, less than its own full
+// per-member timeout (2000ms). hog.sh's bound is deliberately tighter than
+// its own sleep, so it ALWAYS overruns and eats the whole 600ms chain budget,
+// making the tail's shared-budget remainder land on the floor deterministically
+// (Math.max's floor, not a race) — this fixture never depends on the retry
+// wrapper the two timing-sensitive tests above need.
+test('a must-run member starved by the shared chain budget gets its own window and still decides (HIMMEL-3080)', () => {
+  const dir = makeTmpDir('hook-bash-starve-');
+  try {
+    writeFileSync(join(dir, 'hog.sh'), `#!/usr/bin/env bash\n: > "$(dirname "$0")/ran-hog.sh"\nsleep 3\n`);
+    chmodSync(join(dir, 'hog.sh'), 0o755);
+    // Named like the real must-run tail from the ticket's own incident.
+    writeFileSync(
+      join(dir, 'block-chokepoint-env-prefix.sh'),
+      `#!/usr/bin/env bash\n: > "$(dirname "$0")/ran-tail.sh"\nsleep 0.9\nprintf '%s' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"fast"}}'\n`,
+    );
+    chmodSync(join(dir, 'block-chokepoint-env-prefix.sh'), 0o755);
+
+    const result = spawnSync(
+      process.execPath,
+      [LAUNCHER, '--chain', join(dir, 'hog.sh'), join(dir, 'block-chokepoint-env-prefix.sh')],
+      {
+        encoding: 'utf8',
+        input: PAYLOAD,
+        env: {
+          ...process.env,
+          RUN_HOOK_CHAIN_BUDGET_MS: '600',
+          RUN_HOOK_CHAIN_MEMBER_TIMEOUT_MS: '2000',
+        },
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(existsSync(join(dir, 'ran-tail.sh')), true, 'the must-run tail must actually run, not be denied unevaluated');
+    assert.equal(
+      JSON.parse(result.stdout).hookSpecificOutput.permissionDecision,
+      'allow',
+      'a must-run tail starved of shared budget must still get to decide on its own window',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// HIMMEL-3080: the denial message for a genuinely starved-and-still-timed-out
+// must-run member must NAME the upstream member that ate the shared budget,
+// not merely the starved tail — the ticket's DONE WHEN instrumentation ask.
+// hog.sh's bound is clamped to the MIN_MEMBER_TIMEOUT_MS floor (500ms,
+// deterministic regardless of jitter — see the comment on the test above),
+// which always leaves the tail's shared remainder starved below its own
+// 900ms window. The tail's body (1.3s) is longer even than that full 900ms
+// window, so it denies on a REAL timeout of its OWN window, not the shared
+// clamp — proving the consumer note reports upstream starvation that
+// happened regardless of the ultimate cause of this member's own denial.
+test('a starved-then-still-timed-out must-run member names the upstream budget consumer (HIMMEL-3080)', () => {
+  const dir = makeTmpDir('hook-bash-starve-consumer-');
+  try {
+    writeFileSync(join(dir, 'hog.sh'), `#!/usr/bin/env bash\n: > "$(dirname "$0")/ran-hog.sh"\nsleep 3\n`);
+    chmodSync(join(dir, 'hog.sh'), 0o755);
+    writeFileSync(
+      join(dir, 'block-chokepoint-env-prefix.sh'),
+      `#!/usr/bin/env bash\n: > "$(dirname "$0")/ran-tail.sh"\nsleep 1.3\nprintf 'allow'\n`,
+    );
+    chmodSync(join(dir, 'block-chokepoint-env-prefix.sh'), 0o755);
+
+    const result = spawnSync(
+      process.execPath,
+      [LAUNCHER, '--chain', join(dir, 'hog.sh'), join(dir, 'block-chokepoint-env-prefix.sh')],
+      {
+        encoding: 'utf8',
+        input: PAYLOAD,
+        env: {
+          ...process.env,
+          RUN_HOOK_CHAIN_BUDGET_MS: '300',
+          RUN_HOOK_CHAIN_MEMBER_TIMEOUT_MS: '900',
+        },
+      },
+    );
+    assert.equal(result.status, 2, result.stderr);
+    // hog.sh's OWN skip line always names hog.sh (that is not the point being
+    // tested) — the DENY line ITSELF, for the starved tail, must also name
+    // hog.sh as the budget consumer, not just report the tail's own elapsed.
+    const denyLine = result.stderr.split('\n').find((l) => l.includes('DENY block-chokepoint-env-prefix.sh'));
+    assert.ok(denyLine, `expected a DENY line for the tail:\n${result.stderr}`);
+    assert.match(denyLine, /hog\.sh/, 'the DENY line must name the member that ate the shared budget');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// HIMMEL-3080 (J1259O F1): a must-run member's own window must ALSO be capped
+// by an entry-safe deadline — left uncapped, several must-run members (or one
+// that hangs, here) can collectively outrun the settings.json entry `timeout`
+// (60s on every real chain that carries a must-run member). Claude Code then
+// kills the whole hook, and a killed PreToolUse hook fails OPEN — every guard
+// that had not run yet is silently skipped, where the runner itself would
+// have denied. Scaled ÷10 like the judge's own fixtures.sh. An outer
+// `timeout`-shaped kill on the LAUNCHER process itself (spawnSync's own
+// `timeout`/`killSignal`) stands in for that entry timeout: at base this
+// test's chain outruns it and gets killed with no decision emitted; the fix
+// must make the runner deny well inside it instead.
+test('a chain whose advisory members hang and eat the budget, then a hung must-run member, DENIES strictly before the entry timeout (HIMMEL-3080 F1)', () => {
+  const dir = makeTmpDir('hook-bash-entry-deadline-');
+  try {
+    const hangs = ['hog1.sh', 'hog2.sh', 'hog3.sh', 'hog4.sh'];
+    for (const name of hangs) {
+      writeFileSync(join(dir, name), `#!/usr/bin/env bash\n: > "$(dirname "$0")/ran-${name}"\nsleep 100\n`);
+      chmodSync(join(dir, name), 0o755);
+    }
+    // Named like a real must-run guard so MUST_RUN_CHAIN_MEMBERS fires.
+    writeFileSync(join(dir, 'block-read-secrets.sh'), `#!/usr/bin/env bash\n: > "$(dirname "$0")/ran-tail.sh"\nsleep 100\n`);
+    chmodSync(join(dir, 'block-read-secrets.sh'), 0o755);
+
+    const HARNESS_MS = 6500;
+    const t0 = Date.now();
+    const result = spawnSync(
+      process.execPath,
+      [LAUNCHER, '--chain', ...hangs.map((n) => join(dir, n)), join(dir, 'block-read-secrets.sh')],
+      {
+        encoding: 'utf8',
+        input: PAYLOAD,
+        timeout: HARNESS_MS,
+        killSignal: 'SIGKILL',
+        env: {
+          ...process.env,
+          RUN_HOOK_CHAIN_MEMBER_TIMEOUT_MS: '3000',
+          RUN_HOOK_CHAIN_BUDGET_MS: '3000',
+          RUN_HOOK_CHAIN_ENTRY_TIMEOUT_MS: '6500',
+          RUN_HOOK_CHAIN_ENTRY_SAFETY_MARGIN_MS: '1000',
+        },
+      },
+    );
+    const wall = Date.now() - t0;
+    assert.notEqual(
+      result.signal,
+      'SIGKILL',
+      `the launcher must decide before the entry timeout, not be killed by it (stderr: ${result.stderr})`,
+    );
+    assert.equal(result.status, 2, result.stderr);
+    assert.ok(wall < HARNESS_MS, `chain took ${wall}ms, must stay under the ${HARNESS_MS}ms entry timeout`);
+    assert.match(result.stderr, /DENY block-read-secrets\.sh/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// HIMMEL-3080 (J1259O F1): the same regression without any single member ever
+// hanging — several must-run members that each decide SLOWLY but always
+// within their own full window can still, uncapped, collectively outrun the
+// entry timeout. The fix must cap every window so the chain denies (here, via
+// the new pre-spawn deadline-exhausted path once no safe window is left)
+// strictly before the entry timeout, even though nothing ever times out on
+// its own merits.
+test('a chain of many slow-but-deciding must-run members DENIES strictly before the entry timeout (HIMMEL-3080 F1)', () => {
+  const dir = makeTmpDir('hook-bash-entry-deadline-slow-');
+  try {
+    const names = [
+      'block-destructive-commands.sh',
+      'block-rogue-claude-schedule.sh',
+      'block-chokepoint-env-prefix.sh',
+      'block-tail-pipe-on-gates.sh',
+      'check-cr-marker-on-pr-create.sh',
+      'block-edit-live-settings.sh',
+      'block-write-into-main-checkout.sh',
+    ];
+    for (const name of names) {
+      writeFileSync(
+        join(dir, name),
+        `#!/usr/bin/env bash\n: > "$(dirname "$0")/ran-${name}"\nsleep 1.3\nprintf '%s' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"slow"}}'\n`,
+      );
+      chmodSync(join(dir, name), 0o755);
+    }
+
+    const HARNESS_MS = 6000;
+    const t0 = Date.now();
+    const result = spawnSync(
+      process.execPath,
+      [LAUNCHER, '--chain', ...names.map((n) => join(dir, n))],
+      {
+        encoding: 'utf8',
+        input: PAYLOAD,
+        timeout: HARNESS_MS,
+        killSignal: 'SIGKILL',
+        env: {
+          ...process.env,
+          RUN_HOOK_CHAIN_MEMBER_TIMEOUT_MS: '1500',
+          RUN_HOOK_CHAIN_BUDGET_MS: '1000',
+          RUN_HOOK_CHAIN_ENTRY_TIMEOUT_MS: '6000',
+          RUN_HOOK_CHAIN_ENTRY_SAFETY_MARGIN_MS: '500',
+        },
+      },
+    );
+    const wall = Date.now() - t0;
+    assert.notEqual(
+      result.signal,
+      'SIGKILL',
+      `the launcher must decide before the entry timeout, not be killed by it (stderr: ${result.stderr})`,
+    );
+    assert.equal(result.status, 2, result.stderr);
+    assert.ok(wall < HARNESS_MS, `chain took ${wall}ms, must stay under the ${HARNESS_MS}ms entry timeout`);
+    const ranCount = names.filter((n) => existsSync(join(dir, `ran-${n}`))).length;
+    assert.ok(ranCount < names.length, 'the chain must deny before every member gets a chance to run');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// HIMMEL-3080 (J1259O F2): the denial's "budget consumer" note must name the
+// member that actually spent the SHARED chain budget, not merely whichever
+// prior member has the largest raw elapsed time. block-destructive-commands.sh
+// here runs LONGER (1.2s) than hog.sh's own budget spend (1.0s) but does so
+// inside its OWN entry-safe window, after the shared budget was already gone —
+// the old max-elapsed heuristic would wrongly blame it instead of hog.sh.
+test('a starved denial names the member that actually spent the shared budget, not a later must-run member that ran longer in its own window (HIMMEL-3080 F2)', () => {
+  const dir = makeTmpDir('hook-bash-consumer-attribution-');
+  try {
+    writeFileSync(join(dir, 'hog.sh'), `#!/usr/bin/env bash\n: > "$(dirname "$0")/ran-hog.sh"\nsleep 100\n`);
+    chmodSync(join(dir, 'hog.sh'), 0o755);
+    writeFileSync(
+      join(dir, 'block-destructive-commands.sh'),
+      `#!/usr/bin/env bash\n: > "$(dirname "$0")/ran-mid.sh"\nsleep 1.2\nprintf '%s' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"slow"}}'\n`,
+    );
+    chmodSync(join(dir, 'block-destructive-commands.sh'), 0o755);
+    writeFileSync(join(dir, 'block-tail-pipe-on-gates.sh'), `#!/usr/bin/env bash\n: > "$(dirname "$0")/ran-tail.sh"\nsleep 100\n`);
+    chmodSync(join(dir, 'block-tail-pipe-on-gates.sh'), 0o755);
+
+    const result = spawnSync(
+      process.execPath,
+      [LAUNCHER, '--chain', join(dir, 'hog.sh'), join(dir, 'block-destructive-commands.sh'), join(dir, 'block-tail-pipe-on-gates.sh')],
+      {
+        encoding: 'utf8',
+        input: PAYLOAD,
+        env: {
+          ...process.env,
+          RUN_HOOK_CHAIN_MEMBER_TIMEOUT_MS: '2000',
+          RUN_HOOK_CHAIN_BUDGET_MS: '1000',
+          RUN_HOOK_CHAIN_ENTRY_TIMEOUT_MS: '3500',
+          RUN_HOOK_CHAIN_ENTRY_SAFETY_MARGIN_MS: '500',
+        },
+      },
+    );
+    assert.equal(result.status, 2, result.stderr);
+    assert.equal(existsSync(join(dir, 'ran-mid.sh')), true, 'the middle must-run member must actually get to run in its own window');
+    const denyLine = result.stderr.split('\n').find((l) => l.includes('DENY block-tail-pipe-on-gates.sh'));
+    assert.ok(denyLine, `expected a DENY line for the tail:\n${result.stderr}`);
+    assert.match(denyLine, /hog\.sh/, 'the DENY line must name hog.sh, the member that actually spent the shared budget');
+    assert.equal(
+      /block-destructive-commands\.sh/.test(denyLine),
+      false,
+      'the DENY line must NOT blame the middle member merely for running longer in its own window',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // HIMMEL-3383: a starved guard-pr-check-literal.sh must deny, never let the
 // bare scripts/cr literal fall through to the allow rule unchecked.
 test('a starved guard-pr-check-literal.sh DENIES the chain instead of being skipped', () => {

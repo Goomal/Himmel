@@ -49,9 +49,11 @@ cd "$REPO" && bash scripts/handover/console/console.sh $ARGUMENTS --project "$PR
 - `--bucket <slug>` / `--prefix <P>` — override the project-derived defaults
   (e.g. `/console new --arm --bucket websites`); the resolved `--project`
   above only supplies the DEFAULT bucket/prefix, it never forces one.
-- `--project <dir>` — this plugin copy already passes one, derived from the
-  cwd this session is running in; pass your own after the subcommand to
-  override it (the last `--project` on the line wins).
+- `--project <dir>` — this plugin copy always passes one, derived from the
+  cwd this session is running in, AFTER your arguments — so it wins over a
+  `--project` you pass yourself (console.sh keeps the last one). To target a
+  different repo, start the session there, or override just the naming with
+  `--bucket`/`--prefix`.
 
 Record the printed `release-token: ` line — now backticked around the token
 itself (HIMMEL-2910) — in the console's first Results bullet verbatim:

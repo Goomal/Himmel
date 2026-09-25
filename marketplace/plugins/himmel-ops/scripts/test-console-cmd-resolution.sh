@@ -29,7 +29,7 @@ snippet="$(awk '/^REPO="/{f=1} f{print} /cannot locate himmel checkout/{exit}' "
 # are supplied by the caller via an env prefix on the run_resolver call.
 run_resolver(){ ( eval "$snippet" && printf '%s' "$REPO" ) 2>/dev/null; }
 
-td="$(mktemp -d)" || { echo "FATAL: mktemp -d failed"; exit 2; }
+td="$(mktemp -d "${TMPDIR:-/tmp}/console-cmd-res.XXXXXX")" ||{ echo "FATAL: mktemp -d failed"; exit 2; }
 trap 'rm -rf "$td"' EXIT
 empty_home="$td/empty-home"; mkdir -p "$empty_home"   # no canonical himmel here
 

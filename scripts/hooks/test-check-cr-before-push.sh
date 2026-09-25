@@ -705,6 +705,96 @@ case "$out" in
         fail "refusal must name refs/remotes/nowhere/main" "out: $out" ;;
 esac
 
+echo "TEST: explicit-URL push (no named remote) resolves the FORK's OWN base (HIMMEL-3477)"
+FX="$TMP_ROOT/forkbase"
+git init -q -b main "$FX"
+touch "$FX/.single-writer"
+(
+    cd "$FX"
+    git -c user.email=t@t -c user.name=t commit -q --allow-empty -m "shared init"
+    echo 'function forkonly(){}' > fork.sh
+    git -c user.email=t@t -c user.name=t add fork.sh
+    git -c user.email=t@t -c user.name=t commit -q -m "fork-only commit"
+)
+fx_fork_tip=$(git -C "$FX" rev-parse --verify main)
+fx_origin_tip=$(git -C "$FX" rev-parse --verify main^)
+git -C "$FX" update-ref refs/remotes/origin/main "$fx_origin_tip"
+FORK_BARE="$TMP_ROOT/fork-explicit.git"
+git clone -q --bare "$FX" "$FORK_BARE"
+FORK_URL="file://$FORK_BARE"
+git -C "$FX" checkout -q -b feat/urlpush main
+echo 'leg change' > "$FX/urlfeature.txt"
+git -C "$FX" add urlfeature.txt
+git -C "$FX" -c user.email=t@t -c user.name=t commit -q -m "leg feature on top of fork base"
+fx_feat_sha=$(git -C "$FX" rev-parse --verify feat/urlpush)
+
+rc=0; out=$(cd "$FX" && bash "$HOOK" "$FORK_URL" "$FORK_URL" <<< "refs/heads/feat/urlpush $fx_feat_sha refs/heads/feat/urlpush $Z40" 2>&1) || rc=$?
+fxm="$FX/.git/cr-pending/feat/urlpush"
+if [ "$rc" -eq 0 ] && [ -f "$fxm" ]; then
+    pass "explicit-URL fork push: marker written (no named remote, no refs/remotes/<url>/main required)"
+    fxm_base=$(awk -F' [|] ' '{gsub(/^[ \t]+|[ \t]+$/,"",$7); print $7; exit}' "$fxm" 2>/dev/null || true)
+    if [ "$fxm_base" = "$fx_fork_tip" ]; then
+        pass "explicit-URL fork push: marker base pins the FORK's own HEAD, not origin's"
+    else
+        fail "explicit-URL fork push: marker base '$fxm_base' != fork tip ($fx_fork_tip)" "out: $out"
+    fi
+else
+    fail "explicit-URL fork push: expected exit 0 + marker at $fxm (got rc=$rc)" "out: $out"
+fi
+
+echo "TEST: explicit-URL push to an UNREACHABLE fork -> fail CLOSED naming a satisfiable remedy"
+rc=0; out=$(cd "$FX" && bash "$HOOK" "file://$TMP_ROOT/no-such-fork.git" "file://$TMP_ROOT/no-such-fork.git" <<< "refs/heads/feat/urlpush $fx_feat_sha refs/heads/feat/urlpush $Z40" 2>&1) || rc=$?
+if [ "$rc" -eq 2 ]; then pass "unreachable explicit-URL fork -> exit 2 (fail closed)"; else fail "unreachable explicit-URL fork -> expected exit 2 got $rc" "out: $out"; fi
+case "$out" in
+    *"git fetch file://"*", then retry"*)
+        fail "refusal still prints the broken remedy (git fetch <url> can never create refs/remotes/<url>/*)" "out: $out" ;;
+    *"could not fetch the default branch from"*)
+        pass "refusal names a satisfiable remedy (retry / SKIP_CR / --no-verify), not the broken one" ;;
+    *)
+        fail "unexpected refusal message" "out: $out" ;;
+esac
+
+echo "TEST: explicit-URL push after the fork REWINDS its default branch -> scratch ref still refreshes (HIMMEL-3477 codex-1 round 3)"
+# The scratch ref refs/cr/<hash>/fork-head is reused across pushes to the SAME
+# fork URL. Rewind the fork's bare "main" backwards (non-fast-forward from the
+# ref's currently-fetched value) and push again: an unforced fetch refspec
+# would reject this and fail the push closed even though the fork is perfectly
+# reachable.
+git -C "$FORK_BARE" update-ref refs/heads/main "$fx_origin_tip"
+rc=0; out=$(cd "$FX" && bash "$HOOK" "$FORK_URL" "$FORK_URL" <<< "refs/heads/feat/urlpush $fx_feat_sha refs/heads/feat/urlpush $Z40" 2>&1) || rc=$?
+fxm_rewind_base=$(awk -F' [|] ' '{gsub(/^[ \t]+|[ \t]+$/,"",$7); print $7; exit}' "$fxm" 2>/dev/null || true)
+if [ "$rc" -eq 0 ] && [ "$fxm_rewind_base" = "$fx_origin_tip" ]; then
+    pass "rewound fork -> scratch ref force-refreshes to the fork's NEW tip, push still succeeds"
+else
+    fail "rewound fork -> expected exit 0 + base=$fx_origin_tip, got rc=$rc base='$fxm_rewind_base'" "out: $out"
+fi
+
+echo "TEST: explicit-URL push does not clobber the caller's own FETCH_HEAD (HIMMEL-3477 CR round 4, CodeRabbit)"
+printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\t\tsentinel from a real manual fetch moments earlier\n' > "$FX/.git/FETCH_HEAD"
+fetch_head_before=$(cat "$FX/.git/FETCH_HEAD")
+rc=0; out=$(cd "$FX" && bash "$HOOK" "$FORK_URL" "$FORK_URL" <<< "refs/heads/feat/urlpush $fx_feat_sha refs/heads/feat/urlpush $Z40" 2>&1) || rc=$?
+fetch_head_after=$(cat "$FX/.git/FETCH_HEAD" 2>/dev/null || true)
+if [ "$rc" -eq 0 ] && [ "$fetch_head_after" = "$fetch_head_before" ]; then
+    pass "explicit-URL push preserves the caller's own FETCH_HEAD"
+else
+    fail "explicit-URL push clobbered FETCH_HEAD (before='$fetch_head_before' after='$fetch_head_after' rc=$rc)" "out: $out"
+fi
+
+echo "TEST: explicit-URL push to an unreachable fork with embedded credentials -> refusal does not leak them"
+# Loopback + a closed port (not example.com): a real DNS-resolving host makes
+# this suite depend on network availability and can hang (codex-1 CR finding).
+# 127.0.0.1 refuses the connection immediately with no external network use.
+rc=0; out=$(cd "$FX" && bash "$HOOK" "https://x-access-token:sekrit456@127.0.0.1:1/no-such-fork.git" "https://x-access-token:sekrit456@127.0.0.1:1/no-such-fork.git" <<< "refs/heads/feat/urlpush $fx_feat_sha refs/heads/feat/urlpush $Z40" 2>&1) || rc=$?
+if [ "$rc" -eq 2 ]; then pass "unreachable credentialed fork URL -> exit 2 (fail closed)"; else fail "unreachable credentialed fork URL -> expected exit 2 got $rc" "out: $out"; fi
+case "$out" in
+    *"sekrit456"*)
+        fail "refusal message leaks the embedded credential" "out: $out" ;;
+    *"could not fetch the default branch from"*)
+        pass "refusal names the scrubbed endpoint, not the raw credentialed URL" ;;
+    *)
+        fail "unexpected refusal message" "out: $out" ;;
+esac
+
 echo "TEST: http(s) credentials are scrubbed from the marker endpoint"
 git -C "$REPO" checkout -q -b feat/scrub main
 echo 'function s(){}' > "$REPO/scrub.sh"
@@ -723,6 +813,12 @@ if [ -f "$sm" ] && grep -q "sekrit123" "$sm"; then
     fail "marker leaks the credential into plaintext under .git"
 else
     pass "marker carries no credential material"
+fi
+sm_remote=$(awk -F' [|] ' '{gsub(/^[ \t]+|[ \t]+$/,"",$4); print $4; exit}' "$sm" 2>/dev/null || true)
+if [ "$sm_remote" = "origin" ]; then
+    pass "named-remote push: marker field 4 stays the remote NAME (guards the ticket's byte-for-byte-unaffected requirement against the explicit-URL scrub branch scope-creeping onto named remotes)"
+else
+    fail "named-remote push: field 4 changed to '$sm_remote', expected 'origin' unchanged" "out: $out"
 fi
 
 echo "TEST: ref push without an endpoint URL -> fail CLOSED naming the missing binding"

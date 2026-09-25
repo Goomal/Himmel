@@ -1500,8 +1500,58 @@ classify_clause() {
         # token for everything below (inner-loop flag scans etc.) - only the
         # case-match target is stripped.
         case "$(_wrapper_base "$s")" in
-            command|exec|builtin|nohup|time|nice)
-                i=$((i+1)); continue ;;                    # transparent wrapper (no args to consume)
+            nice)
+                i=$((i+1))                                 # nice [-n ADJ|-ADJ|--adjustment=N] CMD
+                while [ "$i" -lt "$n" ]; do
+                    case "$(_strip_cmd "${toks[$i]}")" in
+                        -n|--adjustment) i=$((i+2)) ;;      # flag + separate value
+                        -*)              i=$((i+1)) ;;      # -5 / -n5 / --adjustment=N / ...
+                        *)               break ;;
+                    esac
+                done
+                continue ;;
+            time)
+                i=$((i+1))                                 # time [-p|-o FILE|-f FORMAT|...] CMD
+                while [ "$i" -lt "$n" ]; do
+                    case "$(_strip_cmd "${toks[$i]}")" in
+                        -o|--output|-f|--format) i=$((i+2)) ;;  # flag + value
+                        -*)                       i=$((i+1)) ;; # -p / -a / -v / --verbose / ...
+                        *)                        break ;;
+                    esac
+                done
+                continue ;;
+            nohup)
+                i=$((i+1))                                 # nohup [--] CMD (no other options)
+                if [ "$i" -lt "$n" ] && [ "$(_strip_cmd "${toks[$i]}")" = "--" ]; then
+                    i=$((i+1))
+                fi
+                continue ;;
+            command)
+                i=$((i+1))                                 # command [-pvV] NAME [arg...]
+                cmd_lookup=0
+                while [ "$i" -lt "$n" ]; do
+                    case "$(_strip_cmd "${toks[$i]}")" in
+                        -v|-V) cmd_lookup=1; i=$((i+1)) ;;  # identify-only (type/which), never invokes NAME
+                        -*) i=$((i+1)) ;;                   # -p
+                        *)  break ;;
+                    esac
+                done
+                if [ "$cmd_lookup" -eq 1 ]; then
+                    return 0                                # command -v/-V NAME is a lookup, not an execution
+                fi
+                continue ;;
+            exec)
+                i=$((i+1))                                 # exec [-cl] [-a NAME] CMD
+                while [ "$i" -lt "$n" ]; do
+                    case "$(_strip_cmd "${toks[$i]}")" in
+                        -a) i=$((i+2)) ;;                   # flag + value
+                        -*) i=$((i+1)) ;;                   # -c / -l
+                        *)  break ;;
+                    esac
+                done
+                continue ;;
+            builtin)
+                i=$((i+1)); continue ;;                    # builtin NAME [args] - no options
             setsid)
                 # HIMMEL-2615: setsid [-c|-f|-w|--ctty|--fork|--wait] CMD. Same
                 # shape as nohup - no setsid option takes a SEPARATE value - so

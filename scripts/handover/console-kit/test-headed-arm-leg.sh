@@ -2445,6 +2445,40 @@ contains "37 leg 2's launcher-env names its OWN mcp-config file" "$lenv37" "LEG_
 not_contains "37 leg 2's launcher-env does not keep leg 1's stale mcp-config file" "$lenv37" "LEG_PROFILE_MCP_CONFIG=$leg1_mcp37"
 contains "37 an unrelated sibling launcher-env token still survives" "$lenv37" "KEEP_ME=1"
 
+# --- 37b (#1334 CR follow-up). Case 37 above covers a leg-2 whose OWN profile
+# re-propagates all three names. A leg-2 whose profile does NOT touch a given
+# name this run - here, "mcp-none" (registered above, case 18d's own fixture:
+# no mcpServers field) - never calls leg_propagate_env LEG_PROFILE_MCP_CONFIG
+# at all, so a per-site leg_env_drop_token alone (only reachable INSIDE the
+# `mcpServers != null` branch) would leave leg-1's stale plain var AND token
+# live. Worse than a stale value: the real-launch write-if-set block further
+# down reads the stale plain LEG_PROFILE_MCP_CONFIG as "this leg has an mcp
+# config" and then references $MCP_CONFIG_JSON, which THIS leg's run never
+# assigned (mcp-none never entered that resolution branch) - an unbound
+# variable under `set -u`, i.e. the wrapper crashes instead of launching.
+# Real (non-dry) launch, matching case 18's own fixture registry/profile.
+d37b="$tmp/c37b"; mk_launch_stubs "$d37b" "HIMMEL-9999-leg2b"; mkdir -p "$tmp/repo37b"
+leg1_settings37b="$tmp/leg-1-37b.leg-settings.json"
+leg1_preface37b="$tmp/leg-1-37b.leg-preface.md"
+leg1_mcp37b="$tmp/leg-1-37b.leg-mcp.json"
+printf '%s' '{"mcpServers":{"SENTINEL_LEG1":{}}}' > "$leg1_mcp37b"
+rc=0
+PLUGIN_PROFILES_REGISTRY="$mcpreg" \
+LEG_PROFILE_SETTINGS="$leg1_settings37b" LEG_PROFILE_PREFACE="$leg1_preface37b" LEG_PROFILE_MCP_CONFIG="$leg1_mcp37b" \
+HEADED_ARM_LAUNCHER_ENV="LEG_PROFILE_SETTINGS=$leg1_settings37b LEG_PROFILE_PREFACE=$leg1_preface37b LEG_PROFILE_MCP_CONFIG=$leg1_mcp37b KEEP_ME=1" \
+RUN_LEG_ARGS='--profile mcp-none' run_leg "$d37b" "$tmp/repo37b" "HIMMEL-9999-leg2b" "claude-sonnet-5" >/dev/null 2>&1 || rc=$?
+wait_record "$d37b" || true
+check "37b leg 2 (mcp-none profile) still launches (no unbound-variable crash)" "$rc" "0"
+check "37b leg 1's own mcp file is untouched" \
+  "$(cat "$leg1_mcp37b" 2>/dev/null || true)" '{"mcpServers":{"SENTINEL_LEG1":{}}}'
+env37b="$(cat "$d37b/env-record" 2>/dev/null || true)"
+not_contains "37b leg 2's launched env carries no LEG_PROFILE_MCP_CONFIG at all" "$env37b" "LEG_PROFILE_MCP_CONFIG="
+if [ -e "$d37b/HIMMEL-9999-leg2b.leg-mcp.json" ]; then
+  echo "FAIL - 37b leg 2 must not get its own mcp file (mcp-none has no mcpServers field)"; fails=$((fails+1))
+else
+  echo "ok - 37b leg 2 gets no mcp file (mcp-none has no mcpServers field)"
+fi
+
 echo "---"
 if [ "$fails" -eq 0 ]; then
   echo "PASS - test-headed-arm-leg.sh"

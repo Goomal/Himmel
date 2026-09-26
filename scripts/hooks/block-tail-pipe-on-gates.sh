@@ -426,6 +426,12 @@ invoked_program() {
         pending=''
         # A LEADING redirection is not the command (panel r4, codex-1). A bare
         # operator token (`2>`) also swallows the target word that follows it.
+        # HIMMEL-3677 (J1314O): this word-walk cannot reliably tell a redirect
+        # from an escaped, glued or process-substitution word that merely
+        # CONTAINS `<`/`>` — scan_line's stage-level fail-closed check now
+        # owns that distinction for the first stage of a tail/head pipeline;
+        # this stays exactly as it was pre-HIMMEL-3677 for every other case
+        # (the last-stage tail/head check, and any stage with no pipe at all).
         if [ "$skip_next" = 1 ]; then skip_next=0; continue; fi
         case $stripped in
             *'>'* | *'<'*)
@@ -660,8 +666,54 @@ invoked_program() {
     done
 }
 
+# HIMMEL-3677 (J1314O): whether STAGE contains an unquoted `<`/`>` ANYWHERE —
+# real redirect, escaped (`normalise()` already un-escapes `\>`/`\<` to a bare
+# character before this text is ever seen), glued (`2>/dev/null`), spaced
+# (`2> /dev/null`), or process substitution (`>(cat)`, which is a real bash
+# WORD, not a redirect, but still spelled with a bare `>`). Rather than try to
+# tell these forms apart with a flag that can only remember ONE pending skip,
+# scan_line treats ANY of them as reason enough to stop trusting invoked_program's
+# word walk for this stage and decide by scanning the raw text instead
+# (fail-closed: J1314O findings 1-3, and the pre-existing `>'out>'` class).
+# `$(...)`/backtick bodies are already lifted out to a separate `SUBST`-marked
+# line by normalise(), and `$((...))` bodies to an `ARITH`-marked line, so
+# neither is present in STAGE here — no extra placeholder-skipping needed.
+stage_has_unquoted_angle() {
+    local str=$1 i=0 n dq=''
+    n=${#str}
+    while [ "$i" -lt "$n" ]; do
+        case ${str:$i:1} in
+            "'" | '"')
+                if [ -z "$dq" ]; then dq=${str:$i:1}
+                elif [ "$dq" = "${str:$i:1}" ]; then dq=''
+                fi
+                ;;
+            '<' | '>')
+                [ -z "$dq" ] && return 0 ;;
+        esac
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# HIMMEL-3677 (J1314O fail-closed rule): does ANY word of STAGE match
+# GATE_RE, quote-stripped — used only once stage_has_unquoted_angle says the
+# stage's real invoked program cannot be trusted, so this does not try to
+# resolve WHICH word is the command; it denies if a gate name appears
+# anywhere in the stage's text at all.
+stage_mentions_gate() {
+    local w stripped
+    for w in $1; do
+        stripped=${w//\"/}
+        stripped=${stripped//\'/}
+        [ -n "$stripped" ] || continue
+        grep -qE "$GATE_RE" <<<"$stripped" && return 0
+    done
+    return 1
+}
+
 scan_line() {
-    local line=$1 stmts pipeline prog last
+    local line=$1 stmts pipeline first prog last
     # The opt-out survived normalisation only if it was a real shell comment.
     case "$line" in *"$MARK"*) return 0 ;; esac
 
@@ -674,7 +726,20 @@ scan_line() {
 
     while IFS= read -r pipeline; do
         case "$pipeline" in *'|'*) ;; *) continue ;; esac
-        prog=$(invoked_program "${pipeline%%|*}")
+        # Last stage first (cheap filter): if it isn't tail/head, nothing in
+        # this pipeline can trip the guard regardless of the first stage.
+        last=${pipeline##*|}
+        last=${last#&}
+        case $(invoked_program "$last") in
+            tail | head | */tail | */head | "$ENV_SPLIT_SENTINEL") ;;
+            *) continue ;;
+        esac
+        first=${pipeline%%|*}
+        if stage_has_unquoted_angle "$first" && stage_mentions_gate "$first"; then
+            offender=$pipeline
+            return 0
+        fi
+        prog=$(invoked_program "$first")
         [ -n "$prog" ] || continue
         # HIMMEL-3661: ENV_SPLIT_SENTINEL means "unknown program that may be a
         # gate" — treat it as a match without consulting GATE_RE.
@@ -682,20 +747,6 @@ scan_line() {
             gate_match=$(printf '%s' "$prog" | grep -E "$GATE_RE")
             [ -n "$gate_match" ] || continue
         fi
-        # Last stage, same command-position walk — so `| env tail`, `| command
-        # head` and `| FOO=1 tail` are recognised too (panel r2, codex-1). The
-        # leading `&` is the tail of a `|&` operator, not a word.
-        # J1299O finding 1: the last stage can ALSO be an env -S/--split-string
-        # clause (`| env -S env tail`, `| env -Snice head`) — the walk returns
-        # ENV_SPLIT_SENTINEL there too, and since the split string is never
-        # parsed, it may itself be a tail/head invocation. Treat the sentinel
-        # as tail/head rather than falling through to ALLOW.
-        last=${pipeline##*|}
-        last=${last#&}
-        case $(invoked_program "$last") in
-            tail | head | */tail | */head | "$ENV_SPLIT_SENTINEL") ;;
-            *) continue ;;
-        esac
         offender=$pipeline
         return 0
     done <<EOF

@@ -538,11 +538,11 @@ unset -v _leg_env_scrub
 # HEADED_ARM_LAUNCHER_ENV token leg-1's own launch added - are still live in
 # that shell. Unlike CONSOLE_CONTEXT these three names DO belong on a leg, so
 # this is not a "must never reach a leg" scrub - it is "must be recomputed by
-# THIS leg, never inherited from a sibling". Per-site leg_env_drop_token calls
-# below the --profile resolution still cover the paths that re-propagate a
-# name, but a path that does NOT touch a given name this run (no --profile;
-# a profile with mcpServers: null skips LEG_PROFILE_MCP_CONFIG entirely) would
-# otherwise leave that sibling's stale value live - the plain var read at
+# THIS leg, never inherited from a sibling". Dropping the token only where a
+# name is re-propagated is not enough: a path that does NOT touch a given name
+# this run (no --profile; a profile with mcpServers: null skips
+# LEG_PROFILE_MCP_CONFIG entirely) would otherwise leave that sibling's stale
+# value live - the plain var read at
 # real-launch time (LEG_PROFILE_MCP_CONFIG's write-if-set check further down)
 # and the token forwarded to the actually-launched leg. Scrubbing both, once,
 # before any branch, means every path starts clean and the existing

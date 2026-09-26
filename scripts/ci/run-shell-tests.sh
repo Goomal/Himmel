@@ -699,6 +699,13 @@ scripts/test-plugin-test.sh          # integration: self-bootstraps a plugin's d
 # non-Linux reason is unchanged from its SKIP_LIST days.
 SKIP_LIST_NON_LINUX="
 scripts/test-adopt.sh                # HIMMEL-3203: skipped off-Linux only — timing-heavy full adoption matrix exceeds the hermetic runner's per-suite cap on Windows (600s default since HIMMEL-2233; the exceedance was last measured against the older 180s cap and STILL has not been re-measured, HIMMEL-3580 — do not reinstate on Windows without one); runs on Linux CI (~62s uncontended, 2026-09-19; re-verified PASS at 197s under concurrent multi-lane load, 2026-09-24 — still well inside the 600s cap either way); runnable individually, no VM e2e coverage
+scripts/vm/test-vm-clone-lib.sh              # HIMMEL-3699: skipped off-Linux only — exercises vm-clone.sh's slot-acquire preflight (scripts/vm/lib/vm-clone.sh:133), which requires flock (util-linux, absent from stock macOS); its own CodeRabbit-reviewed comment (PR #2206, vm-clone.sh:123-132) documents this as \"not a portability concern on THIS linux-only runner\" — VM-clone infra is Linux-only by design; precedent HIMMEL-3203
+scripts/vm/test-provenance-roundtrip-dry.sh  # HIMMEL-3699: skipped off-Linux only — same flock/Linux-only dependency as scripts/vm/test-vm-clone-lib.sh above (scripts/vm/lib/vm-clone.sh:133); precedent HIMMEL-3203
+scripts/upstreams/test-apply-drift-bump.sh   # HIMMEL-3699: skipped off-Linux only — same flock/Linux-only dependency as scripts/vm/test-vm-clone-lib.sh above (scripts/vm/lib/vm-clone.sh:133); precedent HIMMEL-3203
+scripts/release/test-tarball-vs-clone.sh     # HIMMEL-3699: skipped off-Linux only — converge-check.sh's hook-diff walk (scripts/release/converge-check.sh:154) uses GNU find's -printf (absent from BSD/macOS find), documented there as \`# gnu-ok: only ever runs on the Linux guest\` — the tarball converge check is Linux-guest-only by design; precedent HIMMEL-3203
+scripts/handover/console-kit/test-console-wait.sh    # HIMMEL-3699: skipped off-Linux only — console-wait.sh's own \`# PLATFORM GUARD: no .ps1 twin, by design — the console kit is Linux-only\` (console-wait.sh:79), and this suite's bare \`timeout\` calls are marked \`# gnu-ok: Linux-only kit\` throughout — the console kit is Linux-only by design; precedent HIMMEL-3203
+scripts/handover/console-kit/test-board.sh           # HIMMEL-3699: skipped off-Linux only — same console-kit Linux-only-by-design PLATFORM GUARD as test-console-wait.sh above (board.mjs:21: \"tick.sh reads pgrep, atq and the konsole launch logs\"); precedent HIMMEL-3203
+scripts/handover/console-kit/test-tick.sh            # HIMMEL-3699: skipped off-Linux only — same console-kit Linux-only-by-design PLATFORM GUARD as test-console-wait.sh above (tick.sh:12-14: \"pgrep, atq, /tmp suite locks, and claudex/konsole\"); precedent HIMMEL-3203
 "
 case "$(uname -s 2>/dev/null || echo unknown)" in
   Linux) ;;
@@ -3564,7 +3571,13 @@ while IFS= read -r suite <&3; do
   # not be skipped because a hygiene nicety could not be set up — but never
   # SILENTLY: a run that quietly lost its isolation is a run whose leftovers
   # nobody expects.
-  suite_tmp=$(mktemp -d "${TMPDIR:-/tmp}/himmel-suite.XXXXXX" 2>/dev/null) || suite_tmp=''
+  # HIMMEL-3699: anchor at literal /tmp, never ${TMPDIR:-/tmp} — on macOS,
+  # TMPDIR defaults to a per-process dir under /private/var/folders, and
+  # uninstall.sh's protected_path() hard-refuses anything under /var. A suite
+  # temp root that ended up there made every suite exercising protected_path
+  # (test-uninstall*.sh, test-console.sh, ...) see its own scratch dir as
+  # protected. Children still inherit TMPDIR/TMP/TEMP=$suite_tmp below.
+  suite_tmp=$(mktemp -d "/tmp/himmel-suite.XXXXXX" 2>/dev/null) || suite_tmp=''
   if [ -z "$suite_tmp" ]; then
     printf '[NOTE] %s — could not create a per-suite temp root; running in the shared one\n' "$suite"
   fi

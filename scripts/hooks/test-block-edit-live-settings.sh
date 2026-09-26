@@ -1282,6 +1282,168 @@ assert_rc "203 cp -t glued traversal from a worktree under HOME denies" 2 \
 assert_rc "204 cp -t glued traversal from a worktree directly under primary denies" 2 \
     "$(bash_rc_of "$WTDIRECT" "cp -t../.claude settings.json")"
 
+# 205-211 (HIMMEL-3686, J1313O "Out of scope, noted" follow-ups): a relative
+# dir-dest climb, a brace-hidden traversal, and a write through a
+# pre-existing symlink all ALLOWed at base (#1313/HIMMEL-3675 left these
+# three untouched) and must DENY now.
+
+# 205: `cp -r x/. ../..` from the nested worktree climbs LEXICALLY all the
+# way back to the primary's own .claude/ itself — no literal ".claude" or
+# "settings" in the text at all, so rule 1/2 never fired at base.
+assert_rc "205 cp -r x/. ../.. from nested worktree denies (dir-dest climb)" 2 \
+    "$(bash_rc_of "$NESTED_WT" "cp -r x/. ../..")"
+
+# 206 (control): the SAME shape but landing on a SIBLING inside worktrees/
+# (../other, not ../..) must stay ALLOW — this is a worktree writing to
+# another worktree's own container, not a climb into the primary.
+assert_rc "206 cp -r x/. ../other stays inside worktrees/ allows" 0 \
+    "$(bash_rc_of "$NESTED_WT" "cp -r x/. ../other")"
+
+# 207 (control): an ordinary same-directory copy inside the worktree, no
+# ".." anywhere, must stay ALLOW.
+assert_rc "207 cp a b inside worktree allows" 0 \
+    "$(bash_rc_of "$NESTED_WT" "cp a b")"
+
+# 208: `tee .{,.}/.{,.}/settings.json` from the nested worktree hides
+# `../../settings.json` inside an unexpanded brace group — no literal ".."
+# in the text, so has_traversal_dots never fired at base.
+assert_rc "208 tee brace-hidden traversal from nested worktree denies" 2 \
+    "$(bash_rc_of "$NESTED_WT" "tee .{,.}/.{,.}/settings.json")"
+
+# 209 (control): a brace group with no .claude/settings mention, outside a
+# nested worktree, and mkdir isn't in the write-verb list either way —
+# must stay ALLOW, unchanged from base.
+assert_rc "209 mkdir -p src/{a,b} outside a worktree allows" 0 \
+    "$(bash_rc_of "$PRIMARY" "mkdir -p src/{a,b}")"
+
+# 210: a pre-existing symlink at <primary>/.claude/worktrees/x/s resolving
+# to the primary's own live settings.json — the destination operand names
+# neither "settings.json" nor ".claude" as a container-relative mention
+# that survives the worktrees/ strip, so this was a text-only hook's blind
+# spot. Built in the scratch SANDBOX only.
+mkdir -p "$PRIMARY/.claude/worktrees/x"
+ln -s "$PRIMARY/.claude/settings.json" "$PRIMARY/.claude/worktrees/x/s"
+assert_rc "210 cp y through a pre-existing symlink to live settings.json denies" 2 \
+    "$(bash_rc_of "$WT2" "cp y \"$PRIMARY/.claude/worktrees/x/s\"")"
+
+# 211 (control): writing through an ordinary (non-symlink) worktree file
+# that merely happens to exist on disk must stay ALLOW.
+printf 'plain\n' > "$PRIMARY/.claude/worktrees/x/plain"
+assert_rc "211 cp y into an ordinary existing worktree file allows" 0 \
+    "$(bash_rc_of "$WT2" "cp y \"$PRIMARY/.claude/worktrees/x/plain\"")"
+
+# 212: same pre-existing-symlink shape as 210, but the symlink's own path
+# contains a space and the command text quotes it. Splitting the
+# quote-stripped command on whitespace (the pre-fix implementation) breaks
+# the one destination word into two, neither of which names the real
+# symlink — a real bypass the codex critic panel caught on this ticket.
+ln -s "$PRIMARY/.claude/settings.json" "$PRIMARY/.claude/worktrees/x/s ymlink"
+assert_rc "212 cp y through a quoted pre-existing symlink with a space denies" 2 \
+    "$(bash_rc_of "$WT2" "cp y \"$PRIMARY/.claude/worktrees/x/s ymlink\"")"
+
+# 213: same shape as 210/212, but the symlink sits on a PARENT DIRECTORY
+# rather than being the final destination itself, and the leaf name
+# (settings.local.json) does not exist ANYWHERE on disk yet — a genuinely
+# new destination, reached through a pre-existing symlinked dir that
+# escapes worktrees/ confinement into the primary's own .claude/, with
+# neither ".." nor ".claude" anywhere in the command text (codex-2 round-2
+# panel finding on this ticket: canon()'s realpath-m/resolve(strict=False)
+# already follow symlinks in every EXISTING path component even when the
+# final leaf is missing, so gating check_target on the full path's own
+# existence — rather than its parent's — missed this).
+ln -s "$PRIMARY/.claude" "$NESTED_WT/escape"
+assert_rc "213 cp y through a symlinked PARENT dir to a not-yet-existing settings.local.json denies" 2 \
+    "$(bash_rc_of "$NESTED_WT" "cp y escape/settings.local.json")"
+
+# 214 (control): the SAME symlinked-parent-dir shape, but the symlink
+# target stays INSIDE worktrees/ (a sibling worktree's own container) and
+# the leaf name is not a live-settings filename — must stay ALLOW.
+mkdir -p "$PRIMARY/.claude/worktrees/sibling"
+ln -s "$PRIMARY/.claude/worktrees/sibling" "$NESTED_WT/escape-inside"
+assert_rc "214 cp y through a symlinked parent dir staying inside worktrees/ allows" 0 \
+    "$(bash_rc_of "$NESTED_WT" "cp y escape-inside/notes.json")"
+
+# 215: a DANGLING symlink — the operand itself is a symlink whose target
+# (a live settings.json) does not exist yet — through a separate primary-like
+# repo that has never had a settings.json created. `-e` follows symlinks and
+# reports false for a dangling one, so the pre-fix code's `[ -e "$wabs" ]`
+# gate skipped check_target entirely; the symlink's own name ("dangle-link")
+# is not itself a settings-named leaf, so round-2's parent-existence pre
+# filter does not catch it either (round-3 codex-1 panel finding).
+DANGLE_PRIMARY="$SANDBOX/dangle-primary"
+mkrepo "$DANGLE_PRIMARY"
+mkdir -p "$DANGLE_PRIMARY/.claude"
+ln -s "$DANGLE_PRIMARY/.claude/settings.json" "$WT2/dangle-link"
+assert_rc "215 cp y through a dangling symlink to a not-yet-existing settings.json denies" 2 \
+    "$(bash_rc_of "$WT2" "cp y dangle-link")"
+
+# 216 (control): the same dangling-symlink shape, but the target's parent
+# is not a live .claude at all — must stay ALLOW.
+ln -s "$DANGLE_PRIMARY/notes/plan.json" "$WT2/dangle-link-safe"
+assert_rc "216 cp y through a dangling symlink to a non-settings path allows" 0 \
+    "$(bash_rc_of "$WT2" "cp y dangle-link-safe")"
+
+# 217: HIMMEL-3686 round-5 codex-3 — lex_resolve's `for part in $joined`
+# word-split (with IFS=/) is also subject to bash's default pathname (glob)
+# expansion, which runs against the HOOK SUBPROCESS'S OWN real cwd —
+# unrelated to either BASE or the path being resolved — so a write-
+# destination operand containing a glob metacharacter (a legal filename
+# character) could silently resolve differently depending on what files
+# happen to exist wherever the hook process is invoked from. Force the real
+# process cwd to a scratch dir seeded with files that WOULD match the
+# operand's glob segment if pathname expansion fired, then confirm
+# lex_resolve still returns the untouched literal text.
+GLOBTRAP="$SANDBOX/glob-trap-real-cwd"
+mkdir -p "$GLOBTRAP/a"
+touch "$GLOBTRAP/a/one" "$GLOBTRAP/a/two"
+LEX_RESOLVE_SRC="$SANDBOX/lex_resolve_extract.sh"
+sed -n '/^lex_resolve() {/,/^}/p' "$HOOK" > "$LEX_RESOLVE_SRC"
+LEX_OUT=$(cd "$GLOBTRAP" && bash -c '
+    source "$1"
+    lex_resolve "/x/y" "../a/*"
+' _ "$LEX_RESOLVE_SRC")
+if [ "$LEX_OUT" = "/x/a/*" ]; then
+    echo "PASS 217 lex_resolve leaves a glob-metacharacter segment untouched regardless of files in the hook process's real cwd (got $LEX_OUT)"
+else
+    echo "FAIL 217 lex_resolve leaves a glob-metacharacter segment untouched regardless of files in the hook process's real cwd — expected /x/a/*, got $LEX_OUT"
+    FAILED=$((FAILED + 1))
+fi
+
+# 218: HIMMEL-3686 CodeRabbit (round-6) — the TOK=0 fallback's own
+# `for w in $cmd_n; do _check_write_operand "$w"; done` (used whenever the
+# tokenizer can't fully vouch for the command text, e.g. a heredoc is
+# present) is UNQUOTED, so it is also subject to pathname (glob) expansion
+# against the HOOK SUBPROCESS'S OWN real cwd — unrelated to tool_input.cwd.
+# A write-destination operand containing a glob metacharacter can therefore
+# be silently replaced depending on what files happen to exist wherever the
+# hook process is launched from. Build a real symlink into a live settings
+# file at a fixed relative path inside a worktree, then run the SAME
+# heredoc-bearing (TOK=0) command with that symlink addressed via a glob
+# operand from two different real launch cwds: one with no matching decoy,
+# one with a same-named decoy that makes the glob expand successfully. The
+# verdict must be identical in both cases.
+mkdir -p "$WT2/wtlink"
+ln -s "$PRIMARY/.claude/settings.json" "$WT2/wtlink/s"
+TOK0_GLOB_CMD='cat <<HEREDOC_BODY
+x
+HEREDOC_BODY
+cp y wtlink/*'
+TOK0_GLOB_JSON=$(jq -n --arg cmd "$TOK0_GLOB_CMD" --arg cwd "$WT2" \
+    '{tool_name: "Bash", tool_input: {command: $cmd, cwd: $cwd}}')
+TRAP_EMPTY="$SANDBOX/tok0-glob-trap-empty"
+mkdir -p "$TRAP_EMPTY"
+TRAP_MATCH="$SANDBOX/tok0-glob-trap-match"
+mkdir -p "$TRAP_MATCH/wtlink"
+touch "$TRAP_MATCH/wtlink/s"
+RC_TRAP_EMPTY=$(cd "$TRAP_EMPTY" && printf '%s' "$TOK0_GLOB_JSON" | bash "$HOOK" >/dev/null 2>&1; echo $?)
+RC_TRAP_MATCH=$(cd "$TRAP_MATCH" && printf '%s' "$TOK0_GLOB_JSON" | bash "$HOOK" >/dev/null 2>&1; echo $?)
+if [ "$RC_TRAP_EMPTY" = "$RC_TRAP_MATCH" ] && [ "$RC_TRAP_EMPTY" = 0 ]; then
+    echo "PASS 218 TOK=0 fallback's glob write operand gives the same, correct ALLOW verdict regardless of a same-named decoy in the hook process's real cwd (rc=$RC_TRAP_EMPTY both)"
+else
+    echo "FAIL 218 TOK=0 fallback's glob write operand verdict depends on the hook process's real cwd contents, or is not ALLOW — got rc=$RC_TRAP_EMPTY with no decoy, rc=$RC_TRAP_MATCH with a same-named decoy present (expected 0 both)"
+    FAILED=$((FAILED + 1))
+fi
+
 # Clean up worktree registrations before removing the sandbox (avoids
 # dangling `git worktree` admin records under SANDBOX/primary).
 git -C "$SANDBOX/primary" worktree remove --force "$SANDBOX/primary/.claude/worktrees/feat+x" 2>/dev/null || true

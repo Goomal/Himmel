@@ -59,6 +59,14 @@ Wherever you see the literal token `YYYY-MM-DD` in instructions below — includ
 
 Verify `<vault>/Clippings/` exists (using the same path form throughout the run). If not, exit 0 with: `triage-clips: no Clippings/ folder — nothing to triage`.
 
+### G-8 — Harvest-completion gate (HIMMEL-1137) — run FIRST after vault resolution
+
+triage-clips consumes harvest output (`harvested_at` + the `## Harvested content` body). A hard-killed `/harvest-clips` mid-run leaves that state partial — running triage against it corrupts downstream output. Before scanning:
+
+If `<vault>/.harvest.done` does not exist: abort with `triage-clips: upstream harvest incomplete — <vault>/.harvest.done not found; run /harvest-clips first.` Exit 2. No date-freshness check: G-2 invalidates the marker at the START of every harvest run, so its mere presence already means "the most recent harvest that started finished cleanly" — a night where harvest exits early without running (bank-threshold skip) leaves yesterday's marker valid, and that is correct.
+
+No operator override flag — keep it minimal; re-running `/harvest-clips` clears the gate.
+
 ### Scan for unprocessed clips
 
 A clip is **unprocessed** unless its **leading, properly closed YAML frontmatter block** contains a line matching `^processed:[[:space:]]*true[[:space:]]*$` (case-sensitive `true`). Both qualifiers are load-bearing — a match in the body, or inside an unterminated block, is NOT the marker. Implementation:

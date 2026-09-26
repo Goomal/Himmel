@@ -7,7 +7,7 @@
 # fake /proc root (CLAUDE_SESSIONS_PROC) with real NUL-separated
 # <pid>/cmdline files, not a flattened `pgrep -af` line. The "lossy fallback"
 # scenario below is the dedicated regression test for the no-/proc degraded
-# path; HIMMEL-1335 reshaped its stubs to the real BSD binaries (`pgrep -x`
+# path; #1335 reshaped its stubs to the real BSD binaries (`pgrep -x`
 # bare pids + `ps -o pid=,args=`), since the old GNU-only `pgrep -af` stub
 # masked the macOS bug it was supposed to catch.
 #
@@ -367,7 +367,7 @@ contains 'a console doc name with no parseable letter reads nonces=unknown' "$(b
 
 rm -f "$W/handover/console.md" "$kdoc" "$aadoc"
 
-# HIMMEL-1335: /proc absent (CLAUDE_SESSIONS_PROC pointing nowhere) falls
+# #1335: /proc absent (CLAUDE_SESSIONS_PROC pointing nowhere) falls
 # back to `pgrep -x claude` (bare pids) + `ps -o pid=,args= -p <pids>` (full
 # argv), the BSD-safe replacement for the old GNU-only `pgrep -af` scan. The
 # stubs are shaped like the REAL binaries -- pgrep prints only bare pids for
@@ -395,7 +395,7 @@ contains 'the /proc-absent fallback still counts the dispatched leg (HIMMEL-3145
 contains 'the /proc-absent fallback flags the degraded read' "$lossy_out" 'models=sonnet:1(lossy)'
 contains 'the /proc-absent fallback still reports ceiling=ok' "$lossy_out" 'ceiling=ok'
 
-# HIMMEL-1335 (ticket cause a): a console managing a DIFFERENT repo exports
+# #1335 (ticket cause a): a console managing a DIFFERENT repo exports
 # REPO as that repo's checkout -- tick.sh must still resolve
 # claude-sessions.sh from its OWN directory, not $REPO, or the source fails
 # (claude_sessions: command not found) and the census silently reads as a
@@ -407,14 +407,14 @@ cp "$W/repo/scripts/context-fill.sh" "$W/foreign-repo/scripts/context-fill.sh"
 cp "$W/repo/scripts/lanes/leg-burn.sh" "$W/foreign-repo/scripts/lanes/leg-burn.sh"
 cp "$W/repo/scripts/lib/bank-preflight.sh" "$W/foreign-repo/scripts/lib/bank-preflight.sh"
 foreign_out="$(REPO="$W/foreign-repo" PATH="$W/bin:$PATH" bash "$SUT" --legs 'HIMMEL-111-legN61')"
-contains 'a foreign REPO (no scripts/lanes/lib/) still counts a live leg (HIMMEL-1335)' "$foreign_out" 'procs=1'
+contains 'a foreign REPO (no scripts/lanes/lib/) still counts a live leg (#1335)' "$foreign_out" 'procs=1'
 contains 'a foreign REPO still buckets its model' "$foreign_out" 'models=sonnet:1'
 case "$foreign_out" in
     *procs=unknown*) fail 'a foreign REPO does not fall back to procs=unknown' ;;
     *) pass 'a foreign REPO does not fall back to procs=unknown' ;;
 esac
 
-# HIMMEL-1335 (ticket cause c): with no --legs armed at all, a census that
+# #1335 (ticket cause c): with no --legs armed at all, a census that
 # cannot run (pgrep itself broken, not merely lossy) must not render the
 # same legs=none a genuinely healthy empty fleet gets -- there is no way to
 # back up "no legs" when the instrument that would have caught an unarmed
@@ -426,7 +426,7 @@ exit 2
 STUB
 chmod +x "$W/bin-nopgrep/pgrep"
 unsupported_out="$(CLAUDE_SESSIONS_PROC="$W/no-such-proc" PATH="$W/bin-nopgrep:$PATH" bash "$SUT" --legs '')"
-contains 'no working census + no --legs reads legs=unsupported, not legs=none (HIMMEL-1335)' "$unsupported_out" 'legs=unsupported'
+contains 'no working census + no --legs reads legs=unsupported, not legs=none (#1335)' "$unsupported_out" 'legs=unsupported'
 case "$unsupported_out" in
     *' legs=none '*) fail 'legs=none is not reused for an unsupported census' ;;
     *) pass 'legs=none is not reused for an unsupported census' ;;

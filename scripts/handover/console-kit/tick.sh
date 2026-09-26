@@ -276,7 +276,7 @@ for leg in $LEGS_SPLIT; do
     leg_docmap="$leg_docmap$label=$leg_doc"$'\n'
     leg_candmap="$leg_candmap$label"$'\t'"$lock_status"$'\t'"$leg_cands"$'\n'
 done
-# HIMMEL-1335: legs_summary's "none" default is resolved further down, once
+# #1335: legs_summary's "none" default is resolved further down, once
 # the census (below) says whether it can back that up -- see the comment
 # there.
 [ -n "$tails_summary" ] || tails_summary=none
@@ -515,7 +515,7 @@ fi
 # /proc/<pid>/cmdline argv, NUL-delimited), never a flattened `pgrep -af`
 # line -- free-text argv (a -p/--append-system-prompt value containing the
 # literal substring "-n X") can no longer spoof procs=/models=.
-# HIMMEL-1335: resolved from $HERE (this script's own directory), not
+# #1335: resolved from $HERE (this script's own directory), not
 # $REPO -- $REPO names the repo THIS console manages (a different checkout
 # for every console but himmel's own), while claude-sessions.sh is a himmel
 # lane helper that always ships beside tick.sh. $REPO-relative sourcing
@@ -539,7 +539,7 @@ if [ "$sessions_rc" -gt 1 ] && { [ "$sessions_rc" -ne 3 ] || [ -z "$sessions_out
     sessions_out=""
     census_failed=1
 fi
-# HIMMEL-1335: an empty --legs arm reads legs=none only when the census could
+# #1335: an empty --legs arm reads legs=none only when the census could
 # actually have told us otherwise. A working census (however lossy) that
 # simply finds nothing live is a genuine healthy empty fleet -- legs=none
 # stays accurate. A census that could not run at all (pgrep/ps themselves

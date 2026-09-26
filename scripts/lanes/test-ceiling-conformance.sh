@@ -9,7 +9,7 @@
 # scenario (h) below a real regression test for the argv-boundary spoof
 # (a pgrep -af-only stub cannot tell "free-text -p value" from "a real -n/
 # --autocompact flag" in the first place). Scenario (i) is the no-/proc
-# fallback regression test; HIMMEL-1335 reshaped its stubs to the real BSD
+# fallback regression test; #1335 reshaped its stubs to the real BSD
 # binaries (`pgrep -x` bare pids + `ps -o pid=,args=`), since the old
 # GNU-only `pgrep -af` stub masked the macOS bug it was supposed to catch.
 #
@@ -128,7 +128,7 @@ out_h="$(run_primary)"
 contains 'a spoofed --autocompact in free-text argv does not override the real value' "$out_h" 'HIMMEL-555-legN70-2026-09-13 auto'
 contains 'the spoofed leg still reports its real DRIFT' "$out_h" 'ceiling=DRIFT:HIMMEL-555-legN70-2026-09-13'
 
-# (i) HIMMEL-1335: /proc absent (CLAUDE_SESSIONS_PROC pointing nowhere) falls
+# (i) #1335: /proc absent (CLAUDE_SESSIONS_PROC pointing nowhere) falls
 # back to `pgrep -x claude` (bare pids) + `ps -o pid=,args= -p <pids>` (full
 # argv) -- the BSD-safe replacement for the old GNU-only `pgrep -af` scan.
 # The stubs are shaped like the real binaries: pgrep hands back only bare

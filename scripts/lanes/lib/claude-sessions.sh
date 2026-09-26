@@ -14,7 +14,7 @@
 # read, so this falls back to `pgrep -x claude` (bare pids, comm-exact -- the
 # same flag the primary path above uses) plus `ps -o pid=,args= -p <pids>`
 # for each matched pid's full argv, and prints a leading "# lossy" comment
-# line so callers can flag the degraded read. HIMMEL-1335: the previous
+# line so callers can flag the degraded read. #1335: the previous
 # fallback (`pgrep -af`) relied on GNU pgrep's `-a`, which prints the full
 # argument list -- BSD pgrep (macOS) defines `-a` as "include ancestors"
 # instead and never prints args at all, so the old awk filter matched
@@ -202,7 +202,7 @@ _tsv_field() { # _tsv_field <value> - CR round 2 (codex-2, Suggestion): a
     printf '%s' "${v//$'\n'/ }"
 }
 
-_claude_sessions_lossy() { # _claude_sessions_lossy <pgrep-bin> - HIMMEL-1335:
+_claude_sessions_lossy() { # _claude_sessions_lossy <pgrep-bin> - #1335:
                             # the no-/proc fallback, made to work on BSD pgrep
                             # (macOS) as well as GNU. `pgrep -x claude`
                             # (comm-exact, the same flag the primary path

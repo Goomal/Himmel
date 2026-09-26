@@ -938,11 +938,23 @@ if [ -n "$PROFILE" ]; then
     fi
     # The shim reads these; propagate so they survive both konsole's
     # `-e env -u ...` (Linux) and `open -a`'s fresh environment (macOS).
+    # (#1334) This wrapper's own process may itself BE a leg that is arming a
+    # SIBLING leg (a console-spawned leg running further headed-arm-leg.sh
+    # calls of its own) - its own settings/preface/MCP triplet is inherited
+    # both as a plain env var and as a HEADED_ARM_LAUNCHER_ENV token, and
+    # leg_propagate_env's caller-wins de-dupe would otherwise keep THAT
+    # sibling's stale token forever, since every leg computes a per-NAME path
+    # here and would never itself collide by value. Drop the stale token
+    # right before resolving this leg's own value, same idiom HIMMEL-3456
+    # already uses for HIMMEL_CONSOLE_NAME below - siblings in the token list
+    # are untouched, only this exact name is dropped and re-added fresh.
+    leg_env_drop_token LEG_PROFILE_SETTINGS
     leg_propagate_env LEG_PROFILE_SETTINGS "$PROFILE_SETTINGS"
     # (HIMMEL-2985) Per-leg path, like PROFILE_SETTINGS above - the claudex
     # lane below overrides this to the same shape for its own coordination
     # preface; content is written only at real-launch time further down.
     LEG_PROFILE_PREFACE="$(dirname "$LOG")/$NAME.leg-preface.md"
+    leg_env_drop_token LEG_PROFILE_PREFACE
     leg_propagate_env LEG_PROFILE_PREFACE "$LEG_PROFILE_PREFACE"
     export HEADED_ARM_LAUNCHER="$LEG_SHIM"
     # Lean SessionStart (HIMMEL-2830): the three advisory hooks go quiet. Only
@@ -963,6 +975,7 @@ if [ -n "$PROFILE" ]; then
             exit 2
         fi
         PROFILE_MCP_CONFIG="$(dirname "$LOG")/$NAME.leg-mcp.json"
+        leg_env_drop_token LEG_PROFILE_MCP_CONFIG
         leg_propagate_env LEG_PROFILE_MCP_CONFIG "$PROFILE_MCP_CONFIG"
     fi
 fi
@@ -985,6 +998,10 @@ if [ "$LANE" = "claudex" ]; then
         leg_propagate_env LEG_PROFILE_PREFACE "$LEG_PROFILE_PREFACE"
     else
         LEG_PROFILE_PREFACE="$CLAUDEX_PREFACE"
+        # (#1334) --no-profile here is the only reachable path that has not
+        # already dropped a stale LEG_PROFILE_PREFACE token above (that block
+        # only runs when a profile is set) - same fix, same reason.
+        leg_env_drop_token LEG_PROFILE_PREFACE
         leg_propagate_env LEG_PROFILE_PREFACE "$LEG_PROFILE_PREFACE"
     fi
 fi

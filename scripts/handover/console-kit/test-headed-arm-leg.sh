@@ -2415,6 +2415,36 @@ check "self-resolved root, doc outside it: grant is never \$HOME" \
 check "self-resolved root, doc outside it: grant is never the repo root" \
   "$(jq --arg d "$primary35" '(.permissions.additionalDirectories // []) | any(. == $d)' "$settings35" 2>/dev/null)" "false"
 
+# --- 37 (#1334). leg_propagate_env's caller-wins de-dupe (case 29/31b above)
+# is correct for a generic passthrough knob, but wrong for the per-leg
+# settings/preface/MCP triplet: this wrapper's own process may itself BE a
+# leg that is now arming a SIBLING leg (console.sh's do_arm() comment: "this
+# process itself may BE a leg"), so leg-1's own LEG_PROFILE_SETTINGS/
+# LEG_PROFILE_PREFACE/LEG_PROFILE_MCP_CONFIG - both the plain env var and the
+# HEADED_ARM_LAUNCHER_ENV token leg-1's own launch added - are still live in
+# that shell when it arms leg-2. Before the fix, leg-2's launcher-env kept
+# leg-1's stale triplet forever, since a real leg never collides with its OWN
+# by-NAME path (only a sibling can). Same bug class HIMMEL-3456 already fixed
+# for HIMMEL_CONSOLE_NAME (see the "preset token" cases above), same fix
+# (leg_env_drop_token) now applied to the triplet.
+leg1_settings37="$tmp/leg-1.leg-settings.json"
+leg1_preface37="$tmp/leg-1.leg-preface.md"
+leg1_mcp37="$tmp/leg-1.leg-mcp.json"
+leg2_settings37="$tmp/HIMMEL-9999-leg-2.leg-settings.json"
+leg2_preface37="$tmp/HIMMEL-9999-leg-2.leg-preface.md"
+leg2_mcp37="$tmp/HIMMEL-9999-leg-2.leg-mcp.json"
+out37="$(LEG_PROFILE_SETTINGS="$leg1_settings37" LEG_PROFILE_PREFACE="$leg1_preface37" LEG_PROFILE_MCP_CONFIG="$leg1_mcp37" \
+  HEADED_ARM_LAUNCHER_ENV="LEG_PROFILE_SETTINGS=$leg1_settings37 LEG_PROFILE_PREFACE=$leg1_preface37 LEG_PROFILE_MCP_CONFIG=$leg1_mcp37 KEEP_ME=1" \
+  bash "$SCRIPT" --dry-run --profile leg-impl HIMMEL-9999-leg-2 some/doc.md /tmp/nosig 99999999999 "$tmp/HIMMEL-9999-leg-2.log" claude-sonnet-5 2>&1)"
+lenv37="$(printf '%s\n' "$out37" | grep '^headed-arm-leg: lane=')"
+contains "37 leg 2's launcher-env names its OWN settings file" "$lenv37" "LEG_PROFILE_SETTINGS=$leg2_settings37"
+not_contains "37 leg 2's launcher-env does not keep leg 1's stale settings file" "$lenv37" "LEG_PROFILE_SETTINGS=$leg1_settings37"
+contains "37 leg 2's launcher-env names its OWN preface file" "$lenv37" "LEG_PROFILE_PREFACE=$leg2_preface37"
+not_contains "37 leg 2's launcher-env does not keep leg 1's stale preface file" "$lenv37" "LEG_PROFILE_PREFACE=$leg1_preface37"
+contains "37 leg 2's launcher-env names its OWN mcp-config file" "$lenv37" "LEG_PROFILE_MCP_CONFIG=$leg2_mcp37"
+not_contains "37 leg 2's launcher-env does not keep leg 1's stale mcp-config file" "$lenv37" "LEG_PROFILE_MCP_CONFIG=$leg1_mcp37"
+contains "37 an unrelated sibling launcher-env token still survives" "$lenv37" "KEEP_ME=1"
+
 echo "---"
 if [ "$fails" -eq 0 ]; then
   echo "PASS - test-headed-arm-leg.sh"

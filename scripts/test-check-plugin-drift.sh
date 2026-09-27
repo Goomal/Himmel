@@ -686,6 +686,10 @@ for f in /usr/bin/*; do
   esac
   tool_link "$f" "$W8/notimeout/$b"
 done
+# macOS ships bash only at /bin/bash, never under /usr/bin -- name it
+# explicitly (same convention as the NOGH_BIN block above) so the rebuilt
+# PATH can still run "$SCRIPT" regardless of which directory holds it.
+tool_link "$(command -v bash)" "$W8/notimeout/bash"
 cat > "$W8/bin/gh" <<'GH'
 #!/usr/bin/env bash
 [ "$1" = auth ] && [ "$2" = status ] && exit 0
@@ -776,19 +780,31 @@ cat > "$W10/upstreams.json" <<'JSON'
 JSON
 printf '{"plugins":[]}' >"$W10/empty_mjson.json"
 printf '{}' >"$W10/empty_ups.json"
-TIMEOUT_PATH="$W10/bin:$PATH"
-if PATH="$TIMEOUT_PATH" command -v timeout >/dev/null 2>&1; then
-  ok "timeout-available setup: 'timeout' resolvable on PATH"
+# Stock macOS ships neither `timeout` nor `gtimeout` (HIMMEL-2589) -- the
+# ambient PATH cannot be trusted to have one, so resolve it explicitly via
+# scripts/lib/timeout-bin.sh and put it on this test's own PATH, same as
+# `tool_link` does for bash/dirname above, rather than assuming the host has
+# GNU coreutils.
+# shellcheck source=lib/timeout-bin.sh
+. "$ROOT/scripts/lib/timeout-bin.sh"
+if [ -n "$_TIMEOUT_BIN" ]; then
+  tool_link "$_TIMEOUT_BIN" "$W10/bin/timeout"
+  TIMEOUT_PATH="$W10/bin:$PATH"
+  if PATH="$TIMEOUT_PATH" command -v timeout >/dev/null 2>&1; then
+    ok "timeout-available setup: 'timeout' resolvable on PATH"
+  else
+    bad "timeout-available setup failed — 'timeout' not resolvable, timeout branch not actually exercised"
+  fi
+  w10_start=$(date +%s)
+  w10_out="$(PATH="$TIMEOUT_PATH" DRIFT_REGISTRY="$W10/upstreams.json" DRIFT_KNOWN_MARKETPLACES=/dev/null DRIFT_MJSON="$W10/empty_mjson.json" DRIFT_UPSTREAMS="$W10/empty_ups.json" bash "$SCRIPT" 2>&1)"; w10_rc=$?
+  w10_elapsed=$(( $(date +%s) - w10_start ))
+  if [ "$w10_elapsed" -lt 20 ]; then ok "timeout-path hanging probe: run completed in ${w10_elapsed}s (<20s)"; else bad "timeout-path hanging probe: run took ${w10_elapsed}s (>=20s) — 'timeout' did not bound it"; fi
+  if grepq "$(printf '%s' "$w10_out" | grep 'timedprobe-tool')" 'probe timed out (10s)'; then ok "timeout-path hanging probe: entry reads 'probe timed out (10s)' UNCHECKED"; else bad "timeout-path hanging probe: no timeout note; $(printf '%s' "$w10_out" | grep timedprobe-tool)"; fi
+  if grepq "$w10_out" -E '^  timedprobe-tool: (CURRENT|BEHIND)'; then bad "timeout-path hanging probe: entry read CURRENT/BEHIND instead of UNCHECKED (partial pre-hang output was parsed)"; else ok "timeout-path hanging probe: entry never read CURRENT/BEHIND"; fi
+  if [ "$w10_rc" -eq 3 ]; then ok "timeout-path hanging probe run exits 3 (incomplete)"; else bad "timeout-path hanging probe run rc=$w10_rc; expected 3"; fi
 else
-  bad "timeout-available setup failed — 'timeout' not resolvable, timeout branch not actually exercised"
+  ok "timeout-available path: skipped — no GNU timeout/gtimeout resolvable on this host (consistent with the documented degrade in timeout-bin.sh)"
 fi
-w10_start=$(date +%s)
-w10_out="$(PATH="$TIMEOUT_PATH" DRIFT_REGISTRY="$W10/upstreams.json" DRIFT_KNOWN_MARKETPLACES=/dev/null DRIFT_MJSON="$W10/empty_mjson.json" DRIFT_UPSTREAMS="$W10/empty_ups.json" bash "$SCRIPT" 2>&1)"; w10_rc=$?
-w10_elapsed=$(( $(date +%s) - w10_start ))
-if [ "$w10_elapsed" -lt 20 ]; then ok "timeout-path hanging probe: run completed in ${w10_elapsed}s (<20s)"; else bad "timeout-path hanging probe: run took ${w10_elapsed}s (>=20s) — 'timeout' did not bound it"; fi
-if grepq "$(printf '%s' "$w10_out" | grep 'timedprobe-tool')" 'probe timed out (10s)'; then ok "timeout-path hanging probe: entry reads 'probe timed out (10s)' UNCHECKED"; else bad "timeout-path hanging probe: no timeout note; $(printf '%s' "$w10_out" | grep timedprobe-tool)"; fi
-if grepq "$w10_out" -E '^  timedprobe-tool: (CURRENT|BEHIND)'; then bad "timeout-path hanging probe: entry read CURRENT/BEHIND instead of UNCHECKED (partial pre-hang output was parsed)"; else ok "timeout-path hanging probe: entry never read CURRENT/BEHIND"; fi
-if [ "$w10_rc" -eq 3 ]; then ok "timeout-path hanging probe run exits 3 (incomplete)"; else bad "timeout-path hanging probe run rc=$w10_rc; expected 3"; fi
 rm -rf "$W10"
 
 # 11. latest_source=release (HIMMEL-1046): for a NON-MONOTONIC-tag upstream, the

@@ -158,6 +158,7 @@ implementation=0
 operational_context=0
 research=0
 followed_by_action=0
+gate_action=0
 read_only_declared=0
 imperative_verb=0
 
@@ -213,6 +214,52 @@ fi
 if grepq "$text" -Eqi '(^|[^[:alnum:]_])(research|explore|investigate|analy[sz]e|review|audit|plan|design|locate|trace|explain|read-only)([^[:alnum:]_]|$)'; then
     research=1
 fi
+if grepq "$text" -Eqi '(^|[^[:alnum:]_])(then|and)([[:space:][:punct:]]+)(implement|fix|land|apply|edit|modify|commit)([^[:alnum:]_]|$)'; then
+    gate_action=1
+fi
+
+# CodeRabbit (HIMMEL-1534 PR #1388): a bare "write" is ambiguous between
+# prose output (a summary/report/findings/notes/answer/overview/write-up)
+# and a code/file write. Only the latter is an implementation action.
+# A report-type object is safe ONLY when nothing path-like follows it in
+# the same clause -- a slash, a file extension, or "to <path>"/"into
+# <file>" all mean a file write, not a written summary.
+#
+# codex (PR #1388 round 2): a single first-match extraction missed a SECOND
+# then/and-write occurrence later in the same text ("write a report and
+# write code"), and its clause-boundary cut at a literal "." hid a file
+# extension right after the noun ("write a report.md").
+#
+# codex (PR #1388 round 3): the round-2 fix-up's remedy -- a fixed-width
+# 60-char window per occurrence, and a 1-5 char cap on the extension match --
+# was itself bounded, so a long-enough intervening phrase ("write a report
+# about <60+ chars> to notes.txt") or a long extension ("report.markdown",
+# 8 chars) could push the path-like signal outside what either bound could
+# see. Fixed by dropping both bounds: take the UNBOUNDED remainder of the
+# text starting right after the first then/and-write occurrence. A second
+# write/edit/etc. transition anywhere in that remainder is already covered
+# by the existing danger alternation (it includes "write"), so no separate
+# occurrence loop is needed -- one unbounded tail check subsumes it.
+if grepq "$text" -Eqi '(^|[^[:alnum:]_])(then|and)([[:space:][:punct:]]+)write([^[:alnum:]_]|$)'; then
+    lower_text=$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]')
+    write_trigger=$(printf '%s' "$lower_text" | grep -Eo '(^|[^[:alnum:]_])(then|and)[[:space:][:punct:]]+write' | head -1)
+    write_tail=${lower_text#*"$write_trigger"}
+    if [ -n "$write_trigger" ] && grepq "$write_tail" -Eq '^[[:space:]]+(a[[:space:]]+|the[[:space:]]+)?(summary|report|findings|notes|answer|overview|write-up)([^[:alnum:]_]|$)' && ! grepq "$write_tail" -Eq '/|\.[a-zA-Z0-9]+([^[:alnum:]]|$)|[[:space:]](to|into)[[:space:]]|(then|and)[[:space:][:punct:]]+(implement|fix|land|apply|edit|modify|commit|write)'; then
+        :
+    else
+        gate_action=1
+    fi
+fi
+
+# J1388A (Opus judge, PR #1388): the write-clause exemption above must only
+# ever narrow the NEW first-gate widening (gate_action), never main's own
+# followed_by_action -- which still vetoes the older read-only-declared and
+# research allow exits below (:296, :306 -- HIMMEL-1617/HIMMEL-1608). Before
+# this split, the exemption cleared followed_by_action itself, so a dispatch
+# with a read-only declaration, an implementation signal, and an exempted
+# "then write a summary" cleared the veto and was ALLOWed on head where main
+# GOVERNED it. followed_by_action is recomputed here exactly as it is on
+# main -- bare "write" included -- independent of the exemption above.
 if grepq "$text" -Eqi '(^|[^[:alnum:]_])(then|and)([[:space:][:punct:]]+)(implement|fix|land|apply|write|edit|modify|commit)([^[:alnum:]_]|$)'; then
     followed_by_action=1
 fi
@@ -233,7 +280,14 @@ if grepq "$text" -Eqi 'do[[:space:]]+not[[:space:]]+edit|analysis[[:space:]]+onl
     read_only_declared=1
 fi
 
-[ "$implementation" = "1" ] || [ "$operational_context" = "1" ] || exit 0
+# HIMMEL-1534: an action-transition signal must be consulted here too -- a
+# "research X, then edit Y" dispatch has research=1, implementation=0
+# (bare-verb regex doesn't cover edit/modify/write/commit), operational_context=0,
+# but gate_action=1 (the "then edit" action transition), and the old
+# two-disjunct gate exited 0 before that signal was ever read, bypassing lane
+# routing and the HIMMEL-920 bank guard. gate_action feeds only THIS gate --
+# see J1388A above for why it is split from followed_by_action.
+[ "$implementation" = "1" ] || [ "$operational_context" = "1" ] || [ "$gate_action" = "1" ] || exit 0
 if [ "$research" = "1" ] && [ "$implementation" = "0" ] && [ "$followed_by_action" = "0" ] && [ "$operational_context" = "0" ]; then
     exit 0
 fi

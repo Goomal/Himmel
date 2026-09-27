@@ -2970,6 +2970,41 @@ check_c40_qmd_vec() {
     fi
 }
 
+# --- C45-qmd-daemon: qmd daemon RSS + uptime vs the recycle ceiling (HIMMEL-3062)
+# The qmd HTTP daemon grows native memory over hours (6.8 GB after ~4.5 h) until
+# vec queries time out while lex keeps working. The qmd plugin's SessionStart
+# hook (ensure-qmd-daemon.sh) recycles it once RSS passes QMD_RSS_CEILING_MB
+# (default 4096; 0 disables); this row reports RSS and uptime from ONE ps call
+# (no network) and WARNs when the daemon sits over that ceiling. Silent when no
+# pidfile, a dead pid, or a pid that is not a qmd mcp process (the hook owns
+# starting it; C40-qmd-vec reports whether it serves).
+# Test seams: HIMMEL_DOCTOR_QMD_PIDFILE (default
+# ${XDG_CACHE_HOME:-~/.cache}/qmd/mcp.pid, where qmd writes it),
+# HIMMEL_DOCTOR_QMD_PS (default ps).
+check_c45_qmd_daemon() {  # t13b-ok: doctor row that reads ps only, starts nothing
+    local pidfile="${HIMMEL_DOCTOR_QMD_PIDFILE:-${XDG_CACHE_HOME:-$HOME/.cache}/qmd/mcp.pid}"
+    local ps_bin="${HIMMEL_DOCTOR_QMD_PS:-ps}"
+    local ceiling="${QMD_RSS_CEILING_MB:-4096}" pid row rss_kb etime rss_mb
+    # A non-numeric ceiling disables the hook's recycle, so it disables the WARN.
+    case "$ceiling" in ''|*[!0-9]*) ceiling=0 ;; esac
+    ceiling=$((10#$ceiling))
+    [ -f "$pidfile" ] || return 0
+    pid="$(head -1 "$pidfile" 2>/dev/null | tr -d '[:space:]')"
+    case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+    row="$("$ps_bin" -o rss= -o etime= -o args= -p "$pid" 2>/dev/null)" || return 0
+    case "$row" in *qmd*mcp*) ;; *) return 0 ;; esac
+    read -r rss_kb etime _ <<< "$row"
+    case "$rss_kb" in ''|*[!0-9]*) return 0 ;; esac
+    rss_mb=$((rss_kb / 1024))
+    # Compare in KB, the unit the hook uses, so a 4096.5 MB daemon is over too.
+    if [ "$ceiling" -gt 0 ] && [ "$rss_kb" -gt $((ceiling * 1024)) ]; then
+        local fix="the qmd plugin's SessionStart hook recycles it on the next session start (log: ~/.cache/qmd/recycle.log); QMD_RSS_CEILING_MB tunes the ceiling"
+        emit WARN C45-qmd-daemon "qmd daemon pid $pid: RSS $rss_mb MB, up $etime -- over the recycle ceiling $ceiling MB (vec queries degrade as it grows)" "$fix"  # t13b-ok: doctor report text, starts nothing
+    else
+        emit OK C45-qmd-daemon "qmd daemon pid $pid: RSS $rss_mb MB, up $etime (ceiling $ceiling MB)"  # t13b-ok: doctor report text, starts nothing
+    fi
+}
+
 # --- C41: MCP server credential on the command line (HIMMEL-2762) ---------------
 # An MCP server entry launched as `npm exec <server> --api-key <key>` puts the key
 # in argv, so any local user reads it via ps or /proc/<pid>/cmdline, and it lands
@@ -3230,6 +3265,7 @@ check_c41_mcp_argv_key
 check_c42_sweep_health
 check_c43_rtk_bare_hook
 check_c44_skill_index
+check_c45_qmd_daemon  # t13b-ok: doctor row that reads ps only, starts nothing
 echo
 printf 'Summary: %s%d FAIL%s  %s%d WARN%s  %s%d INFO%s\n' "$C_RED" "$n_fail" "$C_0" "$C_YEL" "$n_warn" "$C_0" "$C_DIM" "$n_info" "$C_0"
 

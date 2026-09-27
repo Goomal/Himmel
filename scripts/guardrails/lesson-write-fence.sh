@@ -548,7 +548,26 @@ _nearest_toplevel() {
 
 # --- policy -----------------------------------------------------------------
 
-ENTRY_MATCH=(); ENTRY_VALUE=(); ENTRY_CLASS=(); ENTRY_WHY=(); ENTRY_COUNT=0
+ENTRY_MATCH=(); ENTRY_VALUE=(); ENTRY_VALUE_LC=(); ENTRY_CLASS=(); ENTRY_WHY=(); ENTRY_COUNT=0
+
+# Judge J1298E C1 (Critical, main DENY -> effective head ALLOW via timeout):
+# every per-clause scan loop below (classify_target's basename/prefix loops,
+# _clause_has_enforcement_signal's raw/normalized loops) used to lower each
+# ENTRY_VALUE with a fresh `_lc` call - a `printf | tr` FORK - on every
+# clause, so the fork cost scaled with ENTRY_COUNT * clauses-in-command
+# instead of ENTRY_COUNT alone. A padded command with hundreds of cheap
+# env/sudo clauses (`sudo true x; ` xK) drove that product past the 15s
+# PreToolUse hook timeout, which fails OPEN. Fix: lower every ENTRY_VALUE
+# ONCE here, at policy-load time, into ENTRY_VALUE_LC - every per-clause
+# loop below reads the cached value instead of re-forking.
+_cache_entry_value_lc() {
+    ENTRY_VALUE_LC=()
+    local i=0
+    while [ "$i" -lt "$ENTRY_COUNT" ]; do
+        ENTRY_VALUE_LC+=("$(_lc "${ENTRY_VALUE[$i]}")")
+        i=$((i+1))
+    done
+}
 
 load_policy() {
     _require_jq
@@ -565,6 +584,7 @@ load_policy() {
     done < <(jq -r '.entries[] | [.match, .value, .class, .why] | @tsv' "$POLICY" 2>/dev/null)
     ENTRY_COUNT=${#ENTRY_MATCH[@]}
     [ "$ENTRY_COUNT" -gt 0 ] || deny "enforcement-paths policy has zero entries (fail-closed): $POLICY"
+    _cache_entry_value_lc
 }
 
 # classify_target <raw-path> [cwd] -> return 0 (DENY, sets _MATCH_CLASS /
@@ -592,7 +612,7 @@ classify_target() {
     i=0
     while [ "$i" -lt "$ENTRY_COUNT" ]; do
         if [ "${ENTRY_MATCH[$i]}" = "basename" ]; then
-            v_lc="$(_lc "${ENTRY_VALUE[$i]}")"
+            v_lc="${ENTRY_VALUE_LC[$i]}"
             if [ "$base_lc" = "$v_lc" ]; then
                 _MATCH_CLASS="${ENTRY_CLASS[$i]}"; _MATCH_WHY="${ENTRY_WHY[$i]}"
                 return 0
@@ -612,7 +632,7 @@ classify_target() {
                 i=0
                 while [ "$i" -lt "$ENTRY_COUNT" ]; do
                     if [ "${ENTRY_MATCH[$i]}" = "prefix" ]; then
-                        v_lc="$(_lc "${ENTRY_VALUE[$i]}")"
+                        v_lc="${ENTRY_VALUE_LC[$i]}"
                         case "$v_lc" in
                             */)
                                 case "$relpath/" in
@@ -733,6 +753,15 @@ _is_standalone_fd_redirect() {
 # is written - because this fence cannot tell redirect direction apart from
 # a bare operator any more reliably than it can tell shell dialects apart;
 # see the header's over-blocking-is-safe posture.
+# J1298F-followup (found while verifying codex-1): this runs FIRST in
+# process_clause_for_write, unconditionally, on the full token array, calling
+# `_is_standalone_fd_redirect`/`_redirect_target_in_token` per token with no
+# deadline check at all - timing-verified as the ACTUAL dominant cost for a
+# K=20000 padding-token clause (~24s alone, dwarfing every fork-eliminated
+# loop below it) even after `_clause_head_idx`/`_check_git_hook_routing` were
+# fixed. Same class as J1298F C1/codex-1: an unbounded per-token loop with no
+# deadline check outruns the 15s hook timeout. Now checks the deadline every
+# iteration like the other per-token loops in this file.
 REDIR_SKIP=()
 _scan_redirects() {
     local cwd="$1"; shift
@@ -740,6 +769,9 @@ _scan_redirects() {
     local n=${#tok[@]} i=0 t tgt
     REDIR_SKIP=()
     while [ "$i" -lt "$n" ]; do
+        if [ "$SECONDS" -ge "$MAX_EVAL_SECONDS" ]; then
+            deny "command evaluation exceeded the fail-closed time budget (${MAX_EVAL_SECONDS}s); denying the remainder outright (fail-closed)"
+        fi
         t="${tok[$i]}"
         case "$t" in
             '>'|'>>'|'<')
@@ -794,11 +826,39 @@ _scan_redirects() {
 # character class anyway, as a defensive/self-documenting POSIX env-var-name
 # grammar (letter/underscore then word chars), not a case-insensitivity fix
 # that was already covered by the pre-lowering.
+#
+# HIMMEL-3757: `_bundle_value_at_end` and the case-sensitive short-option
+# matching it supported (HIMMEL-3658/HIMMEL-3659) were reverted from the
+# `env`/`sudo` arms below after judge J1298C found the replacement letter
+# sets opened 12 NEW main-DENY -> head-ALLOW gaps (`env -c`/`-U`, `sudo
+# -d`/`-G`/`-H`/`-P`, each + `cat`). Head-index accuracy for these wrappers
+# is tracked as HIMMEL-3757, scoped so any future fix there can only ADD
+# denials relative to main.
+#
+# J1298F-followup (codex-1, Important -> agreed): this used to fork
+# `_strip_wrap`+`_lc` per token in every loop below, exactly the shape J1298F
+# C1 fixed in `_env_split_string_used`/`_wrapper_is_env_or_sudo` - timing-
+# verified 56s/233s for K=8000/20000 padding tokens with no wrapper needed
+# (this outer loop matches `nice` cheaply and runs unconditionally), both far
+# past the 15s hook timeout with zero deadline check anywhere in this
+# function. Now indexes the global `LC_TOK` array instead of forking, exactly
+# like `_env_split_string_used`/`_wrapper_is_env_or_sudo` - the CALLER must
+# have already run `_lc_all` on this SAME token array first (an internal
+# `_lc_all` call here would double the cost instead of eliminating it: this
+# function always runs inside a `$(...)` command substitution, so a caller
+# who has not pre-populated `LC_TOK` gets stale/empty data, not a crash -
+# both current callers populate it immediately before calling this). Checks
+# the deadline every iteration of every loop below; a caller retrieving
+# `head_idx` back from the subshell re-checks `$SECONDS` itself immediately
+# afterward (real process, `deny` works there) since `deny`'s `exit` inside
+# this subshelled function would only end the subshell, not the command.
 _clause_head_idx() {
     local -a tok=("$@")
     local n=${#tok[@]} i=0 s w
     while [ "$i" -lt "$n" ]; do
-        s="$(_lc "$(_strip_wrap "${tok[$i]}")")"
+        [ "$SECONDS" -ge "$MAX_EVAL_SECONDS" ] && break
+        s="${LC_TOK[$i]}"
+        s="${s%\"}"; s="${s#\"}"; s="${s%\'}"; s="${s#\'}"; s="${s%\`}"; s="${s#\`}"
         case "$s" in
             [A-Za-z_][A-Za-z0-9_]*=*)
                 i=$((i+1)); continue ;;
@@ -815,8 +875,20 @@ _clause_head_idx() {
                 # --unset's VALUE as the resolved verb - if that value is
                 # crafted to name a proven-read-only verb (e.g. `cat`), the
                 # real wrapped write command was never scanned at all.
+                # HIMMEL-3757: this arm's short-option matching was made
+                # case-sensitive (HIMMEL-3658) to recognize `-a`/`--argv0` as
+                # value-taking, but judge J1298C found the replacement letter
+                # set opened 2 NEW main-DENY -> head-ALLOW gaps (`-c`, `-U`)
+                # that main's case-insensitive match had covered by accident.
+                # Reverted to main's exact case-insensitive matching; env -a
+                # and this arm's other head-index gaps are tracked as
+                # HIMMEL-3757 (ADD-only denials from here). The separate flat
+                # `-S`/`--split-string` deny below (`_env_split_string_used`)
+                # is untouched by this revert.
                 while [ "$i" -lt "$n" ]; do
-                    w="$(_lc "$(_strip_wrap "${tok[$i]}")")"
+                    [ "$SECONDS" -ge "$MAX_EVAL_SECONDS" ] && break
+                    w="${LC_TOK[$i]}"
+                    w="${w%\"}"; w="${w#\"}"; w="${w%\'}"; w="${w#\'}"; w="${w%\`}"; w="${w#\`}"
                     case "$w" in
                         -u|-c)                    i=$((i+2)) ;;
                         [A-Za-z_][A-Za-z0-9_]*=*) i=$((i+1)) ;;
@@ -839,7 +911,9 @@ _clause_head_idx() {
                 # (empirically verified: `timeout --k 5 10 true` behaves
                 # identically to `timeout --kill-after 5 10 true`).
                 while [ "$i" -lt "$n" ]; do
-                    w="$(_lc "$(_strip_wrap "${tok[$i]}")")"
+                    [ "$SECONDS" -ge "$MAX_EVAL_SECONDS" ] && break
+                    w="${LC_TOK[$i]}"
+                    w="${w%\"}"; w="${w#\"}"; w="${w%\'}"; w="${w#\'}"; w="${w%\`}"; w="${w#\`}"
                     case "$w" in
                         -k|-s)                    i=$((i+2)) ;;
                         --*)
@@ -865,8 +939,18 @@ _clause_head_idx() {
                 # names per `sudo --help` on this station (-r/-t are
                 # SELinux-only and not compiled into this build, so those two
                 # are taken from upstream sudo.ws docs, unverified locally).
+                # HIMMEL-3757: this arm's short-option matching was made
+                # case-sensitive (HIMMEL-3659) to stop folding no-arg -H/-P
+                # onto value-taking -h/-p, but judge J1298C found the
+                # replacement letter set opened 4 NEW main-DENY ->
+                # head-ALLOW gaps (`-d`, `-G`, `-H`, `-P`). Reverted to
+                # main's exact case-insensitive matching; sudo -H/-P and this
+                # arm's other head-index gaps are tracked as HIMMEL-3757
+                # (ADD-only denials from here).
                 while [ "$i" -lt "$n" ]; do
-                    w="$(_lc "$(_strip_wrap "${tok[$i]}")")"
+                    [ "$SECONDS" -ge "$MAX_EVAL_SECONDS" ] && break
+                    w="${LC_TOK[$i]}"
+                    w="${w%\"}"; w="${w#\"}"; w="${w%\'}"; w="${w#\'}"; w="${w%\`}"; w="${w#\`}"
                     case "$w" in
                         -u|-g|-U|-p|-C|-r|-t|-h|-d) i=$((i+2)) ;;
                         --)                       i=$((i+1)); break ;;
@@ -959,6 +1043,68 @@ _git_is_read_only() {
 # verbs either (it would not catch the target, for the same quoting reason)
 # - it instead runs `_clause_has_enforcement_signal` over the RAW clause
 # text and denies on a hit, allows otherwise.
+#
+# _normalize_scan_text <raw-text> -> squeezes repeated `/` down to one,
+# drops `/./ ` segments, collapses `seg/../` hops, and strips quote/backslash
+# characters - the raw-TEXT counterpart to `_normalize`'s path-SEGMENT
+# collapsing, for callers (below) that substring-scan whole clause text
+# rather than resolve a single path.
+# Judge J1298R N1 (Critical): the collapse above stopped at `//` and `/./ `
+# and never stripped backslashes, so `env -S 'tee scripts/x/../hooks/a.sh'`,
+# a backslash-escaped `scripts/\hooks/a.sh`, and the same `../` hop against
+# `.claude/settings.json` all evaded the scan.
+# Judge J1298O C1 (Critical, NEW ALLOW vs main): `_clause_has_enforcement_signal`
+# matched the literal substring only, so a policy value written with a
+# single slash (`scripts/hooks/`) missed the identical write spelled
+# `scripts//hooks/a.sh` or `scripts/./hooks/a.sh` - GNU coreutils resolve
+# both exactly as the plain path, so the fence must scan as if normalized
+# too. Text-level only (no filesystem access, no anchoring) since the
+# caller has no single resolved path to normalize.
+# /pr-check critic panel (codex-1, this branch): the `seg/../` loop below
+# used to walk left-to-right and, on hitting an unresolvable leading `..`
+# (no real parent segment to consume), `break` out of the WHOLE loop rather
+# than skip just that one hop - so `env -S 'tee /../../../tmp/f
+# scripts/ci/../hooks/a.sh'` left the later, independently-resolvable
+# `scripts/ci/../hooks/` hop uncollapsed and the raw-text scan missed the
+# `scripts/hooks/` prefix entirely. Fixed: an unresolvable hop is moved,
+# uncollapsed, into `out` and the loop continues scanning the remainder for
+# further `/../` occurrences instead of abandoning the pass.
+_normalize_scan_text() {
+    local t="$1" before after seg out
+    t="${t//\'/}"; t="${t//\"/}"; t="${t//\`/}"; t="${t//\\/}"
+    while case "$t" in *//*) true ;; *) false ;; esac; do
+        t="${t//\/\//\/}"
+    done
+    while case "$t" in *"/./"*) true ;; *) false ;; esac; do
+        t="${t//\/.\//\/}"
+    done
+    out=''
+    while case "$t" in */../*) true ;; *) false ;; esac; do
+        before="${t%%/../*}"
+        after="${t#*/../}"
+        case "$before" in
+            */*) seg="${before##*/}" ;;
+            *)   seg="$before" ;;
+        esac
+        case "$seg" in
+            ..|'')
+                out="$out$before/../"
+                t="$after"
+                continue
+                ;;
+        esac
+        case "$before" in
+            */*) before="${before%/*}" ;;
+            *)   before="" ;;
+        esac
+        if [ -n "$before" ]; then
+            t="$before/$after"
+        else
+            t="$after"
+        fi
+    done
+    printf '%s' "$out$t"
+}
 _interpreter_is_read_only() {
     local verb="$1"; shift
     local -a tok=("$@")
@@ -995,13 +1141,58 @@ _interpreter_is_read_only() {
 # parseable" gap as `git apply`/`patch`'s diff-body target and `find
 # -exec`/`xargs`'s deferred arguments, called out in the header's ACCEPTED
 # section.
+# Judge J1298A C1 (Critical, NEW ALLOW vs main): checking the NORMALIZED
+# text alone is lossy - the `seg/../` collapse in `_normalize_scan_text`
+# deletes a policy signal that the raw text still carries verbatim (e.g.
+# `scripts/hooks/../` collapses to `scripts/`, erasing the `scripts/hooks/`
+# substring), while runtime string-slicing/parameter-expansion
+# (`${x%../}a.sh`, `d[:14]+'a.sh'`) reconstructs the real write target from
+# exactly that raw text. Fix: scan is a UNION, never a replacement - deny if
+# either the raw text (main's original check, unchanged) OR the normalized
+# text matches a policy value. Normalization can then only ADD denies
+# (catching `//`/`/./ ` spelling variants) and never remove one.
+# Judge J1298D C1 (Critical, main DENY -> effective head ALLOW via timeout):
+# the union above used to compute norm_lc UNCONDITIONALLY, before ever
+# trying the raw match, and `_normalize_scan_text`'s `seg/../` collapse is
+# quadratic in the number of `/../` hops (scratch/timing.sh: ~13.4s at
+# 16000 hops, ~19.5-20.5s at 20000, vs ~100ms on main) - past this fence's
+# 15s PreToolUse hook timeout, which fails OPEN (a timed-out command hook
+# does not block the tool call). A deny-worthy clause padded with enough
+# `a/../` hops could outrun the clock and run unblocked. Fix: (1) try the
+# raw match first and return immediately on a hit, so a clause main already
+# denies via raw text never reaches normalization at all; (2) bound
+# normalization itself - a clause whose raw text is longer than
+# MAX_NORMALIZE_LEN skips normalization and denies outright (fail CLOSED),
+# since every caller of this function (procsub, env/sudo wrapper,
+# inline-eval - `process_clause_for_write`) has already decided the clause
+# is one of the unanalysable shapes this scan exists to catch in the first
+# place, so treating "too long to normalize safely" the same as "found a
+# signal" adds no new main-ALLOW->head-DENY risk in the wrong direction.
+# MAX_NORMALIZE_LEN=4096 keeps the worst case (~800 `/../` hops) at roughly
+# 100ms per scratch/timing.sh's N=1000 row, far under the timeout, while a
+# genuine attack clause (tens of KB) is denied in O(1) before the quadratic
+# loop ever runs.
+MAX_NORMALIZE_LEN=4096
 _clause_has_enforcement_signal() {
-    local raw_lc; raw_lc="$(_lc "$1")"
+    local raw="$1" raw_lc norm_lc
+    raw_lc="$(_lc "$raw")"
     local i v_lc
     i=0
     while [ "$i" -lt "$ENTRY_COUNT" ]; do
-        v_lc="$(_lc "${ENTRY_VALUE[$i]}")"
+        v_lc="${ENTRY_VALUE_LC[$i]}"
         case "$raw_lc" in
+            *"$v_lc"*) return 0 ;;
+        esac
+        i=$((i+1))
+    done
+    if [ "${#raw}" -gt "$MAX_NORMALIZE_LEN" ]; then
+        return 0
+    fi
+    norm_lc="$(_lc "$(_normalize_scan_text "$raw")")"
+    i=0
+    while [ "$i" -lt "$ENTRY_COUNT" ]; do
+        v_lc="${ENTRY_VALUE_LC[$i]}"
+        case "$norm_lc" in
             *"$v_lc"*) return 0 ;;
         esac
         i=$((i+1))
@@ -1043,6 +1234,165 @@ _clause_has_procsub() {
 # signal.
 _deny_procsub() {
     deny "process-substitution write refused: the clause names an enforcement-path signal (guardrails/hooks/settings/pre-commit/gitleaks/codex/backends/lessons/CLAUDE.md/AGENTS.md/hooks.json/parity_guard.py/glm-guard.ts/phi-egress-guard.ts). This surface is propose-only: file a ticket or describe the change in a draft-PR body; enforcement-path edits are operator-lane. clause=$1"
+}
+
+# _deny_env_split_string <raw-clause-text> -> denies (exit 2), UNCONDITIONALLY,
+# any clause where `_env_split_string_used` fires - no enforcement-path-signal
+# match required. /pr-check critic panel (codex-1, this round): `-S`'s value is
+# CODE env itself word-splits and executes, not a clean operand - when that
+# value lands as a SINGLE token (a quoted argument, e.g. `env -S 'cp y a.sh'`),
+# `_clause_head_idx`'s old value-skip treatment of `-S` consumed the whole
+# thing as one opaque "value" and left NOTHING for `_operand_targets` to scan,
+# so a cwd-relative or textually-signal-free write ALLOWed outright - the
+# raw-text scan this branch used to gate on cannot see a cwd-relative target
+# either, so gating the deny on it left exactly that gap open. Per console
+# ruling (three rounds of patching this same parser found a Critical each
+# time): treat ANY genuine `env -S`/`--split-string` use as UNANALYSABLE and
+# fail closed, full stop - `_clause_head_idx` no longer tries to skip past
+# `-S`'s value at all (see the `env)` arm above), and this deny no longer
+# requires a policy-signal match. A benign `env -S 'echo hi'` now denies too;
+# that trade-off is accepted (env -S is rare in agent commands, and failing
+# closed on an unanalysable wrapper is this fence's house style already -
+# see `_deny_inline_eval`/`_deny_procsub`/`_deny_wrapper_enforcement_signal`).
+_deny_env_split_string() {
+    deny "env -S/--split-string write refused: env's split-string value hides the real command from the lesson-write fence - it is a shell-like command line env parses and executes itself, not a plain operand this fence can classify. Run the wrapped command directly instead of through env -S/--split-string. clause=$1"
+}
+
+# _lc_all <tok...> -> sets the global array LC_TOK to the case-lowered form
+# of each token, in ONE fork total no matter how many tokens - J1298F C1
+# (Critical): `_env_split_string_used`/`_wrapper_is_env_or_sudo` used to fork
+# `_lc`+`_strip_wrap` (a `$(...)` subshell each, `_lc` forking `tr` on top)
+# for EVERY token of EVERY clause, so a single padded clause (K tokens)
+# forked ~2-3x K processes, outrunning the 15s hook budget on inputs main
+# denied in seconds (the between-clause `MAX_EVAL_SECONDS` check cannot reach
+# inside a clause). Newline is a safe batch separator here: clause tokens
+# always arrive whitespace-free (`evaluate_command`'s `set -- $clause`
+# IFS-word-splits them, which forbids an embedded newline in any one token),
+# so this can never miscount tokens against attacker-controlled input.
+# `process_clause_for_write` calls this ONCE per clause; the two functions
+# below then index LC_TOK instead of forking per token.
+_lc_all() {
+    LC_TOK=()
+    [ "$#" -gt 0 ] || return 0
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        LC_TOK+=("$line")
+    done <<< "$(printf '%s\n' "$@" | tr '[:upper:]' '[:lower:]')"
+}
+
+# _env_split_string_used <tok...> -> 0 iff some token's basename is `env`
+# (bare `env` or a path ending in `/env`, e.g. `/usr/bin/env`) and any LATER
+# token anywhere in the clause is a short-option cluster containing `S`
+# (`-S`, glued `-Stee...`, bundled `-uS`/`-iS'...'` - GNU env accepts all
+# these spellings identically) or a long-option abbreviation of
+# `--split-string`. Console ruling (pr-check round 4, codex-1 Critical):
+# the prior version walked only tok[0..head_idx-1], the wrapper-prefix range
+# `_clause_head_idx` resolves - for a NESTED wrapper (`env env -S '...'`)
+# that walk resolves the FIRST `env`'s option region and treats the SECOND
+# `env` token as the already-resolved verb, so the real `-S` sitting past it
+# was never inspected and the clause fell through to `_operand_targets`
+# unguarded. Fourth Critical in a row against hop/walk-based detection of
+# this flag (J1298A -> J1298B -> pr-check-round-3's codex-1 -> this one) -
+# per ruling, this is no longer a wrapper walk at all: it is a flat,
+# unconditional scan of every token in the clause, with no head_idx bound,
+# no hop count and no per-option value-skip logic (dropping the old
+# `-a`/`-u`/`-C` value-skip and `--unset`/`--chdir`/`--argv0` handling
+# entirely - there is nothing left to skip past when the scan does not care
+# which option position anything occupies). Accepted false-denies (Minor,
+# pinned in tests): a later, unrelated flag on a DIFFERENT verb in the same
+# clause that happens to spell an `-S`-shaped token (e.g. `env FOO=bar grep
+# -S x`) now also denies, coarser than the walk it replaces - accepted for
+# the same reason `_deny_env_split_string`'s own trade-off note gives.
+# J1298F C1 (Critical, TIMING-VERIFIED: main DENY -> effective head ALLOW via
+# a >15s hook timeout): this used to fork `_strip_wrap`+`_lc` (a `$(...)`
+# subshell each, `_lc` forking `tr` on top of that) for EVERY token, and the
+# whole-command deadline (`MAX_EVAL_SECONDS`, below `evaluate_command`) only
+# checks BETWEEN clauses - so a single padded clause (K tokens, no wrapper
+# needed at all: this runs unconditionally on every clause) forked ~2-3x K
+# processes with the deadline never able to reach it. Now reads the global
+# `LC_TOK` array `_lc_all` (see its own comment) computed ONCE per clause by
+# the caller - zero forks in this loop - and checks the deadline itself every
+# iteration ($SECONDS is a bash builtin, no fork), so an oversized single
+# clause fails closed instead of outrunning the between-clause check.
+_env_split_string_used() {
+    local -a t=("$@")
+    local n=${#t[@]} i=0 s w seen_env=0
+    while [ "$i" -lt "$n" ]; do
+        s="${t[$i]}"
+        s="${s%\"}"; s="${s#\"}"; s="${s%\'}"; s="${s#\'}"; s="${s%\`}"; s="${s#\`}"
+        w="${LC_TOK[$i]}"
+        w="${w%\"}"; w="${w#\"}"; w="${w%\'}"; w="${w#\'}"; w="${w%\`}"; w="${w#\`}"
+        if [ "$seen_env" = 1 ]; then
+            case "$s" in
+                -*S*) return 0 ;;
+            esac
+            case "$w" in
+                --split-string|--split-string=*) return 0 ;;
+                --*) guard_is_long_abbrev "split-string" "$w" && return 0 ;;
+            esac
+        fi
+        case "$w" in
+            env|*/env) seen_env=1 ;;
+        esac
+        if [ "$SECONDS" -ge "$MAX_EVAL_SECONDS" ]; then
+            deny "command evaluation exceeded the fail-closed time budget (${MAX_EVAL_SECONDS}s); denying the remainder outright (fail-closed)"
+        fi
+        i=$((i+1))
+    done
+    return 1
+}
+
+# _deny_wrapper_enforcement_signal <raw-clause-text> -> denies (exit 2): an
+# env/sudo-headed clause whose raw text names an enforcement-path signal. Same
+# rationale as `_deny_env_split_string`/`_deny_procsub`/`_deny_inline_eval`.
+_deny_wrapper_enforcement_signal() {
+    deny "env/sudo-wrapped write refused: the clause names an enforcement-path signal (guardrails/hooks/settings/pre-commit/gitleaks/codex/backends/lessons/CLAUDE.md/AGENTS.md/hooks.json/parity_guard.py/glm-guard.ts/phi-egress-guard.ts). This surface is propose-only: file a ticket or describe the change in a draft-PR body; enforcement-path edits are operator-lane. clause=$1"
+}
+
+# _wrapper_is_env_or_sudo <head_idx> <tok...> -> 0 iff any token in
+# tok[0..head_idx-1] (the wrapper-prefix range `_clause_head_idx` walks) is,
+# once stripped and lowered, exactly `env` or `sudo`.
+# Judge J1298R (Critical, ruling item 1): every prior fix in this file
+# (round after round of HIMMEL-2610/HIMMEL-3632/HIMMEL-3658/HIMMEL-3659/
+# J1298O) patched `_clause_head_idx`'s env/sudo option-cluster walk to
+# resolve one more bundled/glued/case-folded shape correctly - a losing
+# enumeration game, since a NEW option-cluster shape (N2: `-Sp`/`-Np`/`-Su`/
+# `-SD`/`-NC`; N3: glued bundled `-iS'...'`) always resolves the walk to
+# *some* verb, correct or not, and the option tables must never grow again
+# (ruling item 2). This check does not try to resolve the wrapper's options
+# at all: it fires on the mere PRESENCE of `env`/`sudo` anywhere in the
+# wrapper range, independent of whether the cluster walk parsed the rest
+# correctly, and pairs with `_clause_has_enforcement_signal`'s raw-text scan
+# below exactly like `_env_split_string_used` does - no parse result can
+# turn a hit here into an ALLOW. Accepted cost (ruling item 1, pinned in
+# tests): a READ through env/sudo of a path matching a policy signal (e.g.
+# `sudo cat scripts/hooks/a.sh`) now DENIES even though `cat` is proven
+# read-only and the cluster walk resolves it correctly - stricter than main,
+# deliberately. A false-positive match (some OTHER wrapper's own option
+# VALUE token happens to spell "sudo" or "env" literally, e.g. `sudo -u
+# sudo cat ...`) only routes the clause to the raw-text scan unnecessarily -
+# never a new gap, the same false-positive-is-safe reasoning already used
+# for `_env_split_string_used` above.
+# J1298F C1: same fork-elimination and in-loop deadline as
+# `_env_split_string_used` above (see its comment) - reads global `LC_TOK`
+# instead of forking `_lc`/`_strip_wrap` per token.
+_wrapper_is_env_or_sudo() {
+    local head_idx="$1"; shift
+    local -a t=("$@")
+    local n=${#t[@]} i=0 w
+    [ "$head_idx" -le "$n" ] || head_idx="$n"
+    while [ "$i" -lt "$head_idx" ]; do
+        w="${LC_TOK[$i]}"
+        w="${w%\"}"; w="${w#\"}"; w="${w%\'}"; w="${w#\'}"; w="${w%\`}"; w="${w#\`}"
+        case "$w" in
+            env|sudo) return 0 ;;
+        esac
+        if [ "$SECONDS" -ge "$MAX_EVAL_SECONDS" ]; then
+            deny "command evaluation exceeded the fail-closed time budget (${MAX_EVAL_SECONDS}s); denying the remainder outright (fail-closed)"
+        fi
+        i=$((i+1))
+    done
+    return 1
 }
 
 # _verb_is_read_only <verb_lc> <verb-onward-tok...> -> 0 iff the
@@ -1158,15 +1508,32 @@ _operand_targets() {
 # must run before step (4)'s read-only-verb short-circuit, since that is
 # exactly the shape that let a writer hidden inside `>(...)` slip past a
 # proven-read-only outer verb (`echo`/`cat`); (2) resolve the command-position
-# verb, after wrapper stripping (_clause_head_idx); (3) if that verb is an
-# interpreter, delegate to `_interpreter_is_read_only` +
+# verb, after wrapper stripping (_clause_head_idx); (2a) J1298R - if the
+# wrapper-prefix range names `env`/`sudo` at all, ANYWHERE, the same
+# `_clause_has_enforcement_signal` raw-text scan runs and denies on a hit,
+# UNCONDITIONALLY, regardless of whether the option-cluster walk resolved
+# the rest of the wrapper correctly (_wrapper_is_env_or_sudo) - a miss falls
+# through unchanged; (2b) console-authorized redesign (three straight rounds
+# of Criticals against this same `env -S` parser) - if the wrapper-prefix
+# range names env's OWN `-S`/`--split-string` at all, in ANY spelling
+# (`_env_split_string_used`), this denies UNCONDITIONALLY and unguarded by any
+# raw-text signal match, before the resolved "verb" (which would be `-S`'s
+# value, not a real command) is ever checked: `-S`'s value is a shell-like
+# command line env itself word-splits and executes, not a clean operand this
+# fence can classify, so it is treated as categorically unanalysable rather
+# than re-parsed - the accepted trade-off is that a benign `env -S 'echo hi'`
+# now denies too (env -S is rare in agent commands, and failing closed on an
+# unanalysable wrapper is this fence's house style already, same as
+# `_deny_procsub`/`_deny_inline_eval` above); (3)
+# if that verb is an interpreter, delegate to `_interpreter_is_read_only` +
 # `_clause_has_enforcement_signal` (round 5 - see those functions); (4) if
 # that verb is otherwise proven read-only, allow outright - its operands are
 # reads; (5) otherwise scan every operand as a write-target candidate
 # (_operand_targets). <clause-raw> is the clause's own pre-tokenization text
-# (round 5 addition), needed by steps (1b) and (3) - a process-substitution
-# or inline-eval writer's target is not a clean token, so those steps scan
-# the raw text instead of the split <tok...> array.
+# (round 5 addition), needed by steps (1b), (2a), (2b) and (3) - a
+# process-substitution, split-string or inline-eval writer's target is not a
+# clean token, so those steps scan the raw text instead of the split
+# <tok...> array.
 process_clause_for_write() {
     local cwd="$1" clause_raw="$2"; shift 2
     local -a tok=("$@")
@@ -1180,7 +1547,32 @@ process_clause_for_write() {
         return 0
     fi
 
+    # J1298F C1: lower every token ONCE per clause (one fork total via
+    # _lc_all), not once per token per check below - see _lc_all's comment.
+    _lc_all "${tok[@]}"
+
     local head_idx; head_idx="$(_clause_head_idx "${tok[@]}")"
+
+    # J1298R ruling item 1: this check is UNCONDITIONAL - it runs whether or
+    # not the option-cluster walk above resolved the wrapper correctly, and a
+    # miss falls through unchanged to the existing checks below (ruling item
+    # 2: the parser stays an ADDITIONAL deny path, never grown further).
+    if _wrapper_is_env_or_sudo "$head_idx" "${tok[@]}"; then
+        _clause_has_enforcement_signal "$clause_raw" && _deny_wrapper_enforcement_signal "$clause_raw"
+    fi
+
+    # Console-authorized redesign (pr-check round 3, codex-1 Critical; round 4,
+    # codex-1 Critical on the nested-wrapper gap): a genuine `env -S`/
+    # `--split-string` clause denies UNCONDITIONALLY here, not gated on
+    # `_clause_has_enforcement_signal`'s raw-text scan and not bounded by
+    # `head_idx`/the wrapper walk - `_env_split_string_used` now scans every
+    # token in the clause flatly, so a nested wrapper (`env env -S '...'`)
+    # cannot place the flag outside the range this check inspects. Treat the
+    # whole clause as unanalysable and stop here.
+    if _env_split_string_used "${tok[@]}"; then
+        _deny_env_split_string "$clause_raw"
+    fi
+
     [ "$head_idx" -lt "$n" ] || return 0
 
     local -a vtok=()
@@ -1240,7 +1632,17 @@ _check_git_hook_routing() {
     local n=${#tok[@]}
     [ "$n" -gt 0 ] || return 0
 
+    # J1298F-followup (codex-1): this runs unconditionally on every clause,
+    # BEFORE process_clause_for_write's own `_lc_all` call - populate LC_TOK
+    # here too (one fork total for this call, not per-token) so both
+    # `_clause_head_idx` and the per-token loop below stay fork-free and
+    # deadline-checked in the real process (this function is never itself
+    # invoked via `$(...)`, so `deny` here works).
+    _lc_all "${tok[@]}"
     local head_idx; head_idx="$(_clause_head_idx "${tok[@]}")"
+    if [ "$SECONDS" -ge "$MAX_EVAL_SECONDS" ]; then
+        deny "command evaluation exceeded the fail-closed time budget (${MAX_EVAL_SECONDS}s); denying the remainder outright (fail-closed)"
+    fi
     [ "$head_idx" -lt "$n" ] || return 0
 
     case "$(_lc "$(_strip_wrap "${tok[$head_idx]}")")" in
@@ -1250,7 +1652,11 @@ _check_git_hook_routing() {
 
     local i="$head_idx" t_lc has_routing=0 has_get=0
     while [ "$i" -lt "$n" ]; do
-        t_lc="$(_lc "$(_strip_wrap "${tok[$i]}")")"
+        if [ "$SECONDS" -ge "$MAX_EVAL_SECONDS" ]; then
+            deny "command evaluation exceeded the fail-closed time budget (${MAX_EVAL_SECONDS}s); denying the remainder outright (fail-closed)"
+        fi
+        t_lc="${LC_TOK[$i]}"
+        t_lc="${t_lc%\"}"; t_lc="${t_lc#\"}"; t_lc="${t_lc%\'}"; t_lc="${t_lc#\'}"; t_lc="${t_lc%\`}"; t_lc="${t_lc#\`}"
         case "$t_lc" in
             core.hookspath|core.hookspath=*) has_routing=1 ;;
             include.path|include.path=*)     has_routing=1 ;;
@@ -1285,8 +1691,31 @@ _check_git_hook_routing() {
 # non-enforcement paths and still allow. `&>|`/`&>>` (all three metachars)
 # reduce to the existing `&>` handling: `&>|` -> `&> ` after this step, then
 # the `&` split below produces the same clause shape `&>` already denies.
+#
+# Judge J1298E C1 (Critical, main DENY -> effective head ALLOW via timeout):
+# the per-entry-fork fix above (`ENTRY_VALUE_LC`) removes the QUADRATIC-ish
+# blowup for a large ENTRY_COUNT, but the per-clause scan cost (still real,
+# still nonzero: option-cluster walks, wrapper/verb classification, operand
+# scans) is multiplied by the NUMBER of clauses a padded command can carry
+# (`sudo true x; ` xK), and that product is unbounded by anything in this
+# loop - main pays the same per-clause cost via its own inline-eval scan, so
+# this is a pre-existing class this fence widens, not a new one (per the
+# judge's own timing table). A whole-command wall-clock deadline closes
+# BOTH: any command whose clause-by-clause evaluation is still running past
+# MAX_EVAL_SECONDS is denied outright, fail-closed, well under this fence's
+# 15s PreToolUse hook timeout (which fails OPEN on a real timeout) - a
+# padded command that would otherwise race the clock now loses the race on
+# the safe side. `$SECONDS` is a bash builtin (no fork), reset to 0 at
+# process start, so reading it here costs nothing extra per clause.
+MAX_EVAL_SECONDS=8
 evaluate_command() {
     local cmd="$1" cwd="$2" tmp clause
+    # J1298F M2: bash IMPORTS $SECONDS from the environment (`env
+    # SECONDS=-100000 bash -c 'echo $SECONDS'` prints -100000), so a caller
+    # that exports SECONDS before invoking this hook could otherwise stall
+    # the deadline arbitrarily. Reset it here, unconditionally, so the
+    # budget always counts from this function's own start.
+    SECONDS=0
     tmp="$cmd"
     tmp="${tmp//>|/> }"
     tmp="${tmp//>&/> }"
@@ -1295,6 +1724,9 @@ evaluate_command() {
     tmp="${tmp//&/$'\n'}"
     while IFS= read -r clause || [ -n "$clause" ]; do
         [ -n "$clause" ] || continue
+        if [ "$SECONDS" -ge "$MAX_EVAL_SECONDS" ]; then
+            deny "command evaluation exceeded the fail-closed time budget (${MAX_EVAL_SECONDS}s); denying the remainder outright (fail-closed)"
+        fi
         _check_git_hook_routing "$clause"
         # shellcheck disable=SC2086 # intentional word split for tokenisation
         set -- $clause

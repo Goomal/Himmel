@@ -542,6 +542,47 @@ path_textually_resolves_to_root() {
     [ "${#stack[@]}" -eq 0 ]
 }
 
+# HIMMEL-3734 (J1300A finding 7): a bare brace-list word (`{/,.}`) is
+# uncookable to shell_word_value (HIMMEL-3660 fails closed on the internal
+# comma) and so is normally treated as OPAQUE by the path-operand loop below
+# — but `find {/,.} -name x` expands to `find / . -name x`, a real root walk.
+# Scoped narrowly to stay obviously-correct: only a word that is ENTIRELY one
+# non-nested `{...}` span counts, split on TOP-LEVEL commas, and only a
+# literal `/`-only alternative is treated as root — this does not attempt to
+# cook the general brace-expansion case.
+brace_word_is_rootwalk() {
+    local w="$1" inner part
+    case "$w" in '{'*'}') ;; *) return 1 ;; esac
+    inner="${w#\{}"; inner="${inner%\}}"
+    case "$inner" in *'{'*|*'}'*) return 1 ;; esac
+    # ponytail: nested brace words (e.g. {{/,a},b}) stay opaque here — a
+    # one-level comma split, not a recursive brace-expansion parser.
+    # HIMMEL-3753 tracks whether that's worth building.
+    local IFS=',' norm
+    for part in $inner; do
+        # codex-1 (round 1): // is POSIX root too (is_root_anchor:503).
+        # codex-2 (round 3): any run of slashes only (///, ////, ...) is the
+        # same root — is_root_anchor gets this for free by collapsing runs of
+        # `/` before its case match (line 499); this loop has no such
+        # normalization pass, so match the whole class directly instead.
+        case "$part" in
+            '') ;;
+            *[!/]*)
+                # codex-1 (round 8): `/.` (and `/./`, `//.`, ...) is root too
+                # — is_root_anchor's own normalization (line 499) already
+                # strips a trailing `/.` before matching, so apply the same
+                # sed here rather than duplicate its case logic; a part with
+                # any OTHER non-slash byte (e.g. `a`, `a/.`) still falls
+                # through untouched.
+                norm=$(printf '%s' "$part" | sed -E 's@/+@/@g; s@/\.(/)?$@/@')
+                [ "$norm" = / ] && return 0
+                ;;
+            *) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 segment_is_rootwalk_find() {
     resolve_seg_binary "$1"
     [ "$RB_STATUS" = bin ] || return 1
@@ -639,6 +680,7 @@ segment_is_rootwalk_find() {
         # path-operand collection — a literal root anchor later in the same
         # segment must still be found.
         if ! shell_word_value "$tok"; then
+            brace_word_is_rootwalk "$tok" && has_root=1
             continue
         fi
         cooked="$SW_VALUE"
@@ -1146,6 +1188,120 @@ guard_is_long_abbrev() {
         *) return 1 ;;
     esac
 }
+# HIMMEL-3750 judge J1370A (NO-GO, round 3->4): the naive `${cmd//$'\\\n'/}`
+# fold treated every backslash-newline pair as a continuation, even when the
+# backslash itself was already escaped by a PRECEDING backslash (`\\<NL>`: the
+# shell consumes the first two backslashes as one literal `\`, so the newline
+# that follows is a real, unescaped command separator, not a continuation).
+# That let `echo \\<NL>touch PWN` fold into a single harmless-looking `echo`
+# line while the shell actually ran `touch PWN` as a second command — a
+# non-approved command turned into an auto-APPROVE. Only an ODD run of
+# backslashes immediately before the newline is a genuine continuation (the
+# last backslash is unescaped); an even run pairs off completely and the
+# newline stays a real separator, so leave it unfolded and let the existing
+# unquoted-separator/newline handling see it. Single quotes give backslash no
+# special meaning at all, so no fold happens inside them either.
+#
+# HIMMEL-3750 round 6 (codex-1): a `'` is only a single-quote DELIMITER when
+# not already inside double quotes — real shells nest quoting that way, so
+# `"'$\<NL>(touch PWN)"` has a literal apostrophe, not a quote open, and the
+# backslash-newline after it still folds (double quotes fold it same as
+# unquoted text). The old check toggled in_sq on ANY `'`, double-quoted or
+# not, so that literal apostrophe wrongly entered "single-quote" mode and
+# suppressed the fold for the rest of the string (no closing `'` ever came),
+# leaving the raw-text `$(` tripwire unable to see the reconstituted `$(`.
+# Track double-quote state too so a `'` inside `"..."` stays inert.
+# HIMMEL-3750 round 7 (codex-1): a `"` (or `'`) immediately after an ODD
+# backslash run is an ESCAPED quote character in real shell parsing — it
+# stays a literal byte and never opens/closes a quoted region (`\"` inside
+# double quotes writes a literal `"` without closing the string; `\'`
+# outside any quotes writes a literal apostrophe without opening one). The
+# old code let the backslash branch consume only the backslash run and then
+# let the next loop iteration process the quote character with its
+# unconditional/`in_dq==0`-gated toggle, with no memory that a backslash had
+# just escaped it. `echo "\"'$\<NL>(touch PWN)"` exploited exactly that: the
+# escaped `"` wrongly flipped in_dq from 1 to 0, which then let the
+# following literal (still-inside-real-double-quotes) apostrophe wrongly
+# open the code's own fake single-quote mode, which suppressed the
+# backslash-newline fold for the rest of the string and hid the
+# reconstituted `$(` from the raw-text tripwire. Detect an escaped quote
+# right where the backslash run is measured and copy it through untouched.
+fold_backslash_newline() {
+    local s="$1" out="" i=0 n c j run k nc in_sq=0 in_dq=0 bs=$'\\'
+    n=${#s}
+    while [ "$i" -lt "$n" ]; do
+        c="${s:$i:1}"
+        if [ "$in_sq" = 1 ]; then
+            out="$out$c"
+            [ "$c" = "'" ] && in_sq=0
+            i=$((i + 1))
+            continue
+        fi
+        if [ "$c" = "'" ] && [ "$in_dq" = 0 ]; then
+            in_sq=1
+            out="$out$c"
+            i=$((i + 1))
+            continue
+        fi
+        if [ "$c" = '"' ]; then
+            [ "$in_dq" = 0 ] && in_dq=1 || in_dq=0
+            out="$out$c"
+            i=$((i + 1))
+            continue
+        fi
+        if [ "$c" = "$bs" ]; then
+            run=0
+            j=$i
+            while [ "${s:$j:1}" = "$bs" ]; do
+                run=$((run + 1))
+                j=$((j + 1))
+            done
+            if [ "${s:$j:1}" = $'\n' ] && [ $((run % 2)) -eq 1 ]; then
+                # An odd run of N backslashes folds in real shell parsing as
+                # the final lone backslash+newline being the continuation
+                # that disappears, leaving the other (N-1, always even)
+                # backslashes RAW rather than pre-collapsed to (N-1)/2
+                # literal backslash bytes here. Pre-collapsing them handed
+                # scan_cmd's own backslash-escape walk a single
+                # already-resolved backslash byte indistinguishable from a
+                # fresh, still-escaping one, so it swallowed the next real
+                # character (e.g. a `;` separator) as if it were escaped
+                # when it was not (HIMMEL-3750 round 5, codex-1). Left raw,
+                # scan_cmd re-derives the same even pairing bash does on its
+                # own and correctly leaves the following character
+                # unescaped.
+                k=0
+                while [ "$k" -lt "$((run - 1))" ]; do
+                    out="$out\\"
+                    k=$((k + 1))
+                done
+                i=$((j + 1))
+                continue
+            fi
+            nc="${s:$j:1}"
+            if [ $((run % 2)) -eq 1 ] && { [ "$nc" = "'" ] || [ "$nc" = '"' ]; }; then
+                k=0
+                while [ "$k" -lt "$((run - 1))" ]; do
+                    out="$out\\"
+                    k=$((k + 1))
+                done
+                out="$out\\$nc"
+                i=$((j + 1))
+                continue
+            fi
+            k=0
+            while [ "$k" -lt "$run" ]; do
+                out="$out\\"
+                k=$((k + 1))
+            done
+            i=$j
+            continue
+        fi
+        out="$out$c"
+        i=$((i + 1))
+    done
+    printf '%s' "$out"
+}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../guardrails/lib.sh
 # shellcheck disable=SC1091
@@ -1169,6 +1325,17 @@ cmd="${result#*$'\n'}"
 # shell-structure scan so a Bash backslash-newline continuation is not seen as
 # backslash-CR followed by a separate newline command boundary.
 cmd="${cmd//$'\r\n'/$'\n'}"
+# HIMMEL-3750 round 3 (codex-1): a backslash-newline continuation is folded
+# away by the shell before parsing even INSIDE double quotes, so a quoted
+# `"$\<NL>=x"` reaches the shell as `"$=x"` — the raw-text tripwires below
+# must see the same joined text the shell will actually execute, not the
+# literal backslash-newline bytes (which never match `*'$='*` etc). Fold it
+# here, before scan_cmd, so both the structural scan and the tripwires agree.
+# Judge J1370A (round 4): a NAIVE fold of every `\`+newline pair is wrong when
+# the backslash is itself escaped by a preceding one — see
+# fold_backslash_newline()'s header comment above for why only an odd
+# backslash run is a genuine continuation.
+cmd="$(fold_backslash_newline "$cmd")"
 [ "$tool" = "Bash" ] || exit 0   # PowerShell keeps its own native rules
 [ -n "$cmd" ] || exit 0
 
@@ -1223,6 +1390,28 @@ esac
 case "$cmd" in
     *'$('*|*'`'*|*'<('*|*'>('*)        exit 0 ;;  # command / process substitution
     *'system('*|*'popen('*|*'exec('*)  exit 0 ;;  # interpreter shell-out
+esac
+
+# HIMMEL-3750 (J1366A finding 1): zsh parameter-flag expansions reach code
+# execution or defeat quoting even inside double quotes, so SCAN_MASK's
+# quoted-span blanking never sees them — this must check the RAW $cmd text,
+# not the mask. Refuse unconditionally, quoted or not:
+#   - `${(...)`  — the `(e)`/`(#)`/`(%)`/... parameter flags. `(e)` re-
+#     evaluates its value (arbitrary code), and nested `(#):-N` flags build
+#     `$(` from character codes, hiding it from the tripwire above even
+#     unquoted. VERIFIED (zsh -f): `echo "${(e)${:-${(#):-36}${(#):-40}touch
+#     P${(#):-41}}}"` runs `touch P`.
+#   - `$=` / `${=` — the SH_WORD_SPLIT flag forces field-splitting on the
+#     substituted value EVEN INSIDE DOUBLE QUOTES, so a quoted `"$=x"` can
+#     still explode into several argv words, one of which can be a flag
+#     (`ls "$=x"` with x="-l /etc/passwd" runs `ls -l /etc/passwd`).
+#     VERIFIED (zsh -f).
+# `${~...}` (the GLOB_SUBST flag) was checked too: quoted, it does NOT glob
+# (VERIFIED zsh -f) — quoting still protects it, so it is not a new bypass
+# and is left alone.
+# shellcheck disable=SC2016 # literal raw-text match patterns, nothing expanded
+case "$cmd" in
+    *'${('*|*'$='*|*'${='*)  exit 0 ;;
 esac
 
 # HIMMEL-3732 / HIMMEL-3733 (J1300A findings 6,7): an unquoted `(` in ANY word

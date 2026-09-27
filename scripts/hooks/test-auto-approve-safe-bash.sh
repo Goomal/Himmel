@@ -857,6 +857,100 @@ assert "cmd-subst paren still PASS"    PASS "$(decide "$(j_bash 'cat "$(pwd)/f"'
 assert "plain cat README still ALLOW"  ALLOW "$(decide "$(j_bash 'cat README.md')")"
 assert "plain git log still ALLOW"     ALLOW "$(decide "$(j_bash 'git log --oneline -1')")"
 
+# --- HIMMEL-3750 (J1366A finding 1): zsh parameter-flag expansions reach code
+# execution or defeat quoting even INSIDE double quotes, so SCAN_MASK's
+# quoted-span blanking never sees them — must be caught on the RAW text.
+assert "param-flag (e) exec via char-code \$(" PASS "$(decide "$(j_bash 'echo "${(e)${:-${(#):-36}${(#):-40}touch PWN${(#):-41}}}"')")"
+assert "param-flag (e) quoted"         PASS "$(decide "$(j_bash 'cat "${(e)X}"')")"
+assert "param-flag (%) quoted"         PASS "$(decide "$(j_bash 'ls "${(%):-%x}"')")"
+assert "param-flag through git log --" PASS "$(decide "$(j_bash 'git log -- "${(e)X}"')")"
+# \$= / \${= (SH_WORD_SPLIT) forces field-splitting even inside double quotes,
+# so a quoted "\$=x" can still explode into a flag argv word.
+assert "dollar-eq splits through quotes"      PASS "$(decide "$(j_bash 'ls "$=x"')")"
+assert "dollar-brace-eq splits through quotes" PASS "$(decide "$(j_bash 'ls "${=x}"')")"
+# Checked and left alone: quoted \${~...} (GLOB_SUBST) does NOT glob under
+# zsh -f (VERIFIED) — quoting still protects it, so it stays ALLOW.
+assert "param-flag (~) quoted stays ALLOW"    ALLOW "$(decide "$(j_bash 'echo "${~x}"')")"
+# HIMMEL-3750 (J1366A finding 4) regression: a backslash-newline between \$
+# and ( hides \$( from the raw tripwire on main; head must still refuse it.
+assert "backslash-newline \$( regression" PASS "$(decide "$(j_bash "echo \$\\"$'\n''(touch PWN)')")"
+# Accepted false refusal (brief-documented): a SINGLE-QUOTED literal '\${('
+# is refused too, since the fix reads the RAW command text, not the mask.
+assert "single-quoted literal \${( (accepted false refusal)" PASS "$(decide "$(j_bash "grep '\${(' f")")"
+# codex-1 (round 3): a backslash-newline between \$ and = INSIDE double quotes
+# is folded away by the shell before parsing, same as finding 4's \$( case,
+# but the newline sits inside the quotes here so the unquoted-separator
+# fallback that protects finding 4 does not fire. Confirmed ALLOW (bypass) on
+# the pre-fix code; the fold added above joins it into "\$=x" before the
+# tripwires run, so it now falls through like any other \$= case.
+assert "backslash-newline \$= regression" PASS "$(decide "$(j_bash "ls \"\$\\"$'\n''=x"')")"
+# Judge J1370A (round 4, NO-GO): the round-3 fold above folded EVERY
+# backslash-newline pair unconditionally, even when the backslash was itself
+# escaped by a preceding backslash — an even run of backslashes before the
+# newline pairs off completely in real shell parsing, leaving the newline a
+# genuine, unescaped command separator. Folding it anyway merged two real
+# commands into one harmless-looking approved line while the shell still ran
+# the second command. These four must stay PASS (fall through, not approved),
+# matching main's (safe) behavior exactly.
+assert "escaped-backslash-newline stays PASS (J1370A finding 1a)" PASS "$(decide "$(j_bash "echo \\\\"$'\n'"touch PWN")")"
+assert "escaped-backslash-newline w/ prior word stays PASS (finding 1b)" PASS "$(decide "$(j_bash "echo a\\\\"$'\n'"touch PWN")")"
+assert "escaped-backslash-newline via cat/rm stays PASS (finding 1c)" PASS "$(decide "$(j_bash "cat f \\\\"$'\n'"rm -rf x")")"
+assert "double escaped-backslash-newline stays PASS (finding 1d)" PASS "$(decide "$(j_bash "echo \\\\"$'\n'"\\\\"$'\n'"touch PWN")")"
+# Control: a genuine (odd, single) backslash-newline continuation of an
+# otherwise benign command must still fold and stay ALLOW.
+assert "genuine single-backslash continuation still ALLOW" ALLOW "$(decide "$(j_bash "echo a \\"$'\n'"b")")"
+# codex-1 (round 5): an ODD run of 3+ backslashes before the newline still
+# has a genuine (single) continuation, but the code used to pre-COLLAPSE the
+# other (N-1, always even) backslashes down to (N-1)/2 literal backslash
+# BYTES before scan_cmd ever saw them. scan_cmd's own backslash-escape walk
+# then treated that single residual backslash as a FRESH, still-escaping
+# byte and swallowed the very next character — here a real `;` separator —
+# as if it were escaped, hiding a second real command inside what looked
+# like one approved `echo` line. VERIFIED (real bash): `echo hi\\\`+NL+
+# `; touch PWN` runs `touch PWN` as its own command. Left raw (this fix),
+# scan_cmd's own char-by-char escape rule re-derives the same even pairing
+# and correctly leaves the `;` unescaped, so this must stay PASS (fall
+# through), not get folded into a single approved segment.
+assert "odd(3) backslash-newline leaves real separator visible (codex-1)" PASS "$(decide "$(j_bash "echo hi\\\\\\"$'\n'"; touch PWN")")"
+# codex-1 (round 6): fold_backslash_newline() toggled its single-quote state
+# on ANY `'`, even one appearing INSIDE double quotes, where it is a plain
+# literal character, not a quote delimiter. `echo "'$\<NL>(touch PWN)"` has
+# its apostrophe inside double quotes; the old code wrongly treated it as
+# opening a single-quoted span (no closing `'` ever follows), so the fold
+# never ran and the raw `$(` tripwire never saw the reconstituted `$(`.
+# VERIFIED (real bash): this exact string, run as a script, executes
+# `touch PWN`. Must fall through to PASS, not ALLOW.
+assert "apostrophe inside dquotes no longer blocks fold (codex-1 round 6)" PASS "$(decide "$(j_bash "echo \"'\$\\"$'\n'"(touch PWN)\"")")"
+# codex-1 (round 7): the `"` toggle in fold_backslash_newline() fired on ANY
+# `"` byte, even one immediately preceded by a backslash (an ESCAPED quote,
+# which stays a literal char and never closes the real double-quoted span).
+# `echo "\"'$\<NL>(touch PWN)"` has that escaped `"` right after the opening
+# quote; the old code wrongly flipped in_dq to 0, which then let the
+# following (still-really-inside-double-quotes) apostrophe wrongly open the
+# fake single-quote span, suppressing the fold for the rest of the string and
+# hiding the reconstituted `$(` from the raw tripwire.
+# VERIFIED (real bash): this exact string, run as a script, executes
+# `touch PWN`. Must fall through to PASS, not ALLOW.
+assert "escaped dquote no longer mistoggles state (codex-1 round 7)" PASS "$(decide "$(j_bash "echo \"\\\"'\$\\"$'\n'"(touch PWN)\"")")"
+# Controls: common benign expansions must keep ALLOWing.
+assert "echo \${HOME} still ALLOW"     ALLOW "$(decide "$(j_bash 'echo "${HOME}"')")"
+assert "echo \$PWD still ALLOW"        ALLOW "$(decide "$(j_bash 'echo "$PWD"')")"
+
+# --- HIMMEL-3734 (J1300A finding 7): a brace-expanded root among the
+# find path operands (\`{/,.}\` -> \`/ .\`) must DENY as a root-walk.
+assert "find brace-expanded root DENY" DENY "$(decide "$(j_bash 'find {/,.} -name x')")"
+# codex-1: // is POSIX root too (mirrors is_root_anchor's own /|// case).
+assert "find brace-expanded // root DENY" DENY "$(decide "$(j_bash 'find {//,.} -name x')")"
+# codex-2 (round 3): any run of slashes only (///, not just / and //) is root.
+assert "find brace-expanded /// root DENY" DENY "$(decide "$(j_bash 'find {///,.} -name x')")"
+# codex-1 (round 8): `/.` is root too (mirrors is_root_anchor's own trailing
+# `/.` strip) — VERIFIED: unfixed hook returned PASS (not DENY) for this exact
+# command before the fix.
+assert "find brace-expanded /. root DENY" DENY "$(decide "$(j_bash 'find {/.,a} -name x')")"
+# Controls: brace alternatives with no bare '/' stay as before (opaque, PASS).
+assert "find brace non-root stays PASS" PASS "$(decide "$(j_bash 'find {a,b} -name x')")"
+assert "find brace maxdepth-value unaffected" DENY "$(decide "$(j_bash 'find / -maxdepth {1,2} -name x')")" # gnu-ok: fixture string fed to the hook under test, never executed as a shell command
+
 echo ""
 if [ "$FAILED" -eq 0 ]; then
     echo "All cases passed."

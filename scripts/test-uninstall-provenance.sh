@@ -150,6 +150,34 @@ esac
 CRONTAB_STUB_EOF
 chmod 755 "$FAKE_CRONTAB"
 
+# fake jq shim (RED53, HIMMEL-3637 R3-codex2): a real jq passthrough for every
+# call EXCEPT prov_read_units' own fold query, which it forces to fail
+# (exit 1) when RED53_FORCE_JQ_FAIL=1 is exported -- prov_read_units' filter
+# is the only jq invocation in this codebase carrying `--argjson havepath`
+# (provenance-read.sh), so this is a targeted failure injection of "the fold
+# read itself errors", not a corrupted row (which prov_read_load's own
+# fold-validation already catches upstream, before LEDGER_OK is even set).
+REAL_JQ="$(command -v jq)"
+FAKE_JQ="$SUITE_TMP/bin/jq"
+cat > "$FAKE_JQ" <<JQ_STUB_EOF
+#!/usr/bin/env bash
+set -u
+if [ "\${RED53_FORCE_JQ_FAIL:-}" = "1" ]; then
+    prev=""
+    for a in "\$@"; do
+        [ "\$prev" = "--argjson" ] && [ "\$a" = "havepath" ] && exit 1
+        prev="\$a"
+    done
+fi
+if [ "\${RED54_FORCE_JQ_FAIL:-}" = "1" ]; then
+    for a in "\$@"; do
+        case "\$a" in *HIMMEL-3637-pu-json*) exit 5 ;; esac
+    done
+fi
+exec "$REAL_JQ" "\$@"
+JQ_STUB_EOF
+chmod 755 "$FAKE_JQ"
+
 # new_case <name> -- fresh scratch HOME/cwd/provenance dir + fresh plugin and
 # marketplace stub state for one case. Sets the CASE_* globals the rest of
 # the case (and run_uninstall) uses.
@@ -1582,6 +1610,159 @@ check "RED43 wet run: exits 0" "$rc43" "0"
 AFTER43_BYTES=$([ -f "$HUD_LEGACY43" ] && cat "$HUD_LEGACY43" || echo "ABSENT")
 check "RED43 uninstall: no-ledger legacy config byte-identical to himmel's own template is removed" \
   "$AFTER43_BYTES" "ABSENT"
+
+echo "==== RED50 (HIMMEL-3637): --purge-state must refuse while a recorded backup's original path has not been restored ===="
+# J1274O P1 wet-run repro (a): the adopted project lives OUTSIDE this case's
+# cwd (run_uninstall always cd's into $CASE_DIR/cwd), so the adopter-scripts
+# restore step cannot reach it and the file stays overwritten by himmel's
+# copy. --purge-state must then refuse to delete the only backup, not
+# silently remove it and exit 0.
+new_case red50
+PROJDIR50="$CASE_DIR/project"
+mkdir -p "$PROJDIR50/scripts"
+DEST50="$PROJDIR50/scripts/clean.sh"
+printf '#!/bin/sh\necho original-user-script\n' > "$DEST50"
+SNAP50=$(mktemp "$SUITE_TMP/SNAP50.XXXXXX") || exit 1
+cp -p "$DEST50" "$SNAP50"
+printf '#!/bin/sh\necho himmel-installed-script\n' > "$DEST50"
+( prov_begin --writer adopt.sh -- seed-red50 >/dev/null
+  prov_record replace file "$DEST50" --scope project --class code --row adopter-scripts \
+    --writer adopt.sh --pre-file "$SNAP50" --backup --post-file "$DEST50" >/dev/null
+  prov_end ok >/dev/null )
+rm -f "$SNAP50"
+BACKUPS50_BEFORE=$(find "$HIMMEL_PROVENANCE_DIR/provenance-backups" -type f 2>/dev/null | wc -l | tr -d ' ')
+check "RED50: setup actually created a backup (control is not vacuous)" "$([ "$BACKUPS50_BEFORE" -gt 0 ] && echo yes || echo no)" "yes"
+run_uninstall --yes --skip-tasks --skip-plugins --skip-hooks --skip-settings --purge-state >/dev/null
+rc50=$?
+BACKUPS50_AFTER=$(find "$HIMMEL_PROVENANCE_DIR/provenance-backups" -type f 2>/dev/null | wc -l | tr -d ' ')
+REFUSED50=$([ "$rc50" -ne 0 ] && echo yes || echo no)
+check "RED50: --purge-state refuses (non-zero) when the adopted project's backup was never restored" "$REFUSED50" "yes"
+check "RED50: refusing means deleting nothing — the backup survives" "$BACKUPS50_AFTER" "$BACKUPS50_BEFORE"
+
+echo "==== RED51 (HIMMEL-3637): an uninstall run from a cwd that is not the recorded project must never exit 0 having restored nothing ===="
+new_case red51
+PROJDIR51="$CASE_DIR/project"
+mkdir -p "$PROJDIR51/scripts"
+DEST51="$PROJDIR51/scripts/clean.sh"
+printf '#!/bin/sh\necho original-user-script\n' > "$DEST51"
+ORIG51_BYTES=$(cat "$DEST51")
+SNAP51=$(mktemp "$SUITE_TMP/SNAP51.XXXXXX") || exit 1
+cp -p "$DEST51" "$SNAP51"
+printf '#!/bin/sh\necho himmel-installed-script\n' > "$DEST51"
+( prov_begin --writer adopt.sh -- seed-red51 >/dev/null
+  prov_record replace file "$DEST51" --scope project --class code --row adopter-scripts \
+    --writer adopt.sh --pre-file "$SNAP51" --backup --post-file "$DEST51" >/dev/null
+  prov_end ok >/dev/null )
+rm -f "$SNAP51"
+run_uninstall --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks --skip-settings >/dev/null
+rc51=$?
+AFTER51_BYTES=$(cat "$DEST51")
+RESTORED51=$([ "$AFTER51_BYTES" = "$ORIG51_BYTES" ] && echo yes || echo no)
+REFUSED51=$([ "$rc51" -ne 0 ] && echo yes || echo no)
+OUTCOME51=BUG
+{ [ "$RESTORED51" = yes ] || [ "$REFUSED51" = yes ]; } && OUTCOME51=ok
+check "RED51: uninstall from a non-project cwd either resolves+restores or refuses non-zero (never silent rc=0 with nothing restored)" \
+  "$OUTCOME51" "ok"
+
+echo "==== RED52 (HIMMEL-3637): --purge-state must refuse when the recorded project dir itself is gone (J1274O w1 'clone deleted') ===="
+# The exact judge repro shape: the adopted project directory is deleted
+# entirely (not just left unrestored), so the recorded path's current state
+# reads ABSENT and prov_read_verdict says "keep already-absent" rather than
+# "restore" -- a distinct code path from RED50/RED51, which both leave the
+# project directory on disk.
+new_case red52
+PROJDIR52="$CASE_DIR/project"
+mkdir -p "$PROJDIR52/scripts"
+DEST52="$PROJDIR52/scripts/clean.sh"
+printf '#!/bin/sh\necho original-user-script\n' > "$DEST52"
+SNAP52=$(mktemp "$SUITE_TMP/SNAP52.XXXXXX") || exit 1
+cp -p "$DEST52" "$SNAP52"
+printf '#!/bin/sh\necho himmel-installed-script\n' > "$DEST52"
+( prov_begin --writer adopt.sh -- seed-red52 >/dev/null
+  prov_record replace file "$DEST52" --scope project --class code --row adopter-scripts \
+    --writer adopt.sh --pre-file "$SNAP52" --backup --post-file "$DEST52" >/dev/null
+  prov_end ok >/dev/null )
+rm -f "$SNAP52"
+rm -rf "$PROJDIR52"
+BACKUPS52_BEFORE=$(find "$HIMMEL_PROVENANCE_DIR/provenance-backups" -type f 2>/dev/null | wc -l | tr -d ' ')
+check "RED52: setup actually created a backup (control is not vacuous)" "$([ "$BACKUPS52_BEFORE" -gt 0 ] && echo yes || echo no)" "yes"
+run_uninstall --yes --skip-tasks --skip-plugins --skip-hooks --skip-settings --purge-state >/dev/null
+rc52=$?
+BACKUPS52_AFTER=$(find "$HIMMEL_PROVENANCE_DIR/provenance-backups" -type f 2>/dev/null | wc -l | tr -d ' ')
+REFUSED52=$([ "$rc52" -ne 0 ] && echo yes || echo no)
+check "RED52: --purge-state refuses (non-zero) when the adopted project directory itself is gone" "$REFUSED52" "yes"
+check "RED52: refusing means deleting nothing — the backup survives" "$BACKUPS52_AFTER" "$BACKUPS52_BEFORE"
+
+echo "==== RED53 (HIMMEL-3637 R3-codex2): --purge-state must refuse when prov_read_units itself fails, not treat a failed read as zero units ===="
+# Round-1 critic finding: 'done <<EOF\n$(prov_read_units)\nEOF' fed an empty
+# loop body whether prov_read_units returned zero units OR failed outright --
+# both looked identical to the scan. RED53 forces the LATTER: the ledger loads
+# fine (LEDGER_OK=1), a recorded backup exists and is unrestored exactly like
+# RED50, but prov_read_units' own fold query errors (RED53_FORCE_JQ_FAIL=1's
+# jq shim above). The scan must fail closed, exactly as if it had read the
+# real unrestored unit, not silently proceed as "nothing to check".
+new_case red53
+PROJDIR53="$CASE_DIR/project"
+mkdir -p "$PROJDIR53/scripts"
+DEST53="$PROJDIR53/scripts/clean.sh"
+printf '#!/bin/sh\necho original-user-script\n' > "$DEST53"
+SNAP53=$(mktemp "$SUITE_TMP/SNAP53.XXXXXX") || exit 1
+cp -p "$DEST53" "$SNAP53"
+printf '#!/bin/sh\necho himmel-installed-script\n' > "$DEST53"
+( prov_begin --writer adopt.sh -- seed-red53 >/dev/null
+  prov_record replace file "$DEST53" --scope project --class code --row adopter-scripts \
+    --writer adopt.sh --pre-file "$SNAP53" --backup --post-file "$DEST53" >/dev/null
+  prov_end ok >/dev/null )
+rm -f "$SNAP53"
+BACKUPS53_BEFORE=$(find "$HIMMEL_PROVENANCE_DIR/provenance-backups" -type f 2>/dev/null | wc -l | tr -d ' ')
+check "RED53: setup actually created a backup (control is not vacuous)" "$([ "$BACKUPS53_BEFORE" -gt 0 ] && echo yes || echo no)" "yes"
+export RED53_FORCE_JQ_FAIL=1
+run_uninstall --yes --skip-tasks --skip-plugins --skip-hooks --skip-settings --purge-state >/dev/null
+rc53=$?
+unset RED53_FORCE_JQ_FAIL
+BACKUPS53_AFTER=$(find "$HIMMEL_PROVENANCE_DIR/provenance-backups" -type f 2>/dev/null | wc -l | tr -d ' ')
+REFUSED53=$([ "$rc53" -ne 0 ] && echo yes || echo no)
+check "RED53: --purge-state refuses (non-zero) when prov_read_units itself fails" "$REFUSED53" "yes"
+check "RED53: refusing means deleting nothing — the backup survives" "$BACKUPS53_AFTER" "$BACKUPS53_BEFORE"
+
+echo "==== RED54 (HIMMEL-3637 R5-codex1): --purge-state must refuse when a per-row jq check itself fails, not treat the row as backup-less ===="
+# Round-5 critic finding: the purge-time scan's per-row backup check
+# ('jq -e .eff_pre.backup // empty || continue') could not tell "this row
+# genuinely has no backup" from "jq itself failed reading this row" (a
+# malformed provenance-ledger line) -- both fell into the same
+# `|| continue`. Fixed by validating each row's JSON parseability up front
+# (tagged `# HIMMEL-3637-pu-json` so this shim can target only that check,
+# not prov_read_units' own fold query or any unrelated `jq -e .` validity
+# check elsewhere in uninstall.sh's unwire helpers) and by adding `?` to
+# the backup-check filter itself, so a legitimate non-object eff_pre (e.g.
+# `false`) can no longer produce a jq type-error exit that looked
+# identical to a hard failure. RED54 forces the JSON-parseability check to
+# fail via the RED54_FORCE_JQ_FAIL shim above, on a row that DOES have a
+# genuine, unrestored backup. The scan must fail closed exactly as if it
+# had read the real unrestored unit, not silently skip it as unparsable.
+new_case red54
+PROJDIR54="$CASE_DIR/project"
+mkdir -p "$PROJDIR54/scripts"
+DEST54="$PROJDIR54/scripts/clean.sh"
+printf '#!/bin/sh\necho original-user-script\n' > "$DEST54"
+SNAP54=$(mktemp "$SUITE_TMP/SNAP54.XXXXXX") || exit 1
+cp -p "$DEST54" "$SNAP54"
+printf '#!/bin/sh\necho himmel-installed-script\n' > "$DEST54"
+( prov_begin --writer adopt.sh -- seed-red54 >/dev/null
+  prov_record replace file "$DEST54" --scope project --class code --row adopter-scripts \
+    --writer adopt.sh --pre-file "$SNAP54" --backup --post-file "$DEST54" >/dev/null
+  prov_end ok >/dev/null )
+rm -f "$SNAP54"
+BACKUPS54_BEFORE=$(find "$HIMMEL_PROVENANCE_DIR/provenance-backups" -type f 2>/dev/null | wc -l | tr -d ' ')
+check "RED54: setup actually created a backup (control is not vacuous)" "$([ "$BACKUPS54_BEFORE" -gt 0 ] && echo yes || echo no)" "yes"
+export RED54_FORCE_JQ_FAIL=1
+run_uninstall --yes --skip-tasks --skip-plugins --skip-hooks --skip-settings --purge-state >/dev/null
+rc54=$?
+unset RED54_FORCE_JQ_FAIL
+BACKUPS54_AFTER=$(find "$HIMMEL_PROVENANCE_DIR/provenance-backups" -type f 2>/dev/null | wc -l | tr -d ' ')
+REFUSED54=$([ "$rc54" -ne 0 ] && echo yes || echo no)
+check "RED54: --purge-state refuses (non-zero) when the per-row backup check itself fails" "$REFUSED54" "yes"
+check "RED54: refusing means deleting nothing — the backup survives" "$BACKUPS54_AFTER" "$BACKUPS54_BEFORE"
 
 echo "==== REAL-LEDGER TRIPWIRE ===="
 REAL_LEDGER_AFTER=$(real_ledger_state)

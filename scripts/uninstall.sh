@@ -3421,7 +3421,24 @@ if [ "$HALTED" -eq 0 ] && [ "$LEDGER_OK" -eq 1 ]; then
     _adopter_path="$(printf '%s' "$_au" | jq -r '.path // ""')"
     case "$_adopter_path" in
       "$_adopter_proj_root"/*) ;;
-      *) continue ;;
+      *)
+        # HIMMEL-3637: a unit outside this cwd's project root is left alone
+        # (codex-2 fix above), but if it genuinely needs restoring, silently
+        # skipping it would let this run finish at rc=0 having restored
+        # nothing — and a later --purge-state would then delete its only
+        # backup. Halt instead: the caller re-runs from the recorded project.
+        # "keep already-absent" (the project dir itself, not just the file,
+        # is gone -- J1274O w1's "clone deleted" shape) is just as unsafe as
+        # a live "restore" verdict: prov_read_verdict can't tell a genuinely
+        # gone project from this bug's wrong-cwd trap, so both halt.
+        _adopter_verdict="$(prov_read_verdict "$_au")" || _adopter_verdict=""
+        case "$_adopter_verdict" in
+          restore\ *|"keep already-absent")
+            echo "  WARN: $_adopter_path needs restoring but is outside this directory ($PWD) — re-run uninstall.sh from $_adopter_proj_root" >&2
+            fail_step "[6/8] adopter-scripts: $_adopter_path not restored (wrong cwd — re-run from its project directory)"
+            ;;
+        esac
+        continue ;;
     esac
     ledger_apply_unit "$_au"
   done <<EOF
@@ -3868,28 +3885,126 @@ if [ "$LEDGER_OK" -eq 1 ]; then
   if [ "$HALTED" -eq 1 ]; then
     prov_read_session_end halted
   else
+    _prov_session_iid="$_PROV_READ_IID"
     prov_read_session_end ok
     if [ "$PURGE_STATE" -eq 1 ]; then
-      _prov_base_dir="$(prov_dir 2>/dev/null || true)"
-      if [ -z "$_prov_base_dir" ] || suspicious_rm_path "$_prov_base_dir"; then
-        echo "WARN: refusing to purge the provenance ledger — suspicious path: '$_prov_base_dir'" >&2
-        fail_step "[8/8] provenance ledger: refused a suspicious ledger directory ('$_prov_base_dir')"
+      # HIMMEL-3637: fail closed — a backup is the only copy of whatever it
+      # holds, so purging it out from under a unit that still verdicts
+      # "restore" (unrestored, live state still himmel's) would destroy it
+      # for good. This is a defense-in-depth scan across every recorded
+      # backup, independent of row/kind and of any earlier step's own
+      # cwd-scoping, so a gap like it never turns into silent data loss.
+      # A unit this run explicitly decided to keep (e.g. the qmd plugin
+      # stub, HIMMEL-3332's "never gates a removal" ruling) already has a
+      # kept/restored/removed outcome row for this session's iid — that's
+      # a policy decision, not the bug; only a unit with NO outcome row at
+      # all (silently skipped) is what must refuse the purge.
+      _prov_scan_dir="$(prov_dir 2>/dev/null || true)"
+      _prov_scan_ledger="${_prov_scan_dir:+$_prov_scan_dir/provenance.jsonl}"
+      _prov_handled_keys=""
+      if [ -n "$_prov_session_iid" ] && [ -n "$_prov_scan_ledger" ] && [ -f "$_prov_scan_ledger" ]; then
+        # HIMMEL-3637 R3-codex2: key by path+unit, not path alone -- two
+        # different fold units (e.g. distinct hooks nested at the same file
+        # path) each get their own outcome row, so an outcome for one must
+        # never mask a different, still-unrestored unit at the same path.
+        # HIMMEL-3637 R4-codex1: the key is a jq-encoded [path,unit] JSON
+        # array, not a NUL-joined string -- bash's handling of an embedded
+        # NUL inside a variable is undocumented and version-dependent (this
+        # project must stay bash-3.2-safe), so a NUL separator is not a safe
+        # foundation for a substring-match key on every supported shell.
+        _prov_handled_keys="$(jq -c --arg iid "$_prov_session_iid" \
+          'select(.iid==$iid and (.op=="kept" or .op=="restored" or .op=="removed")) | [(.path // ""), (.unit // "")]' \
+          "$_prov_scan_ledger")"
+      fi
+      _prov_handled_keys="
+$_prov_handled_keys
+"
+      _prov_unrestored=""
+      if ! _prov_units_raw="$(prov_read_units)"; then
+        # HIMMEL-3637 R3-codex2: prov_read_units itself failing (a malformed
+        # provenance fold file, not just one bad row) must not look like "no
+        # units to check" -- an empty `$()` here fed the loop nothing and let
+        # --purge-state through with zero checks. Fail the whole scan closed
+        # instead of silently skipping it.
+        echo "WARN: refusing --purge-state — could not read the provenance ledger units (prov_read_units failed)" >&2
+        fail_step "[8/8] provenance ledger: refused to purge — provenance ledger unreadable"
       else
-        _prov_backups_dir="$_prov_base_dir/provenance-backups"
-        _prov_ledger_file="$_prov_base_dir/provenance.jsonl"
-        # HIMMEL-3332 S6 R2-codex6: --keep-backups spares provenance-backups/
-        # under --purge-state too -- the ledger file itself is still removed
-        # unconditionally, only the backups directory is protected.
-        if [ "$KEEP_BACKUPS" -ne 1 ]; then
-          # HIMMEL-2505 gap A.3: a symlinked backups dir is unlinked, never
-          # `rm -rf`'d through into whatever it points at.
-          if [ -L "$_prov_backups_dir" ]; then
-            guarded run rm -f -- "$_prov_backups_dir"
-          else
-            guarded run rm -rf -- "$_prov_backups_dir"
+        while IFS= read -r _pu; do
+          [ -n "$_pu" ] || continue
+          # HIMMEL-3637 R5-codex1: a genuinely unparsable row must not look
+          # like "row has no path"/"row has no backup" -- both silently fell
+          # into the same `|| continue` as a legitimate skip. Validate JSON
+          # parseability up front so that failure is unresolvable, not safe.
+          if ! printf '%s' "$_pu" | jq -e '.
+# HIMMEL-3637-pu-json' >/dev/null 2>&1; then
+            _prov_unrestored="${_prov_unrestored}(unparsable provenance row)"$'\n'
+            continue
           fi
+          _pu_path="$(printf '%s' "$_pu" | jq -r '.path // empty')"
+          [ -n "$_pu_path" ] || continue
+          # `.eff_pre.backup?` (not `.eff_pre.backup`) -- some legitimate
+          # rows carry a non-object eff_pre (e.g. `false`), which a bare
+          # `.eff_pre.backup` errors on (a jq type error, not "no backup");
+          # `?` makes that case resolve to "no backup" like any other absent
+          # field, so `|| continue` here can only mean a genuine no-backup
+          # row now that the row is already known to be valid JSON above.
+          printf '%s' "$_pu" | jq -e '.eff_pre.backup? // empty' >/dev/null 2>&1 || continue
+          _pu_unit="$(printf '%s' "$_pu" | jq -r '.unit // ""')"
+          _pu_key="$(jq -cn --arg p "$_pu_path" --arg u "$_pu_unit" '[$p,$u]')"
+          case "$_prov_handled_keys" in *"
+$_pu_key
+"*) continue ;; esac
+          # HIMMEL-3637 R3-codex1: a verdict this can't even COMPUTE (rc!=0 --
+          # malformed row, missing field) is unresolvable, not safe -- fail
+          # closed on it exactly like an explicit "restore" verdict, rather
+          # than silently letting `|| continue` skip past it and purge.
+          if ! _pu_verdict="$(prov_read_verdict "$_pu")"; then
+            _prov_unrestored="${_prov_unrestored}${_pu_path}"$'\n'
+            continue
+          fi
+          # HIMMEL-3637: "keep already-absent" means the path is gone -- which
+          # includes the whole project directory having been deleted (J1274O
+          # w1). prov_read_verdict can't distinguish that from a genuinely
+          # gone, harmless-to-purge file, so both count as unrestored here.
+          case "$_pu_verdict" in
+            restore\ *|"keep already-absent") ;;
+            *) continue ;;
+          esac
+          _prov_unrestored="${_prov_unrestored}${_pu_path}"$'\n'
+        done <<EOF
+$_prov_units_raw
+EOF
+      fi
+      if [ -n "$_prov_unrestored" ]; then
+        echo "WARN: refusing --purge-state — these backups have not been restored:" >&2
+        printf '%s' "$_prov_unrestored" | while IFS= read -r _pu_path; do
+          [ -n "$_pu_path" ] || continue
+          echo "  $_pu_path (re-run uninstall.sh from its project directory to restore, then --purge-state)" >&2
+        done
+        fail_step "[8/8] provenance ledger: refused to purge — unrestored backup(s) would be lost"
+      fi
+      if [ "$HALTED" -eq 0 ]; then
+        _prov_base_dir="$(prov_dir 2>/dev/null || true)"
+        if [ -z "$_prov_base_dir" ] || suspicious_rm_path "$_prov_base_dir"; then
+          echo "WARN: refusing to purge the provenance ledger — suspicious path: '$_prov_base_dir'" >&2
+          fail_step "[8/8] provenance ledger: refused a suspicious ledger directory ('$_prov_base_dir')"
+        else
+          _prov_backups_dir="$_prov_base_dir/provenance-backups"
+          _prov_ledger_file="$_prov_base_dir/provenance.jsonl"
+          # HIMMEL-3332 S6 R2-codex6: --keep-backups spares provenance-backups/
+          # under --purge-state too -- the ledger file itself is still removed
+          # unconditionally, only the backups directory is protected.
+          if [ "$KEEP_BACKUPS" -ne 1 ]; then
+            # HIMMEL-2505 gap A.3: a symlinked backups dir is unlinked, never
+            # `rm -rf`'d through into whatever it points at.
+            if [ -L "$_prov_backups_dir" ]; then
+              guarded run rm -f -- "$_prov_backups_dir"
+            else
+              guarded run rm -rf -- "$_prov_backups_dir"
+            fi
+          fi
+          guarded run rm -f -- "$_prov_ledger_file"
         fi
-        guarded run rm -f -- "$_prov_ledger_file"
       fi
     elif [ "$KEEP_BACKUPS" -ne 1 ]; then
       # codex-1 fix: a dry run must not delete real backup files -- only say

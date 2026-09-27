@@ -115,7 +115,7 @@ try {
   $sentinel6 = Join-Path $FAKEHOME '.claude-codex\.seeded'
   Set-Content -LiteralPath $seeded6 -Value 'operator rules' -NoNewline
   New-Item -ItemType File -Force -Path $sentinel6 | Out-Null
-  if ((Get-Item -LiteralPath $sentinel6).Length -eq 0) { Pass 'test setup produced an empty legacy sentinel' } else { Fail 'test setup did not produce an empty legacy sentinel' }
+  if ((Get-Item -Force -LiteralPath $sentinel6).Length -eq 0) { Pass 'test setup produced an empty legacy sentinel' } else { Fail 'test setup did not produce an empty legacy sentinel' }
   Invoke-Launcher
   if ((Get-Content -LiteralPath $seeded6 -Raw) -match 'HIMMEL-1927') { Pass 'empty legacy sentinel forces a reseed' } else { Fail 'empty legacy sentinel did not force the stanza to land' }
 
@@ -127,9 +127,9 @@ try {
   Invoke-Launcher
   $seeded7 = Join-Path $FAKEHOME '.claude-codex\CLAUDE.md'
   Add-Content -LiteralPath $seeded7 -Value 'tamper-marker-should-survive'
-  (Get-Item -LiteralPath (Join-Path $FAKEHOME '.claude\CLAUDE.md')).LastWriteTimeUtc = [datetime]'2020-01-01'
+  (Get-Item -Force -LiteralPath (Join-Path $FAKEHOME '.claude\CLAUDE.md')).LastWriteTimeUtc = [datetime]'2020-01-01'
   $sentinel7 = Join-Path $FAKEHOME '.claude-codex\.seeded'
-  (Get-Item -LiteralPath $sentinel7).LastWriteTimeUtc = [datetime]::UtcNow
+  (Get-Item -Force -LiteralPath $sentinel7).LastWriteTimeUtc = [datetime]::UtcNow
   Invoke-Launcher
   $seeded7Content = Get-Content -LiteralPath $seeded7 -Raw
   if ($seeded7Content -match 'tamper-marker-should-survive') { Pass 'current-version sentinel skips reseed' } else { Fail 'current-version sentinel still triggered a reseed' }
@@ -148,9 +148,9 @@ try {
   $seeded8 = Join-Path $FAKEHOME '.claude-codex\CLAUDE.md'
   $seeded8Content = Get-Content -LiteralPath $seeded8 -Raw
   if ($seeded8Content -match 'Your backend model is gpt-5\.6-sol') { Pass 'initial seed names gpt-5.6-sol' } else { Fail 'initial seed did not name gpt-5.6-sol' }
-  (Get-Item -LiteralPath (Join-Path $FAKEHOME '.claude\CLAUDE.md')).LastWriteTimeUtc = [datetime]'2020-01-01'
+  (Get-Item -Force -LiteralPath (Join-Path $FAKEHOME '.claude\CLAUDE.md')).LastWriteTimeUtc = [datetime]'2020-01-01'
   $sentinel8 = Join-Path $FAKEHOME '.claude-codex\.seeded'
-  (Get-Item -LiteralPath $sentinel8).LastWriteTimeUtc = [datetime]::UtcNow
+  (Get-Item -Force -LiteralPath $sentinel8).LastWriteTimeUtc = [datetime]::UtcNow
   $env:CODEX_MODEL = 'gpt-5.6-terra'
   Invoke-Launcher
   $seeded8Content = Get-Content -LiteralPath $seeded8 -Raw
@@ -165,6 +165,27 @@ try {
   $seeded8Content = Get-Content -LiteralPath $seeded8 -Raw
   $count9 = ([regex]::Matches($seeded8Content, '(?m)^## Claudex lane model identity \(HIMMEL-1927\)$')).Count
   if ($count9 -eq 1) { Pass 'same-model relaunch does not reseed again' } else { Fail "same-model relaunch produced $count9 identity stanzas (expected 1)" }
+
+  # --- HIMMEL-3334 F2: the un-swept claude-hud.json path (new, alongside the
+  # legacy plugins\claude-hud\config.json) is seeded and staleness-tracked too —
+  # a lane must not lose the HUD after an operator's box has migrated off the
+  # legacy path.
+  New-Sandbox
+  $env:CODEX_MODEL = 'gpt-5.6-sol'
+  Set-Content -LiteralPath (Join-Path $FAKEHOME '.claude\claude-hud.json') -Value '{"display":{"customLineCommand":"new-path"}}' -NoNewline
+  Invoke-Launcher
+  $hudSeeded = Join-Path $FAKEHOME '.claude-codex\claude-hud.json'
+  if (Test-Path -LiteralPath $hudSeeded) { Pass 'claude-hud.json (new path) seeded' } else { Fail 'claude-hud.json (new path) not seeded' }
+  $hudSeededContent = Get-Content -LiteralPath $hudSeeded -Raw
+  if ($hudSeededContent -match 'new-path') { Pass 'seeded claude-hud.json content matches source' } else { Fail 'seeded claude-hud.json content mismatch' }
+  (Get-Item -Force -LiteralPath (Join-Path $FAKEHOME '.claude-codex\.seeded')).LastWriteTimeUtc = [datetime]'2020-01-01'
+  Set-Content -LiteralPath (Join-Path $FAKEHOME '.claude\claude-hud.json') -Value '{"display":{"customLineCommand":"new-path-updated"}}' -NoNewline
+  Invoke-Launcher
+  $hudSeededContent = Get-Content -LiteralPath $hudSeeded -Raw
+  if ($hudSeededContent -match 'new-path-updated') { Pass 'new hud path staleness triggers reseed' } else { Fail 'new-path hud change did not trigger reseed' }
+  Remove-Item -LiteralPath (Join-Path $FAKEHOME '.claude\claude-hud.json') -Force
+  Invoke-Launcher
+  if (-not (Test-Path -LiteralPath $hudSeeded)) { Pass 'deleted new-path hud source mirrors removal' } else { Fail 'stale claude-hud.json (new path) survived source deletion' }
 
   # --- .salus marker -> refuse exit 3 before any seeding happens (HIMMEL-2173)
   New-Sandbox

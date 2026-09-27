@@ -269,7 +269,7 @@ kept_line5=$(printf '%s\n' "$out5" | grep -c -E 'kept.*bar\.sh.*user-modified')
 check "RED5 uninstall: user-modified adopter-script kept as-is + reported user-modified" \
   "$AFTER5_BYTES|$kept_line5" "$USER_MODIFIED5_BYTES|1"
 
-echo "==== RED6: missing ledger -- six overwrite-prone rows protected, plugins skipped ===="
+echo "==== RED6: missing ledger -- six overwrite-prone rows protected (hud-config's own path), plugins skipped; a legacy pre-HIMMEL-3334 swept-path leftover is kept while the statusLine stays wired ===="
 new_case red6
 mkdir -p "$HOME/.claude/plugins/claude-hud"
 cat > "$CASE_SETTINGS" <<JSON
@@ -279,6 +279,15 @@ cat > "$CASE_SETTINGS" <<JSON
 }
 JSON
 printf '{"display":{"customLineCommand":"bash \\"/fake/scripts/statusline/hud-custom-lines.sh\\""}}\n' \
+  > "$HOME/.claude/claude-hud.json"
+# HIMMEL-3334: a leftover config at the pre-migration swept path
+# (plugins/claude-hud/config.json, inside Claude Code's plugin-manager
+# sweep) is ledger-independent -- gated by unwire_hud_config's
+# customLineCommand shape check -- but it is KEPT while the statusLine
+# is still wired (here the no-ledger branch protects the statusLine), so an
+# upgraded-but-not-yet-rewired install keeps its HUD; the row's OWN (new,
+# un-swept) path is protected too, asserted separately below.
+printf '{"display":{"customLineCommand":"bash \\"/fake/scripts/statusline/hud-custom-lines.sh\\""}}\n' \
   > "$HOME/.claude/plugins/claude-hud/config.json"
 printf '[{"id":"himmel-ops@himmel","scope":"user"}]\n' > "$CASE_PLUGINS_JSON"
 printf '[{"name":"himmel"}]\n' > "$CASE_MARKETPLACES_JSON"
@@ -287,10 +296,11 @@ out6=$(run_uninstall --yes --keep-telegram-state --skip-tasks --skip-hooks)
 warn6=$(printf '%s\n' "$out6" | grep -c -F "provenance: no ledger at $LEDGER_PATH6; pre-existing units cannot be told from himmel's — the six overwrite-prone rows are kept")
 statusline_kept6=$(jq -r 'has("statusLine")' "$CASE_SETTINGS")
 handover_kept6=$(jq -r '.env.HANDOVER_DIR // "ABSENT"' "$CASE_SETTINGS")
-hud_kept6=$([ -f "$HOME/.claude/plugins/claude-hud/config.json" ] && echo yes || echo no)
+hud_kept6=$([ -f "$HOME/.claude/claude-hud.json" ] && echo yes || echo no)
+hud_legacy_kept6=$([ -f "$HOME/.claude/plugins/claude-hud/config.json" ] && echo yes || echo no)
 plugin_kept6=$(jq -r '[.[] | select(.id=="himmel-ops@himmel")] | length>0' "$CASE_PLUGINS_JSON")
-check "RED6 uninstall: no ledger -> warning printed + statusLine/HANDOVER_DIR/hud-config/plugins all protected" \
-  "$warn6|$statusline_kept6|$handover_kept6|$hud_kept6|$plugin_kept6" "1|true|/opt/red6-handover|yes|true"
+check "RED6 uninstall: no ledger -> warning printed + statusLine/HANDOVER_DIR/hud-config(new path)/plugins protected, legacy swept-path leftover kept while statusLine is wired" \
+  "$warn6|$statusline_kept6|$handover_kept6|$hud_kept6|$hud_legacy_kept6|$plugin_kept6" "1|true|/opt/red6-handover|yes|yes|true"
 
 echo "==== RED7: foreign ledger (recorded home != current home) -- same warning + statusLine protected ===="
 new_case red7
@@ -421,13 +431,18 @@ AFTER12B=$(cat "$DEST12B")
 check "RED12 codex-9: second adopter-scripts unit untouched after the first failed" \
   "$AFTER12B" "$B12B_INSTALLED"
 
-echo "==== RED13 (codex-4): ledger loaded but silent on statusLine/HANDOVER_DIR/hud -- kept like no-ledger, not stripped ===="
+echo "==== RED13 (codex-4): ledger loaded but silent on statusLine/HANDOVER_DIR/hud -- kept like no-ledger, not stripped; a legacy swept-path leftover is kept while the statusLine stays wired ===="
 new_case red13
 # RED7's HOME override, `( HOME set inside a subshell )`, closed long before this line; HOME here is the
 # suite's own scratch HOME, exactly as intended.
 # shellcheck disable=SC2031
-HUD13="$HOME/.claude/plugins/claude-hud/config.json"
+HUD13="$HOME/.claude/claude-hud.json"
 mkdir -p "$(dirname "$HUD13")"
+# HIMMEL-3334: a leftover legacy-path config, same reasoning as RED6 --
+# kept while the loaded-but-silent ledger keeps the statusLine wired.
+# shellcheck disable=SC2031
+HUD13_LEGACY="$HOME/.claude/plugins/claude-hud/config.json"
+mkdir -p "$(dirname "$HUD13_LEGACY")"
 cat > "$CASE_SETTINGS" <<JSON
 {
   "statusLine": {"type":"command","command":"bash \"$repo_root/marketplace/plugins/claude-hud/dist/index.js\""},
@@ -436,6 +451,8 @@ cat > "$CASE_SETTINGS" <<JSON
 JSON
 printf '{"display":{"customLineCommand":"bash \\"/fake/scripts/statusline/hud-custom-lines.sh\\""}}\n' \
   > "$HUD13"
+printf '{"display":{"customLineCommand":"bash \\"/fake/scripts/statusline/hud-custom-lines.sh\\""}}\n' \
+  > "$HUD13_LEGACY"
 # a REAL, loaded ledger (LEDGER_OK=1) that records only an UNRELATED unit --
 # never a json-key unit for /statusLine or /env/HANDOVER_DIR, and never a
 # file unit for the hud config path -- so every one of these six-row
@@ -448,12 +465,13 @@ out13=$(run_uninstall --yes --keep-telegram-state --skip-tasks --skip-plugins --
 statusline_kept13=$(jq -r 'has("statusLine")' "$CASE_SETTINGS")
 handover_kept13=$(jq -r '.env.HANDOVER_DIR // "ABSENT"' "$CASE_SETTINGS")
 hud_kept13=$([ -f "$HUD13" ] && echo yes || echo no)
+hud_legacy_kept13=$([ -f "$HUD13_LEGACY" ] && echo yes || echo no)
 notinledger13=$(printf '%s\n' "$out13" | grep -c 'kept (not in ledger)')
 # HIMMEL-3332 S6 slice2: workspace-trust is now ledger-decided too, so a
 # loaded-but-silent ledger also keeps it "not in ledger" -- a 4th line,
 # alongside statusLine, env.HANDOVER_DIR and the hud config.
-check "RED13 codex-4: loaded-but-silent ledger keeps statusLine/HANDOVER_DIR/hud-config like the no-ledger branch" \
-  "$statusline_kept13|$handover_kept13|$hud_kept13|$notinledger13" "true|/opt/red13-handover|yes|4"
+check "RED13 codex-4: loaded-but-silent ledger keeps statusLine/HANDOVER_DIR/hud-config(new path) like the no-ledger branch, legacy swept-path leftover kept while statusLine is wired" \
+  "$statusline_kept13|$handover_kept13|$hud_kept13|$hud_legacy_kept13|$notinledger13" "true|/opt/red13-handover|yes|yes|4"
 
 echo "==== RED14 (codex-5): a halted per-unit settings loop must not fall through to the legacy helper for a unit it never reached ===="
 new_case red14
@@ -1244,6 +1262,326 @@ for sub in created control; do
   esac
 done
 unset ENTRY33
+
+echo "==== RED34 (HIMMEL-3334 F1, judge J1269O): a legacy-path replace backup survives a rewire's bare rm -f, restored by uninstall ===="
+# Scenario from the verdict: an operator has their own (non-himmel) config at
+# the pre-HIMMEL-3334 swept path; a pre-PR install REPLACES it there and
+# records a ledger `replace` row with a backup of the original bytes -- the
+# only place those bytes still exist once wire-statusline.sh's own
+# HIMMEL-3334 migration later `rm -f`s that path with no provenance of its
+# own (scripts/lib/wire-statusline.sh ~406-411) while publishing the new
+# un-swept claude-hud.json. Before this fix, uninstall's hud branch only ever
+# consulted the ledger for the NEW path ($_p), so the legacy path's own
+# `replace` unit was never applied and the operator's bytes stayed lost.
+new_case red34
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+mkdir -p "$HOME/.claude/plugins/claude-hud"
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+HUD_LEGACY34="$HOME/.claude/plugins/claude-hud/config.json"
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+HUD_NEW34="$HOME/.claude/claude-hud.json"
+printf '{"custom":"operator-pre-himmel-hud-config"}\n' > "$HUD_LEGACY34"
+ORIG34_BYTES=$(cat "$HUD_LEGACY34")
+SNAP34=$(mktemp "$SUITE_TMP/SNAP34.XXXXXX") || exit 1
+cp -p "$HUD_LEGACY34" "$SNAP34"
+printf '{"display":{"customLineCommand":"bash \\"%s/scripts/statusline/hud-custom-lines.sh\\""}}\n' "$repo_root" > "$HUD_LEGACY34"
+( prov_begin --writer wire-statusline.sh -- seed-red34 >/dev/null
+  prov_record replace file "$HUD_LEGACY34" --scope user --class code --row hud-config \
+    --writer wire-statusline.sh --pre-file "$SNAP34" --backup --post-file "$HUD_LEGACY34" >/dev/null
+  prov_end ok >/dev/null )
+rm -f "$SNAP34"
+# The rewire's migration: publish the new path, then blow away the legacy one.
+printf '{"display":{"customLineCommand":"bash \\"%s/scripts/statusline/hud-custom-lines.sh\\""}}\n' "$repo_root" > "$HUD_NEW34"
+rm -f "$HUD_LEGACY34"
+run_uninstall --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks >/dev/null
+AFTER34_BYTES=$([ -f "$HUD_LEGACY34" ] && cat "$HUD_LEGACY34" || echo "ABSENT")
+check "RED34 uninstall: legacy-path replace backup restored after a rewire's bare rm -f" \
+  "$AFTER34_BYTES" "$ORIG34_BYTES"
+
+echo "==== RED35 (HIMMEL-3334 C1, judge J1269A): a legacy-path replace backup survives uninstall even when NOT rewired ===="
+# Scenario from the verdict (C1): unlike RED34, this box was never re-wired
+# since HIMMEL-3334 -- the legacy path still holds himmel's own (post-replace)
+# bytes when uninstall runs, so the "legacy exists" branch (not the F1
+# file-absent branch RED34 covers) is the one that must consult the ledger
+# before ever touching the file.
+new_case red35
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+mkdir -p "$HOME/.claude/plugins/claude-hud"
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+HUD_LEGACY35="$HOME/.claude/plugins/claude-hud/config.json"
+printf '{"custom":"operator-pre-himmel-hud-config-35"}\n' > "$HUD_LEGACY35"
+ORIG35_BYTES=$(cat "$HUD_LEGACY35")
+SNAP35=$(mktemp "$SUITE_TMP/SNAP35.XXXXXX") || exit 1
+cp -p "$HUD_LEGACY35" "$SNAP35"
+printf '{"display":{"customLineCommand":"bash \\"%s/scripts/statusline/hud-custom-lines.sh\\""}}\n' "$repo_root" > "$HUD_LEGACY35"
+( prov_begin --writer wire-statusline.sh -- seed-red35 >/dev/null
+  prov_record replace file "$HUD_LEGACY35" --scope user --class code --row hud-config \
+    --writer wire-statusline.sh --pre-file "$SNAP35" --backup --post-file "$HUD_LEGACY35" >/dev/null
+  prov_end ok >/dev/null )
+rm -f "$SNAP35"
+# No rewire migration this time: no claude-hud.json at the new path, and the
+# legacy file is left in place, exactly as it would be on an un-rewired box.
+run_uninstall --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks >/dev/null
+AFTER35_BYTES=$([ -f "$HUD_LEGACY35" ] && cat "$HUD_LEGACY35" || echo "ABSENT")
+check "RED35 uninstall: legacy-path replace backup restored without a prior rewire" \
+  "$AFTER35_BYTES" "$ORIG35_BYTES"
+
+echo "==== RED36 (HIMMEL-3334 I1/JD, judge J1269A): a himmel-shaped legacy file with NO ledger unit is kept, not deleted ===="
+# Scenario from the verdict (I1): the ledger is present and has OTHER history
+# (so LEDGER_OK=1), but nothing was ever recorded for this legacy path -- no
+# ledger evidence himmel owns this file, so it must be left alone even though
+# its bytes happen to match himmel's own customLineCommand pattern.
+new_case red36
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+mkdir -p "$HOME/.claude/plugins/claude-hud"
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+HUD_LEGACY36="$HOME/.claude/plugins/claude-hud/config.json"
+printf '{"display":{"customLineCommand":"bash \\"%s/scripts/statusline/hud-custom-lines.sh\\""}}\n' "$repo_root" > "$HUD_LEGACY36"
+ORIG36_BYTES=$(cat "$HUD_LEGACY36")
+# Unrelated ledger history so LEDGER_OK=1, but no unit for $HUD_LEGACY36 at all.
+( prov_begin --writer install-plugins.sh -- seed-red36 >/dev/null
+  prov_record register marketplace - --unit claude-plugins-official --scope machine --class code \
+    --writer install-plugins.sh --row marketplaces --field 'cli_scope="user"' --field preexisted=true >/dev/null
+  prov_end ok >/dev/null )
+run_uninstall --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks >/dev/null
+AFTER36_BYTES=$([ -f "$HUD_LEGACY36" ] && cat "$HUD_LEGACY36" || echo "ABSENT")
+check "RED36 uninstall: himmel-shaped legacy file with no ledger unit is kept" \
+  "$AFTER36_BYTES" "$ORIG36_BYTES"
+
+echo "==== RED37 (HIMMEL-3334 N1, judge J1269B): a legacy replace unit the operator edited after install is kept, not restored ===="
+# Scenario (JF): like RED35, a pre-PR install REPLACED the operator's own
+# config and recorded a ledger `replace` unit with a backup -- but the
+# operator then hand-edited the himmel-written file, keeping himmel's
+# customLineCommand. Not rewired. Before this fix, the legacy branch called
+# prov_read_apply restore directly (no drift check), overwriting the
+# operator's post-install edit with the pre-himmel backup.
+new_case red37
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+mkdir -p "$HOME/.claude/plugins/claude-hud"
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+HUD_LEGACY37="$HOME/.claude/plugins/claude-hud/config.json"
+printf '{"custom":"operator-pre-himmel-hud-config-37"}\n' > "$HUD_LEGACY37"
+SNAP37=$(mktemp "$SUITE_TMP/SNAP37.XXXXXX") || exit 1
+cp -p "$HUD_LEGACY37" "$SNAP37"
+printf '{"display":{"customLineCommand":"bash \\"%s/scripts/statusline/hud-custom-lines.sh\\""}}\n' "$repo_root" > "$HUD_LEGACY37"
+( prov_begin --writer wire-statusline.sh -- seed-red37 >/dev/null
+  prov_record replace file "$HUD_LEGACY37" --scope user --class code --row hud-config \
+    --writer wire-statusline.sh --pre-file "$SNAP37" --backup --post-file "$HUD_LEGACY37" >/dev/null
+  prov_end ok >/dev/null )
+rm -f "$SNAP37"
+# The operator's post-install edit, keeping himmel's own command.
+printf '{"display":{"customLineCommand":"bash \\"%s/scripts/statusline/hud-custom-lines.sh\\"","operatorKey":"edited-after-install"}}\n' "$repo_root" > "$HUD_LEGACY37"
+EDITED37_BYTES=$(cat "$HUD_LEGACY37")
+out37dry=$(run_uninstall --dry-run --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks); rc37dry=$?
+check "RED37 dry-run: exits 0" "$rc37dry" "0"
+check "RED37 dry-run: previews the legacy hud config as kept (user-modified)" \
+  "$(printf '%s' "$out37dry" | grep -Fc "would keep $HUD_LEGACY37 (user-modified)")" "1"
+AFTER37DRY_BYTES=$(cat "$HUD_LEGACY37")
+check "RED37 dry-run: left the operator's edit untouched (preview only)" "$AFTER37DRY_BYTES" "$EDITED37_BYTES"
+out37=$(run_uninstall --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks); rc37=$?
+check "RED37 wet run: exits 0" "$rc37" "0"
+check "RED37 wet run: names the legacy hud config as kept (user-modified)" \
+  "$(printf '%s' "$out37" | grep -Fc "kept $HUD_LEGACY37 (user-modified)")" "1"
+AFTER37_BYTES=$(cat "$HUD_LEGACY37")
+check "RED37 uninstall: legacy-path operator edit survives (not restored over)" \
+  "$AFTER37_BYTES" "$EDITED37_BYTES"
+
+echo "==== RED38 (HIMMEL-3334 N2, judge J1269B): a legacy create unit the operator edited after install is kept, not deleted ===="
+# Scenario (JG): a pre-PR install CREATED the legacy config (no pre-existing
+# file, a `create` unit, no backup). The operator later edited it, keeping
+# himmel's command. Not rewired. Before this fix, a unit with no backup fell
+# into the pattern-gated rm fallback and deleted the operator's edited file.
+new_case red38
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+mkdir -p "$HOME/.claude/plugins/claude-hud"
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+HUD_LEGACY38="$HOME/.claude/plugins/claude-hud/config.json"
+printf '{"display":{"customLineCommand":"bash \\"%s/scripts/statusline/hud-custom-lines.sh\\""}}\n' "$repo_root" > "$HUD_LEGACY38"
+( prov_begin --writer wire-statusline.sh -- seed-red38 >/dev/null
+  prov_record create file "$HUD_LEGACY38" --pre-absent --post-file "$HUD_LEGACY38" --scope user --class code \
+    --row hud-config --writer wire-statusline.sh --field preexisted=false >/dev/null
+  prov_end ok >/dev/null )
+printf '{"display":{"customLineCommand":"bash \\"%s/scripts/statusline/hud-custom-lines.sh\\"","operatorKey":"edited-after-install"}}\n' "$repo_root" > "$HUD_LEGACY38"
+EDITED38_BYTES=$(cat "$HUD_LEGACY38")
+run_uninstall --dry-run --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks >/dev/null; rc38dry=$?
+check "RED38 dry-run: exits 0" "$rc38dry" "0"
+AFTER38DRY_BYTES=$(cat "$HUD_LEGACY38")
+check "RED38 dry-run: left the operator's edit untouched (preview only)" "$AFTER38DRY_BYTES" "$EDITED38_BYTES"
+run_uninstall --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks >/dev/null; rc38=$?
+check "RED38 wet run: exits 0" "$rc38" "0"
+AFTER38_BYTES=$([ -f "$HUD_LEGACY38" ] && cat "$HUD_LEGACY38" || echo "ABSENT")
+check "RED38 uninstall: legacy-path operator edit survives (not deleted)" \
+  "$AFTER38_BYTES" "$EDITED38_BYTES"
+
+echo "==== RED39 (HIMMEL-3334 N3, judge J1269B): a legacy replace unit whose backup is gone is kept, not a halt ===="
+# Scenario (JH): a legacy `replace` unit whose backup file has since been
+# pruned or hand-deleted. Not rewired. Before this fix, the legacy branch
+# still saw a non-empty backup PATH string, attempted the restore, and
+# fail_step halted the whole uninstall with rc=2 when the read failed.
+new_case red39
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+mkdir -p "$HOME/.claude/plugins/claude-hud"
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+HUD_LEGACY39="$HOME/.claude/plugins/claude-hud/config.json"
+printf '{"custom":"operator-pre-himmel-hud-config-39"}\n' > "$HUD_LEGACY39"
+SNAP39=$(mktemp "$SUITE_TMP/SNAP39.XXXXXX") || exit 1
+cp -p "$HUD_LEGACY39" "$SNAP39"
+printf '{"display":{"customLineCommand":"bash \\"%s/scripts/statusline/hud-custom-lines.sh\\""}}\n' "$repo_root" > "$HUD_LEGACY39"
+( prov_begin --writer wire-statusline.sh -- seed-red39 >/dev/null
+  prov_record replace file "$HUD_LEGACY39" --scope user --class code --row hud-config \
+    --writer wire-statusline.sh --pre-file "$SNAP39" --backup --post-file "$HUD_LEGACY39" >/dev/null
+  prov_end ok >/dev/null )
+rm -f "$SNAP39"
+# Prune the backup the ledger row ACTUALLY points at. --backup copies the
+# pre-state into its own provenance-backups/<iid>/... file (_prov_backup in
+# provenance.sh); deleting $SNAP39 (the staging file passed as --pre-file)
+# does not touch that copy, so the real backup path has to be read back out
+# of the ledger row itself.
+LEDGER39=$(prov_ledger_path)
+BACKUP39=$(jq -r --arg p "$HUD_LEGACY39" 'select(.path==$p and .pre.backup != null) | .pre.backup' "$LEDGER39" | tail -n1)
+[ -n "$BACKUP39" ] || { echo "RED39 setup: could not find the recorded backup path" >&2; exit 1; }
+rm -f "$BACKUP39"
+ORIG39_BYTES=$(cat "$HUD_LEGACY39")
+run_uninstall --dry-run --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks >/dev/null; rc39dry=$?
+check "RED39 dry-run: exits 0 (no-backup is not a halt)" "$rc39dry" "0"
+AFTER39DRY_BYTES=$(cat "$HUD_LEGACY39")
+check "RED39 dry-run: left the legacy config untouched (preview only)" "$AFTER39DRY_BYTES" "$ORIG39_BYTES"
+run_uninstall --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks >/dev/null; rc39=$?
+check "RED39 wet run: exits 0 (no-backup is not a halt)" "$rc39" "0"
+AFTER39_BYTES=$(cat "$HUD_LEGACY39")
+check "RED39 uninstall: legacy-path config with a pruned backup is kept, byte-identical" \
+  "$AFTER39_BYTES" "$ORIG39_BYTES"
+
+echo "==== RED40 (HIMMEL-3334 I1, judge J1269C): a migrated-away legacy replace unit whose backup is pruned is kept, not a halt (F1 branch) ===="
+# Scenario (JH2, contrived): same setup as RED34 (migrated away, ledger
+# replace unit with backup) but the backup itself is gone when uninstall
+# runs. Before this fix, the F1 branch (scripts/uninstall.sh ~3237-3251)
+# read a non-empty backup PATH string off the ledger row and called
+# prov_read_apply restore unconditionally -- prov_read_apply's own missing-
+# backup check then failed, WARN + fail_step halted the whole uninstall
+# (rc=2). Main has no F1 branch and completes the same input with rc=0.
+new_case red40
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+mkdir -p "$HOME/.claude/plugins/claude-hud"
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+HUD_LEGACY40="$HOME/.claude/plugins/claude-hud/config.json"
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+HUD_NEW40="$HOME/.claude/claude-hud.json"
+printf '{"custom":"operator-pre-himmel-hud-config-40"}\n' > "$HUD_LEGACY40"
+SNAP40=$(mktemp "$SUITE_TMP/SNAP40.XXXXXX") || exit 1
+cp -p "$HUD_LEGACY40" "$SNAP40"
+printf '{"display":{"customLineCommand":"bash \\"%s/scripts/statusline/hud-custom-lines.sh\\""}}\n' "$repo_root" > "$HUD_LEGACY40"
+( prov_begin --writer wire-statusline.sh -- seed-red40 >/dev/null
+  prov_record replace file "$HUD_LEGACY40" --scope user --class code --row hud-config \
+    --writer wire-statusline.sh --pre-file "$SNAP40" --backup --post-file "$HUD_LEGACY40" >/dev/null
+  prov_end ok >/dev/null )
+rm -f "$SNAP40"
+# The rewire's migration: publish the new path, then blow away the legacy one.
+printf '{"display":{"customLineCommand":"bash \\"%s/scripts/statusline/hud-custom-lines.sh\\""}}\n' "$repo_root" > "$HUD_NEW40"
+rm -f "$HUD_LEGACY40"
+LEDGER40=$(prov_ledger_path)
+BACKUP40=$(jq -r --arg p "$HUD_LEGACY40" 'select(.path==$p and .pre.backup != null) | .pre.backup' "$LEDGER40" | tail -n1)
+[ -n "$BACKUP40" ] || { echo "RED40 setup: could not find the recorded backup path" >&2; exit 1; }
+rm -f "$BACKUP40"
+run_uninstall --dry-run --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks >/dev/null; rc40dry=$?
+check "RED40 dry-run: exits 0 (no-backup is not a halt)" "$rc40dry" "0"
+run_uninstall --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks >/dev/null; rc40=$?
+check "RED40 wet run: exits 0 (no-backup is not a halt)" "$rc40" "0"
+AFTER40_BYTES=$([ -f "$HUD_LEGACY40" ] && cat "$HUD_LEGACY40" || echo "ABSENT")
+check "RED40 uninstall: migrated-away legacy path with a pruned backup stays absent, not resurrected" \
+  "$AFTER40_BYTES" "ABSENT"
+
+echo "==== RED41 (HIMMEL-3334 I1, judge J1269C): the natural JH3 path -- restore, prune, sweep, re-uninstall never halts ===="
+# Scenario (JH3, natural path from the verdict): (1) a base-era install
+# records a replace unit over the operator's own legacy config; (2) a rewire
+# migrates the legacy file away; (3) uninstall #1 restores the operator's
+# original and its clean-end prune deletes the now-restored unit's backup
+# (prov_read_prune_backups, no --keep-backups) -- the fold ignores `restored`
+# outcome rows (m1, a follow-up ticket, not this fix), so the unit stays
+# live; (4) Claude Code's plugin-dir sweep deletes plugins/claude-hud/,
+# taking the just-restored file with it. A reinstall between (4) and the
+# second uninstall is a no-op for hud-config here (the legacy path stays
+# absent either way) and is omitted. Uninstall #2 must not halt.
+new_case red41
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+mkdir -p "$HOME/.claude/plugins/claude-hud"
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+HUD_LEGACY41="$HOME/.claude/plugins/claude-hud/config.json"
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+HUD_NEW41="$HOME/.claude/claude-hud.json"
+printf '{"custom":"operator-pre-himmel-hud-config-41"}\n' > "$HUD_LEGACY41"
+ORIG41_BYTES=$(cat "$HUD_LEGACY41")
+SNAP41=$(mktemp "$SUITE_TMP/SNAP41.XXXXXX") || exit 1
+cp -p "$HUD_LEGACY41" "$SNAP41"
+printf '{"display":{"customLineCommand":"bash \\"%s/scripts/statusline/hud-custom-lines.sh\\""}}\n' "$repo_root" > "$HUD_LEGACY41"
+( prov_begin --writer wire-statusline.sh -- seed-red41 >/dev/null
+  prov_record replace file "$HUD_LEGACY41" --scope user --class code --row hud-config \
+    --writer wire-statusline.sh --pre-file "$SNAP41" --backup --post-file "$HUD_LEGACY41" >/dev/null
+  prov_end ok >/dev/null )
+rm -f "$SNAP41"
+printf '{"display":{"customLineCommand":"bash \\"%s/scripts/statusline/hud-custom-lines.sh\\""}}\n' "$repo_root" > "$HUD_NEW41"
+rm -f "$HUD_LEGACY41"
+run_uninstall --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks >/dev/null
+AFTER41_FIRST_BYTES=$([ -f "$HUD_LEGACY41" ] && cat "$HUD_LEGACY41" || echo "ABSENT")
+check "RED41 setup: uninstall #1 restored the operator's original" "$AFTER41_FIRST_BYTES" "$ORIG41_BYTES"
+# The plugin-dir sweep: the just-restored file (and its already-pruned
+# backup) are both gone again, while the ledger unit is still live (m1).
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+rm -rf "$HOME/.claude/plugins/claude-hud"
+run_uninstall --dry-run --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks >/dev/null; rc41dry=$?
+check "RED41 dry-run #2: exits 0 (no-backup is not a halt)" "$rc41dry" "0"
+run_uninstall --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks >/dev/null; rc41=$?
+check "RED41 wet uninstall #2: exits 0, no halt on a pruned backup in the F1 branch" "$rc41" "0"
+AFTER41_BYTES=$([ -f "$HUD_LEGACY41" ] && cat "$HUD_LEGACY41" || echo "ABSENT")
+check "RED41 uninstall #2: legacy path stays absent (no resurrection, no halt)" "$AFTER41_BYTES" "ABSENT"
+
+echo "==== RED42 (HIMMEL-3334 I2, console ruling on judge J1269C): a no-ledger legacy config the operator edited (not byte-identical to himmel's template) survives ===="
+# Scenario (JJ): no ledger at all; a himmel-shaped legacy config (its
+# customLineCommand matches himmel's pattern) with an operator-added key
+# alongside it. Before this fix, the no-ledger branch's pattern-gated rm
+# (unwire_hud_config) only ever checked customLineCommand and deleted the
+# file outright, losing the operator's added key.
+new_case red42
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+mkdir -p "$HOME/.claude/plugins/claude-hud"
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+HUD_LEGACY42="$HOME/.claude/plugins/claude-hud/config.json"
+printf '{"display":{"customLineCommand":"bash \\"%s/scripts/statusline/hud-custom-lines.sh\\""},"operatorKey":"edited-e310cc"}\n' \
+  "$repo_root" > "$HUD_LEGACY42"
+EDITED42_BYTES=$(cat "$HUD_LEGACY42")
+run_uninstall --dry-run --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks >/dev/null; rc42dry=$?
+check "RED42 dry-run: exits 0" "$rc42dry" "0"
+AFTER42DRY_BYTES=$(cat "$HUD_LEGACY42")
+check "RED42 dry-run: left the operator's edit untouched (preview only)" "$AFTER42DRY_BYTES" "$EDITED42_BYTES"
+run_uninstall --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks >/dev/null; rc42=$?
+check "RED42 wet run: exits 0" "$rc42" "0"
+AFTER42_BYTES=$([ -f "$HUD_LEGACY42" ] && cat "$HUD_LEGACY42" || echo "ABSENT")
+check "RED42 uninstall: no-ledger legacy config edited by the operator (not byte-identical to himmel's template) survives" \
+  "$AFTER42_BYTES" "$EDITED42_BYTES"
+
+echo "==== RED43 (HIMMEL-3334 I2, console ruling on judge J1269C): a no-ledger legacy config byte-identical to himmel's own template is removed ===="
+# Scenario (JJ2): the mirror of RED42 -- no ledger at all, but the legacy
+# file is exactly himmel's own shipped template (same source RED42 must be
+# told apart from). This must still be removed; only an edited/non-template
+# file is protected.
+new_case red43
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+mkdir -p "$HOME/.claude/plugins/claude-hud"
+# shellcheck disable=SC2031  # HOME is new_case's top-level export, not a subshell leak
+HUD_LEGACY43="$HOME/.claude/plugins/claude-hud/config.json"
+TEMPLATE43=$(cat "$repo_root/marketplace/plugins/claude-hud/config/himmel-config.json")
+TEMPLATE43="${TEMPLATE43//<himmel-path>/$repo_root}"
+printf '%s\n' "$TEMPLATE43" > "$HUD_LEGACY43"
+PRISTINE43_BYTES=$(cat "$HUD_LEGACY43")
+run_uninstall --dry-run --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks >/dev/null; rc43dry=$?
+check "RED43 dry-run: exits 0" "$rc43dry" "0"
+AFTER43DRY_BYTES=$(cat "$HUD_LEGACY43")
+check "RED43 dry-run: left the pristine template untouched (preview only)" "$AFTER43DRY_BYTES" "$PRISTINE43_BYTES"
+run_uninstall --yes --keep-telegram-state --skip-tasks --skip-plugins --skip-hooks >/dev/null; rc43=$?
+check "RED43 wet run: exits 0" "$rc43" "0"
+AFTER43_BYTES=$([ -f "$HUD_LEGACY43" ] && cat "$HUD_LEGACY43" || echo "ABSENT")
+check "RED43 uninstall: no-ledger legacy config byte-identical to himmel's own template is removed" \
+  "$AFTER43_BYTES" "ABSENT"
 
 echo "==== REAL-LEDGER TRIPWIRE ===="
 REAL_LEDGER_AFTER=$(real_ledger_state)

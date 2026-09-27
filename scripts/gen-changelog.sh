@@ -114,7 +114,7 @@ generate() {
             [ -n "$vt" ] || continue
             # Reachable-commit-count ordering is only valid for tags that are
             # ancestors of HEAD — a tag on a side branch has no topological
-            # relationship to HEAD's history, so its count is meaningless and
+            # relationship to HEAD history, so its count is meaningless and
             # sorting by it corrupts every release range (HIMMEL-2363: a
             # side-branch tag with a higher count than the real latest
             # release outranks it, and commits already released reappear
@@ -146,8 +146,8 @@ generate() {
             # rank=0 (has one) under the `nr` (numeric reverse) sort below.
             # KEEP IN SYNC with scripts/gen-changelog.ps1 $rank.
             case "$vt" in
-                *-*) rank=0 ;;
-                *)   rank=1 ;;
+                (*-*) rank=0 ;;
+                (*)   rank=1 ;;
             esac
             printf '%s\t%s\t%s\n' "$(git rev-list --count "$vt")" "$rank" "$vt"
         done < <(git tag --list "$VERSION_TAG_GLOB" | grep -E "$VERSION_TAG_RE") \

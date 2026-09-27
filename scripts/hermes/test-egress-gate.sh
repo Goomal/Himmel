@@ -18,6 +18,11 @@ FAILED=0
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/egress-gate-test.XXXXXX")" || { echo "FAIL mktemp"; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
+# egress-gate.sh resolves every path with cd -P/pwd -P before logging it (no
+# GNU realpath on stock macOS); resolve TMP the same way so expected values
+# built from it match what the gate actually writes when /tmp is a symlink
+# (macOS: /tmp -> /private/tmp).
+TMP="$(cd -P "$TMP" && pwd -P)" || { echo "FAIL resolve TMP"; exit 1; }
 
 check() { # label expected actual
     if [ "$2" = "$3" ]; then echo "PASS $1"
@@ -302,7 +307,11 @@ printf 'GATED-CORPUS\n' > "$SWAPFILE"; : > "$HIMMEL_HERMES_EGRESS_LEDGER"
 SNAPDIR="$(TMPDIR="$GTMP" bash "$GATE" --prompt-file "$SWAPFILE" --provider openai-codex --snapshot 2>/dev/null)"; rc=$?
 SNAP="$SNAPDIR/prompt"
 check "gate --snapshot: permitted dispatch rc 0" 0 "$rc"
-check "gate --snapshot: prints a fresh directory under TMPDIR" "yes" "$(case "$SNAPDIR" in "$GTMP"/hermes-snapshot.*) echo yes ;; *) echo "no:$SNAPDIR" ;; esac)"
+snapdir_check="no:$SNAPDIR"
+case "$SNAPDIR" in
+    ("$GTMP"/hermes-snapshot.*) snapdir_check=yes ;;
+esac
+check "gate --snapshot: prints a fresh directory under TMPDIR" "yes" "$snapdir_check"
 check "gate --snapshot: the directory is 0700 and the file 0600" "dir700 file600" "$(find "$SNAPDIR" -prune -type d -perm 700 | grep -q . && echo dir700 || echo dir-other) $(find "$SNAP" -prune -type f -perm 600 | grep -q . && echo file600 || echo file-other)"
 check "gate --snapshot: the snapshot holds the gated bytes" "GATED-CORPUS" "$(tr -d '\n' < "$SNAP" 2>/dev/null)"
 WANT_SHA="$(node -e 'process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync(process.argv[1])).digest("hex"))' "$SNAP")"

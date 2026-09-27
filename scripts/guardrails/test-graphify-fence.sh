@@ -2498,6 +2498,228 @@ run_fence deny no "$HIMMEL" "find -exec env -S\"graphify ...\" glued token -> de
 run_fence deny no "$HIMMEL" "quiet-run.sh unparsable label, tail env -S\"graphify ...\" glued token -> deny (round-7 sweep)" \
     "bash scripts/quiet-run.sh \"a -- b\" -- env -S\"graphify update notes/patient.md --backend glm\""
 
+echo "== HIMMEL-3683: a clause separator INSIDE a command substitution must not =="
+echo "== split the substitution across two false top-level clauses =="
+
+
+# Controls: clause-splitting for every OTHER shape must stay exactly as before.
+# (X9) no substitution at all -> unaffected.
+run_fence allow no "$HIMMEL" "no substitution, himmel-code x glm -> allow (X9 control)" \
+    "graphify update $HIMMEL/scripts/thing.sh --backend glm"
+# (X10) a substitution with NO separator inside -> judged exactly as at base
+# (still denied, but via the pre-existing unresolved-chdir reason, not the
+# new hidden-separator one).
+# shellcheck disable=SC2086 # CLEAN_ENV is an intentional word-split flag list
+out=$( cd "$HIMMEL" && env $CLEAN_ENV "$BASH_BIN" "$FENCE" "env -C \$(pwd) graphify update notes/patient.md --backend glm" 2>&1 ); rc=$?
+hit=$(printf '%s' "$out" | grep -F 'clause separator')
+if [ "$rc" -eq 2 ] && [ -z "$hit" ]; then
+    pass "env -C \$(pwd) (no separator inside) -> deny via pre-existing chdir reason, unchanged (X10 control)"
+else
+    fail "env -C \$(pwd) (no separator inside) unchanged (X10 control) (rc=$rc) out=$out"
+fi
+# (X11) a REAL top-level separator (not inside any substitution) -> unaffected.
+run_fence allow no "$HIMMEL" "echo a; graphify update . (real top-level ;, not inside \$(...)) -> allow (X11 control)" \
+    "echo a; graphify update . --backend glm"
+
+
+# (X15) the symmetric false-positive control: a clause-separator CHARACTER
+# quoted inside \$(...) is data to bash, not a real separator, and must not
+# itself trip the new hidden-separator deny.
+# round-5 codex-1: checking only that the diagnostic text is absent lets any
+# OTHER failure (a crash, an unrelated deny) pass silently too - assert rc
+# along with the text, the way X17's control already does.
+# shellcheck disable=SC2086 # CLEAN_ENV is an intentional word-split flag list
+out=$( cd "$HIMMEL" && env $CLEAN_ENV "$BASH_BIN" "$FENCE" "env -C \$(echo ';')/salus graphify update notes/patient.md --backend glm" 2>&1 ); rc=$?
+hit=$(printf '%s' "$out" | grep -F 'clause separator')
+if [ "$rc" -eq 0 ] && [ -z "$hit" ]; then
+    pass "quoted ';' inside \$(...) does not trigger hidden-separator deny (X15 control)"
+else
+    fail "quoted ';' inside \$(...) wrongly triggered hidden-separator deny (X15 control) (rc=$rc) out=$out"
+fi
+
+
+
+# (X17) the symmetric control: a dq-wrapped \$(...) with NO separator inside
+# must be judged exactly as X10 - still denied, but via the pre-existing
+# unresolved-chdir reason, not the new hidden-separator one.
+# shellcheck disable=SC2086 # CLEAN_ENV is an intentional word-split flag list
+out=$( cd "$HIMMEL" && env $CLEAN_ENV "$BASH_BIN" "$FENCE" "env -C \"\$(pwd)\" graphify update notes/patient.md --backend glm" 2>&1 ); rc=$?
+hit=$(printf '%s' "$out" | grep -F 'clause separator')
+if [ "$rc" -eq 2 ] && [ -z "$hit" ]; then
+    pass "env -C \"\$(pwd)\" (dq-wrapped, no separator inside) -> deny via pre-existing chdir reason, unchanged (X17 control)"
+else
+    fail "env -C \"\$(pwd)\" (dq-wrapped, no separator inside) unchanged (X17 control) (rc=$rc) out=$out"
+fi
+
+
+# (X19) J1323A F1: the hidden-separator scan must be linear, not quadratic -
+# a large routed command has to decide well under the hook's 15s timeout, or
+# a timed-out PreToolUse hook fails OPEN and a main-DENY becomes an ALLOW.
+# codex-1 (PR #1323 round 15): kept at a fixed 65536 bytes this payload now
+# hits HIMMEL-3683/J1323C F1's own size cap (32768 bytes) before the scan
+# this row means to exercise ever runs, so a pass here stopped being evidence
+# the SCAN is linear - only that the (separately-tested, X27/X28) cap denies
+# quickly. Sized under the cap so the scan path is what actually executes,
+# and the deny is asserted to come from THIS scan (not the cap).
+big=$(head -c 20000 /dev/zero | tr '\0' 'a')
+X19_CMD="env -C $SALUS graphify update notes/patient.md --backend glm # $big"
+start_ns=$(date +%s%N)
+# shellcheck disable=SC2086 # CLEAN_ENV is an intentional word-split flag list
+out=$( cd "$HIMMEL" && env $CLEAN_ENV "$BASH_BIN" "$FENCE" "$X19_CMD" 2>&1 ); rc=$?
+end_ns=$(date +%s%N)
+elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+# codex-2 (PR #1323 round 3): a fast result alone is not evidence the scan
+# ran correctly - a crash or an erroneous allow both return quickly too.
+# Assert the expected deny (rc=2) alongside the timing, and (codex-1 round
+# 15) that it was NOT the size cap that fired, or this would again test the
+# cap instead of the scan.
+if [ "$elapsed_ms" -lt 5000 ] && [ "$rc" -eq 2 ] && ! grepq "$out" "fence cap"; then
+    pass "under-cap large routed command denies via the scan (not the size cap) in ${elapsed_ms}ms, well under the 15s hook timeout (X19)"
+else
+    fail "under-cap large routed command rc=$rc in ${elapsed_ms}ms, cap-fired=$(grepq "$out" "fence cap" && echo yes || echo no) (want rc=2, <5000ms, scan-path deny) (X19) out=$out"
+fi
+
+# (X20/X21) J1323A F2: the hidden-separator deny must be scoped to a
+# substitution that is itself a chdir argument, not fire on ANY substitution
+# containing a separator just because "graphify" appears somewhere in the
+# command - the everyday `git commit`/`gh pr create` heredoc-body form must
+# still ALLOW when its body text merely mentions graphify as data.
+X20_CMD=$'git commit -m "$(cat <<\'EOF\'\ngraphify fence now denies a thing\nEOF\n)"'
+run_fence allow no "$HIMMEL" "git commit heredoc body mentioning graphify as data -> allow (X20)" \
+    "$X20_CMD"
+X21_CMD=$'gh pr create --title t --body "$(cat <<\'EOF\'\ngraphify query forms still allowed\nEOF\n)"'
+run_fence allow no "$HIMMEL" "gh pr create heredoc body mentioning graphify as data -> allow (X21)" \
+    "$X21_CMD"
+
+
+# (X23) J1323B F1: X19 only padded the command at nesting depth 0, so it
+# never exercised the stack's push/pop/top-of-stack cost - the actual
+# quadratic (a string stack popped/pushed with `${stack%q}`/`${stack}q`,
+# O(depth) per character) hid entirely inside a deeply nested substitution
+# such as `x=$(cat <<'EOF' <N x '('> EOF)`, where X19's flat padding never
+# goes. Pad AT depth instead: N '(' characters nested inside one $(...) via
+# a heredoc body (each '(' is data to the heredoc, but pushes the fence's
+# stack all the same). J1323C F1's 32768-byte size cap (checked before any
+# scan runs) now denies both of this test's original sizes on byte count
+# alone, so they no longer reach the stack scan at all - shrink under the
+# cap (codex-3683-panel-3) so the timing check still exercises the O(depth)
+# stack fix itself, not the unrelated size cap.
+for X23_N in 8192 30000; do
+    X23_PARENS=$(head -c "$X23_N" /dev/zero | tr '\0' '(')
+    # shellcheck disable=SC2016 # single-quoted printf format string: the
+    # literal $(...) text is the payload under test, not a real expansion
+    X23_CMD=$(printf 'env -C %s graphify update notes/patient.md --backend glm; x=$(cat <<%s\n%s\nEOF\n)' \
+        "$SALUS" "'EOF'" "$X23_PARENS")
+    start_ns=$(date +%s%N)
+    # shellcheck disable=SC2086 # CLEAN_ENV is an intentional word-split flag list
+    out=$( cd "$HIMMEL" && env $CLEAN_ENV "$BASH_BIN" "$FENCE" "$X23_CMD" 2>&1 ); rc=$?
+    end_ns=$(date +%s%N)
+    elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+    if [ "$elapsed_ms" -lt 5000 ] && [ "$rc" -eq 2 ]; then
+        pass "${X23_N}B nested-at-depth command denies in ${elapsed_ms}ms, well under the 15s hook timeout (X23 N=$X23_N)"
+    else
+        fail "${X23_N}B nested-at-depth command rc=$rc in ${elapsed_ms}ms (want rc=2, <5000ms) (X23 N=$X23_N)"
+    fi
+done
+
+
+# (X25) codex-2 (PR #1323 round 4): a trailing unquoted \$ as the LAST
+# character of the routed command (no substitution actually opens) read one
+# array index past the end under this file's `set -u`, aborting the scan;
+# the fail-closed EXIT trap turned that abort into a DENY regardless of
+# whether the command has anything to do with graphify or chdir at all - a
+# false-positive-deny availability bug, not a bypass. A benign command with
+# no graphify token and a bare trailing \$ must ALLOW.
+run_fence allow no "$HIMMEL" "trailing bare \$ (no substitution, no graphify) -> allow, does not abort (X25)" \
+    'echo hello $'
+
+
+# (X27) J1323C F1: a per-span lookback rebuild-plus-word-split cost, stacked
+# in front of an unrelated quadratic elsewhere in this file, crosses the
+# hook's 15s timeout on a large-enough routed command (a flood of `''` pairs
+# combined with a deeply nested heredoc) - and a timed-out --optional hook
+# fails OPEN. The fence's fail-closed size cap must reject an oversized
+# command outright, before any scan runs, well inside the 15s budget.
+# Sized well over the 32768-byte cap but under Linux's MAX_ARG_STRLEN
+# (131072 bytes, the hard per-argv-element ceiling) so this shape can
+# actually be passed to bash as a single argument at all.
+X27_PAIRS=40000
+X27_FLOOD=$(head -c "$((X27_PAIRS * 2))" /dev/zero | tr '\0' "'")
+X27_PARENS=$(head -c 20000 /dev/zero | tr '\0' '(')
+# shellcheck disable=SC2016 # single-quoted printf format string: the
+# literal $(...) text is the payload under test, not a real expansion
+X27_CMD=$(printf 'echo %s\ncat > notes.txt <<%s\n$%s\nEOF\nenv -C %s graphify update notes/patient.md --backend glm' \
+    "$X27_FLOOD" "'EOF'" "$X27_PARENS" "$SALUS")
+start_ns=$(date +%s%N)
+# shellcheck disable=SC2086 # CLEAN_ENV is an intentional word-split flag list
+out=$( cd "$HIMMEL" && env $CLEAN_ENV "$BASH_BIN" "$FENCE" "$X27_CMD" 2>&1 ); rc=$?
+end_ns=$(date +%s%N)
+elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+if [ "$elapsed_ms" -lt 5000 ] && [ "$rc" -eq 2 ] && grepq "$out" "fence cap"; then
+    pass "combo2-shaped flood+nested-heredoc denies via the size cap (not some other predicate) in ${elapsed_ms}ms, well under the 15s hook timeout (X27)"
+else
+    fail "combo2-shaped flood+nested-heredoc rc=$rc in ${elapsed_ms}ms, cap-diagnostic present=$(grepq "$out" "fence cap" && echo yes || echo no) (want rc=2, <5000ms, size-cap denial) (X27)"
+fi
+
+# (X28) NEGATIVE control for X27: an ordinary graphify command safely under
+# the size cap must still ALLOW (or DENY on its own merits, never on size
+# alone) - the cap must not be so tight it false-denies real usage.
+run_fence allow no "$HIMMEL" "ordinary graphify command well under the size cap -> allow (X28)" \
+    "graphify update notes/patient.md --backend glm"
+
+
+# (X34) codex-2 (critic panel round 4): the lb_prev fallback that resolves a
+# bare --chdir word (added for J1323C F2, e.g. `-C ../$(...)` where "../"
+# glues onto the substitution as one shell word) trusted -C/--chdir as the
+# PRECEDING word without checking whether the word actually touching the
+# substitution is glued to it. `-C foo $(...)` has "foo" as its own complete
+# word (whitespace before the substitution) - the substitution is an
+# unrelated argument, not part of `-C foo`'s value - so this must ALLOW.
+run_fence allow no "$HIMMEL" "-C flag with an unrelated word before an unrelated substitution -> allow (X34)" \
+    "echo -C foo \$(echo a; echo b) graphify"
+
+# (F2) J1323D F2: the cut hidden-clause-separator scan (removed HIMMEL-3683
+# PR #1323, formerly scripts/guardrails/graphify-fence.sh:2278-2510) had an
+# over-broad -C/-D/--chdir prefix match that false-denied a chdir flag
+# followed by an UNRELATED substitution merely containing a separator -
+# common real shapes like `git -C $(...) status` and `make -C $(...) test`
+# must ALLOW now that the scan is gone.
+# shellcheck disable=SC2016 # single-quoted: the literal $(...) text is the
+# payload under test, not a real expansion
+run_fence allow no "$HIMMEL" "git -C \$(cd .. && pwd) status; graphify query x -> allow (F2A)" \
+    'git -C "$(cd .. && pwd)" status; graphify query x'
+# shellcheck disable=SC2016 # single-quoted: the literal $(...) text is the
+# payload under test, not a real expansion
+run_fence allow no "$HIMMEL" "make -C \$(git rev-parse --show-toplevel; true) test && graphify query x -> allow (F2B)" \
+    'make -C $(git rev-parse --show-toplevel; true) test && graphify query x'
+
+# (F1) J1323D F1: the cut scan itself is what pushed hook execution past the
+# 15s PreToolUse timeout on a sub-32KB-cap flood input (a timed-out
+# --optional hook fails OPEN). This asserts the shape still denies
+# functionally - not a timing SLA: main's own unrelated quoting/clause-
+# splitting cost on this ;'' padding shape is itself close to the hook's 15s
+# budget at this size, independent of this PR's change. A bounded (not
+# merely faster) redesign is tracked in HIMMEL-3771, not fixed by this PR.
+# codex-2 (PR #1323 round 15): rc=2 alone does not prove THIS deny reason
+# fired (a cap or a crash also returns rc=2) - and this row's own chdir arg
+# (SALUS) resolves cleanly, so the actual reason is the ordinary corpus x
+# backend policy deny (egress matrix), not chdir at all. Assert that text.
+F1_N=8000
+F1_UNIT=";''"
+F1_REPS=$(( F1_N / ${#F1_UNIT} + 1 ))
+F1_PAD=$(for _ in $(seq 1 "$F1_REPS"); do printf '%s' "$F1_UNIT"; done | head -c "$F1_N")
+F1_CMD=$(printf 'cat > notes.txt <<%s\n%s\nEOF\nenv -C %s graphify update notes/patient.md --backend glm' \
+    "'EOF'" "$F1_PAD" "$SALUS")
+start_s=$SECONDS
+# shellcheck disable=SC2086 # CLEAN_ENV is an intentional word-split flag list
+out=$( cd "$HIMMEL" && env $CLEAN_ENV "$BASH_BIN" "$FENCE" "$F1_CMD" 2>&1 ); rc=$?
+elapsed_s=$(( SECONDS - start_s ))
+if [ "$rc" -eq 2 ] && grepq "$out" "egress matrix"; then
+    pass "${F1_N}B ;'' padding + real chdir still denies via egress-matrix policy (rc=$rc) in ${elapsed_s}s - functional, no timing SLA, residual risk tracked in HIMMEL-3771 (F1)"
+else
+    fail "${F1_N}B ;'' padding + real chdir rc=$rc in ${elapsed_s}s, egress-matrix-deny=$(grepq "$out" "egress matrix" && echo yes || echo no) (want rc=2, egress-matrix deny) (F1) out=$out"
+fi
+
 if [ "$failures" -eq 0 ]; then
     echo "OK: all cases passed"
     exit 0

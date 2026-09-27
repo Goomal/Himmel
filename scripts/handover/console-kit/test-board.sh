@@ -28,6 +28,9 @@ contains() {
 lacks() {
     case "$2" in *"$3"*) fail "$1 (found '$3')" ;; *) pass "$1" ;; esac
 }
+same() {
+    if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (got '$2', want '$3')"; fi
+}
 
 B="$W/bucket"
 mkdir -p "$B" "$W/bin" "$W/repo"
@@ -58,6 +61,14 @@ case "$*" in
 esac
 STUB
 chmod +x "$W/bin/gh"
+
+# Sessions stub (Ask 3, HIMMEL-3745): sourced, then claude_sessions() is called, same as
+# board.mjs invokes the real claude-sessions.sh. Empty by default -- no window is ever
+# "still open" unless a test explicitly points BOARD_SESSIONS elsewhere. Never the real
+# process census.
+cat > "$W/bin/sessions-empty.sh" <<'STUB'
+claude_sessions() { :; }
+STUB
 
 cat > "$W/open.json" <<'JSON'
 [
@@ -166,6 +177,7 @@ printf '%s\n' '# console' '' '## Live state' '' \
 
 run() {  # run <extra args...> -- prints board.mjs stdout; rc in $rc
     PATH="$W/bin:$PATH" BOARD_TICK="$W/bin/tick-stub" TICK_ARGV_LOG="$W/argv.log" \
+        BOARD_SESSIONS="${BOARD_SESSIONS:-$W/bin/sessions-empty.sh}" \
         GH_OPEN="$W/open.json" GH_MERGED="$W/merged.json" GH_EPIC="$W/epic.json" GH_VIEW="$W/view" \
         node "$SUT" --doc "$DOC" --repo "$W/repo" "$@" 2>"$W/stderr.log"
 }
@@ -293,6 +305,61 @@ contains 'a short label lookup warns with the shortfall' "$shorterr" 'returned 1
 contains 'a short label lookup renders the unavailable banner' "$shorthtml" 'data-banner="labels-unavailable"'
 contains 'a short label lookup keeps the legs it did label' "$shorthtml" 'data-label="N1"'
 lacks 'a short label lookup does not claim no legs' "$shorthtml" 'no legs'
+
+# --- HIMMEL-3745 (Ask 3): a WRAPPED leg whose claude window is still alive is its
+# own needs-the-console state, derived from an independent process census -- never
+# from tick.sh's procs= (which only counts HELD legs). N5 is the fixture's one
+# WRAPPED leg (doc stem HIMMEL-3300-N5-eps-2026-09-21); leg_identity() derives its
+# undated session name HIMMEL-3300-N5-eps.
+cat > "$W/bin/sessions-n5-alive.sh" <<'STUB'
+claude_sessions() { printf '999\tHIMMEL-3300-N5-eps\tsonnet\ton\n'; }
+STUB
+out="$(BOARD_SESSIONS="$W/bin/sessions-n5-alive.sh" run --out "$W/n5-alive-board.html")"; rc=$?
+n5html="$(cat "$W/n5-alive-board.html" 2>/dev/null)"
+contains 'a WRAPPED leg with a live census match reads WRAPPED, window still open' "$n5html" 'data-label="N5" data-phase="WRAPPED, window still open"'
+contains 'it is listed as needing the console' "$n5html" 'data-need="N5"'
+contains 'the need row explains why' "$n5html" 'WRAPPED, window still open — close the leg window'
+
+# No census match (the default empty stub the suite already uses throughout):
+# N5 stays plain WRAPPED, as pinned above at line 212. (The ladder itself always
+# lists the 'WRAPPED, window still open' phase, at count 0 here -- check the leg's
+# own data-phase, not a bare substring of the whole page.)
+lacks 'a WRAPPED leg with no census match is never flagged as still open' "$html" 'data-label="N5" data-phase="WRAPPED, window still open"'
+
+# Census unavailable (the sourced helper itself fails): never read as "nothing is
+# running" -- falls back to plain WRAPPED, same as no match.
+cat > "$W/bin/sessions-fail.sh" <<'STUB'
+claude_sessions() { return 1; }
+STUB
+out="$(BOARD_SESSIONS="$W/bin/sessions-fail.sh" run --out "$W/n5-census-fail-board.html")"; rc=$?
+n5failhtml="$(cat "$W/n5-census-fail-board.html" 2>/dev/null)"
+contains 'an unavailable census still renders the board (rc 0)' "rc=$rc" 'rc=0'
+contains 'and leaves the WRAPPED leg as plain WRAPPED' "$n5failhtml" 'data-label="N5" data-phase="WRAPPED"'
+lacks 'never flags "still open" on a census it could not read' "$n5failhtml" 'data-label="N5" data-phase="WRAPPED, window still open"'
+
+# --- HIMMEL-3745 (Ask 1): --changed re-renders and reports whether the render moved,
+# so a console can call ONE kit command after every Live-state mutation; the Artifact
+# publish stays a separate model step.
+rm -f "$W/changed-board.html"
+out1="$(run --out "$W/changed-board.html" --changed)"; rc1=$?
+same '--changed on the first render (nothing to compare against) reports CHANGED' "$out1" "CHANGED $W/changed-board.html"
+contains '--changed rc is still 0' "rc=$rc1" 'rc=0'
+out2="$(run --out "$W/changed-board.html" --changed)"
+same '--changed on an identical re-render reports UNCHANGED' "$out2" "UNCHANGED $W/changed-board.html"
+out3="$(TICK_STUB_FAIL=1 run --out "$W/changed-board.html" --changed)"
+same '--changed after tick goes unavailable (fp now empty, prior fp was real) reports CHANGED' "$out3" "CHANGED $W/changed-board.html"
+
+# --- HIMMEL-3745 (Ask 3 x Ask 1): the WRAPPED-window census is read independently
+# of tick's --emit-fp, so a window opening on an otherwise-unchanged tick
+# fingerprint must still flip --changed to CHANGED.
+rm -f "$W/changed-census-board.html"
+out4="$(run --out "$W/changed-census-board.html" --changed)"; rc4=$?
+same 'census --changed: first render reports CHANGED' "$out4" "CHANGED $W/changed-census-board.html"
+contains 'census --changed: rc is still 0' "rc=$rc4" 'rc=0'
+out5="$(BOARD_SESSIONS="$W/bin/sessions-n5-alive.sh" run --out "$W/changed-census-board.html" --changed)"
+same 'a WRAPPED leg gaining a live window flips CHANGED although tick-fp is unchanged' "$out5" "CHANGED $W/changed-census-board.html"
+out6="$(BOARD_SESSIONS="$W/bin/sessions-n5-alive.sh" run --out "$W/changed-census-board.html" --changed)"
+same 'the same still-open leg on a re-render reports UNCHANGED' "$out6" "UNCHANGED $W/changed-census-board.html"
 
 # --- usage
 PATH="$W/bin:$PATH" node "$SUT" >/dev/null 2>&1; rc=$?

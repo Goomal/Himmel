@@ -3904,5 +3904,186 @@ t52_tmp_left=0; for f in "$W"/.graph-structural-fields.*; do [ -e "$f" ] && t52_
 [ "$t52_tmp_left" -eq 0 ] && pass "T52 leak: no scan temp left in the workdir" || fail "T52 leak: scan temp left in the workdir"
 [ -d "$W/graphify-out" ] && pass "T52 leak: workdir kept" || fail "T52 leak: workdir removed"
 
+# --- T53 (HIMMEL-3718): --out-root / GRAPHIFY_OUT_ROOT lets the promote land
+# OUTSIDE the corpus (luna's graphify-out/ sat inside the vault; Obsidian
+# watches every vault file and hung on the nightly refresh churn). This is a
+# SEPARATE knob from GRAPHIFY_OUT (T46/T47 above): that one names the
+# scratch-relative extraction leaf; OUT_ROOT only redirects where the finished
+# promote lands, after extraction already happened in the scratch copy. ---
+T53CORPUS="$WS/t53-corpus"; T53MAPS="$WS/t53-maps"; mkdir -p "$T53CORPUS" "$T53MAPS"
+printf '# note\nt53 fixture\n' > "$T53CORPUS/note.md"
+
+# T53a: an absolute --out-root is honoured -- the graph is promoted under
+# <out-root>/graphify-out, and the corpus itself never gets a graphify-out/.
+T53ROOT="$WS/t53-out-root"
+out=$( GRAPHIFY_MAP_BIN="$GOBIN/graphify" bash "$SCRIPT" \
+  --name t53a --corpus-root "$T53CORPUS" --backend claude-cli \
+  --maps-dir "$T53MAPS" --title T53a --slug t53a-map --out-root "$T53ROOT" 2>&1 ); rc=$?
+if [ "$rc" -eq 0 ] && [ -f "$T53ROOT/graphify-out/graph.json" ] && [ ! -e "$T53CORPUS/graphify-out" ]; then
+  pass "T53a --out-root promotes under <out-root>/graphify-out and never creates the in-corpus default"
+else
+  fail "T53a --out-root promote (rc=$rc) at=$( [ -f "$T53ROOT/graphify-out/graph.json" ] && echo yes || echo no ) in-corpus=$( [ -e "$T53CORPUS/graphify-out" ] && echo yes || echo no ): $out"
+fi
+
+# T53a2: GRAPHIFY_OUT_ROOT env var is the fallback for --out-root (cron
+# cadence callers invoke by fixed argv and vary behaviour by env).
+T53CORPUS2="$WS/t53-corpus-env"; mkdir -p "$T53CORPUS2"
+printf '# note\nt53 env fixture\n' > "$T53CORPUS2/note.md"
+T53ROOT2="$WS/t53-out-root-env"
+out=$( GRAPHIFY_OUT_ROOT="$T53ROOT2" GRAPHIFY_MAP_BIN="$GOBIN/graphify" bash "$SCRIPT" \
+  --name t53a2 --corpus-root "$T53CORPUS2" --backend claude-cli \
+  --maps-dir "$T53MAPS" --title T53a2 --slug t53a2-map 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && [ -f "$T53ROOT2/graphify-out/graph.json" ] \
+  && pass "T53a2 GRAPHIFY_OUT_ROOT env var is honoured the same as --out-root" \
+  || fail "T53a2 GRAPHIFY_OUT_ROOT env (rc=$rc): $out"
+
+# T53b: a RELATIVE --out-root is refused -- resolving it against an unknown cwd
+# is exactly the ambiguity this flag exists to avoid.
+out=$( GRAPHIFY_MAP_BIN="$GOBIN/graphify" bash "$SCRIPT" \
+  --name t53b --corpus-root "$T53CORPUS" --backend claude-cli \
+  --maps-dir "$T53MAPS" --title T53b --slug t53b-map --out-root "relative/path" 2>&1 ); rc=$?
+[ "$rc" -eq 2 ] && grep -q "must be an absolute path" <<< "$out" \
+  && pass "T53b a relative --out-root is refused rc=2" \
+  || fail "T53b relative --out-root should be refused rc=2 (rc=$rc): $out"
+
+# T53c: --out-root=/ is refused -- the promote step deletes cache/ and
+# manifest.json under OUT_DIR, so rooting it at / is catastrophic.
+out=$( GRAPHIFY_MAP_BIN="$GOBIN/graphify" bash "$SCRIPT" \
+  --name t53c --corpus-root "$T53CORPUS" --backend claude-cli \
+  --maps-dir "$T53MAPS" --title T53c --slug t53c-map --out-root "/" 2>&1 ); rc=$?
+[ "$rc" -eq 2 ] && grep -q "REFUSING --out-root=/" <<< "$out" \
+  && pass "T53c --out-root=/ is refused rc=2" \
+  || fail "T53c --out-root=/ should be refused rc=2 (rc=$rc): $out"
+
+# T53d: --out-root=$HOME is refused -- point it at a dedicated subdirectory.
+T53HOME="$WS/t53-home"; mkdir -p "$T53HOME"
+out=$( HOME="$T53HOME" GRAPHIFY_MAP_BIN="$GOBIN/graphify" bash "$SCRIPT" \
+  --name t53d --corpus-root "$T53CORPUS" --backend claude-cli \
+  --maps-dir "$T53MAPS" --title T53d --slug t53d-map --out-root "$T53HOME" 2>&1 ); rc=$?
+[ "$rc" -eq 2 ] && grep -q 'REFUSING --out-root=\$HOME' <<< "$out" \
+  && pass "T53d --out-root=\$HOME is refused rc=2" \
+  || fail "T53d --out-root=\$HOME should be refused rc=2 (rc=$rc): $out"
+
+# T53e: --out-root equal to the corpus root itself is refused -- that is just
+# the in-corpus default spelled out; omit the flag instead.
+out=$( GRAPHIFY_MAP_BIN="$GOBIN/graphify" bash "$SCRIPT" \
+  --name t53e --corpus-root "$T53CORPUS" --backend claude-cli \
+  --maps-dir "$T53MAPS" --title T53e --slug t53e-map --out-root "$T53CORPUS" 2>&1 ); rc=$?
+[ "$rc" -eq 2 ] && grep -q "REFUSING --out-root=<corpus root>" <<< "$out" \
+  && pass "T53e --out-root=<corpus root> is refused rc=2" \
+  || fail "T53e --out-root=<corpus root> should be refused rc=2 (rc=$rc): $out"
+
+# T53e2 (HIMMEL-3718 CR round 3, codex-3): an --out-root that is a SUBDIRECTORY
+# of the corpus root (not equal to it) still churns inside the watched corpus
+# and must be refused too.
+T53SUB="$T53CORPUS/dedicated-out"; mkdir -p "$T53SUB"
+out=$( GRAPHIFY_MAP_BIN="$GOBIN/graphify" bash "$SCRIPT" \
+  --name t53e2 --corpus-root "$T53CORPUS" --backend claude-cli \
+  --maps-dir "$T53MAPS" --title T53e2 --slug t53e2-map --out-root "$T53SUB" 2>&1 ); rc=$?
+[ "$rc" -eq 2 ] && grep -q "REFUSING --out-root inside the corpus" <<< "$out" \
+  && pass "T53e2 --out-root=<subdir of corpus> is refused rc=2" \
+  || fail "T53e2 --out-root=<subdir of corpus> should be refused rc=2 (rc=$rc): $out"
+
+# T53e3 (HIMMEL-3718 CR round 3, codex-2): a --out-root with a SYMLINK component
+# followed by ".." can lexically collapse to one location (what the root/home/
+# corpus-root refusals above actually check) while the OS resolves the raw
+# string -- following the real symlink target, then applying ".." from THERE --
+# to a totally different, unvalidated location. If OUT_DIR were built from the
+# raw string, the promote would land somewhere the checks above never saw.
+# Fixture: corpus at t53sym/a/b/corpus; a symlink under it points 6 levels deep
+# (t53sym/deep/x/y/z/w); "corpus/link/../../../safe-out" lexically collapses to
+# t53sym/a/safe-out (an ancestor of corpus, correctly accepted as out-of-corpus)
+# but really resolves (symlink then 3 real ".."s from its target) to
+# t53sym/deep/x/safe-out -- a different directory this test never validates.
+# The graph must land at the LEXICALLY-VALIDATED path, never the raw-resolved one.
+T53SYMROOT="$WS/t53sym"; mkdir -p "$T53SYMROOT/a/b/corpus" "$T53SYMROOT/deep/x/y/z/w"
+printf '# note\nt53e3 fixture\n' > "$T53SYMROOT/a/b/corpus/note.md"
+ln -s "$T53SYMROOT/deep/x/y/z/w" "$T53SYMROOT/a/b/corpus/link"
+T53E3VALIDATED="$T53SYMROOT/a/safe-out"
+T53E3RAWRESOLVED="$T53SYMROOT/deep/x/safe-out"
+out=$( GRAPHIFY_MAP_BIN="$GOBIN/graphify" bash "$SCRIPT" \
+  --name t53e3 --corpus-root "$T53SYMROOT/a/b/corpus" --backend claude-cli \
+  --maps-dir "$T53MAPS" --title T53e3 --slug t53e3-map \
+  --out-root "$T53SYMROOT/a/b/corpus/link/../../../safe-out" 2>&1 ); rc=$?
+if [ "$rc" -eq 0 ] && [ -f "$T53E3VALIDATED/graphify-out/graph.json" ] && [ ! -e "$T53E3RAWRESOLVED/graphify-out" ]; then
+  pass "T53e3 symlink+.. out-root promotes at the validated path, not the raw-resolved one"
+else
+  fail "T53e3 symlink+.. divergence (rc=$rc) validated=$( [ -f "$T53E3VALIDATED/graphify-out/graph.json" ] && echo yes || echo no ) raw-resolved=$( [ -e "$T53E3RAWRESOLVED/graphify-out" ] && echo yes || echo no ): $out"
+fi
+
+# T53e4 (CodeRabbit review on PR #1367): a not-yet-existing --out-root whose
+# ANCESTOR is a symlink is never canonicalized -- the "if -d" pwd -P
+# canonicalizer above only fires once the FULL OUT_ROOT_RESOLVED path exists,
+# so an ancestor symlink pointing straight into the corpus survives lexically
+# unresolved past every refusal below, then `mkdir -p "$OUT_DIR"` follows that
+# real symlink and lands the promote inside the corpus after all.
+T53E4ROOT="$WS/t53e4"; T53E4CORPUS="$T53E4ROOT/corpus"; mkdir -p "$T53E4CORPUS"
+printf '# note\n' > "$T53E4CORPUS/note.md"
+ln -s "$T53E4CORPUS" "$T53E4ROOT/link-to-corpus"
+T53E4LEAF="$T53E4ROOT/link-to-corpus/not-yet-existing-leaf"
+out=$( GRAPHIFY_MAP_BIN="$GOBIN/graphify" bash "$SCRIPT" \
+  --name t53e4 --corpus-root "$T53E4CORPUS" --backend claude-cli \
+  --maps-dir "$T53MAPS" --title T53e4 --slug t53e4-map \
+  --out-root "$T53E4LEAF" 2>&1 ); rc=$?
+if [ "$rc" -eq 2 ] && [ ! -e "$T53E4CORPUS/not-yet-existing-leaf" ]; then
+  pass "T53e4 --out-root with a not-yet-existing ancestor-symlink into the corpus is refused"
+else
+  fail "T53e4 ancestor-symlink divergence (rc=$rc) leaked=$( [ -e "$T53E4CORPUS/not-yet-existing-leaf" ] && echo yes || echo no ): $out"
+fi
+
+# T53f: an --out-root pointing at an existing non-graphify, non-empty directory
+# is refused, EVEN AT THE DEFAULT leaf name -- HIMMEL-3718 widens the T47a/T47b2
+# guard (previously scoped only to a GRAPHIFY_OUT_NAME override) to also fire
+# whenever the promote is redirected out-of-corpus, since "the conventional
+# graphify-out needs no proof" only held while OUT_DIR was guaranteed to be a
+# child of an already-trusted corpus.
+T53FROOT="$WS/t53f-out-root"; mkdir -p "$T53FROOT/graphify-out"
+printf 'unrelated content\n' > "$T53FROOT/graphify-out/keep.txt"
+T53FCALLS="$WS/t53f-calls.log"; : > "$T53FCALLS"
+out=$( GRAPHIFY_CALL_LOG="$T53FCALLS" GRAPHIFY_MAP_BIN="$GOBIN/graphify" bash "$SCRIPT" \
+  --name t53f --corpus-root "$T53CORPUS" --backend claude-cli \
+  --maps-dir "$T53MAPS" --title T53f --slug t53f-map --out-root "$T53FROOT" 2>&1 ); rc=$?
+if [ "$rc" -eq 2 ] && grep -q "REFUSING to use" <<< "$out" && [ -f "$T53FROOT/graphify-out/keep.txt" ] && [ ! -s "$T53FCALLS" ]; then
+  pass "T53f --out-root refuses a non-graphify dir at the DEFAULT leaf name, before graphify runs"
+else
+  fail "T53f --out-root non-graphify guard (rc=$rc, kept=$( [ -f "$T53FROOT/graphify-out/keep.txt" ] && echo yes || echo NO )): $out calls=$(cat "$T53FCALLS")"
+fi
+
+# T53g: an --out-root promote destination that is a SYMLINK escapes to
+# somewhere the operator never validated -- refused even at the default leaf
+# name, mirroring T47h's in-corpus symlink guard.
+if ln -s "$SYMPROBE2/target" "$SYMPROBE2/link2" 2>/dev/null && [ -L "$SYMPROBE2/link2" ]; then
+  T53GEXT="$WS/t53g-external"; mkdir -p "$T53GEXT"
+  printf 'external content\n' > "$T53GEXT/keep.txt"
+  T53GROOT="$WS/t53g-out-root"; mkdir -p "$T53GROOT"
+  ln -s "$T53GEXT" "$T53GROOT/graphify-out"
+  T53GCALLS="$WS/t53g-calls.log"; : > "$T53GCALLS"
+  out=$( GRAPHIFY_CALL_LOG="$T53GCALLS" GRAPHIFY_MAP_BIN="$GOBIN/graphify" bash "$SCRIPT" \
+    --name t53g --corpus-root "$T53CORPUS" --backend claude-cli \
+    --maps-dir "$T53MAPS" --title T53g --slug t53g-map --out-root "$T53GROOT" 2>&1 ); rc=$?
+  if [ "$rc" -eq 2 ] && [ -f "$T53GEXT/keep.txt" ] && [ ! -s "$T53GCALLS" ]; then
+    pass "T53g --out-root refuses a symlinked promote destination, external content untouched"
+  else
+    fail "T53g --out-root symlink guard (rc=$rc, external survived=$( [ -f "$T53GEXT/keep.txt" ] && echo yes || echo NO )): $out"
+  fi
+else
+  skip "T53g SKIPPED (this environment cannot create symlinks)"
+fi
+
+# T53h (HIMMEL-3718 CR round 1, codex-1): a NOT-YET-EXISTING --out-root that
+# lexically collapses (via "..") to the corpus root itself must be refused
+# exactly like T53e's direct spelling -- the "if -d" cd/pwd -P canonicalizer
+# alone never fires for a path that doesn't exist yet, so a naive resolver
+# would compare the unresolved string against the fully-resolved corpus root
+# and silently let this through, landing the promote back inside the corpus
+# once `mkdir -p`/the promote step itself collapsed the ".." the same way.
+T53HNONEXIST="$T53CORPUS/does-not-exist-t53h"
+out=$( GRAPHIFY_MAP_BIN="$GOBIN/graphify" bash "$SCRIPT" \
+  --name t53h --corpus-root "$T53CORPUS" --backend claude-cli \
+  --maps-dir "$T53MAPS" --title T53h --slug t53h-map --out-root "$T53HNONEXIST/.." 2>&1 ); rc=$?
+[ "$rc" -eq 2 ] && grep -q "REFUSING --out-root=<corpus root>" <<< "$out" \
+  && pass "T53h a not-yet-existing --out-root that collapses via .. to the corpus root is refused rc=2" \
+  || fail "T53h .. traversal into the corpus root should be refused rc=2 (rc=$rc): $out"
+
 if [ "$FAILS" -ne 0 ]; then echo "$FAILS FAILURES"; exit 1; fi
 if [ "$SKIPS" -ne 0 ]; then echo "ALL PASS ($SKIPS skipped)"; else echo "ALL PASS"; fi

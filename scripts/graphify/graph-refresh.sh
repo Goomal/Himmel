@@ -69,6 +69,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HIMMEL_ROOT="$(cd "$HERE/../.." && pwd)"
 REFRESH_SCRIPT="${GRAPH_REFRESH_RUNNER:-$HIMMEL_ROOT/scripts/graphify/refresh-graph-map.sh}"
 CADENCE_SCRIPT="${GRAPH_REFRESH_CADENCE_SCRIPT:-$HIMMEL_ROOT/scripts/luna/graphmap-cadence.sh}"
+# HIMMEL-3718: ONE resolver for the out-of-corpus promote destination — see
+# graph-out-root.sh for why (Obsidian hangs on the vault-internal graphify-out/
+# churn). Empty for himmel (its graphify-out/ stays tracked + in-corpus).
+# shellcheck source=./graph-out-root.sh
+# shellcheck disable=SC1091
+. "$HIMMEL_ROOT/scripts/graphify/graph-out-root.sh"
 # PHI/denylist config dir (mirrors graphify-fence.sh): the vault preflight below
 # reads phi-roots / egress-denylist list files under here. CLAUDE_GLM_CONFIG_DIR
 # is the test seam (point it at a temp tree); default matches the fence.
@@ -646,6 +652,8 @@ if [ "$DRY_RUN" -eq 1 ]; then
         if [ -n "$PREFLIGHT_MAPS_ID" ]; then RUNNER_ARGV+=(--maps-id "$PREFLIGHT_MAPS_ID"); fi
         if [ -n "$PREFLIGHT_VAULT_ID" ]; then RUNNER_ARGV+=(--maps-parent-id "$PREFLIGHT_VAULT_ID"); fi
         if [ "$c" = "luna" ]; then RUNNER_ARGV+=(--corpus-class luna-personal); fi
+        R_OUT_ROOT="$(graphify_out_root_for "$c")"
+        if [ -n "$R_OUT_ROOT" ]; then RUNNER_ARGV+=(--out-root "$R_OUT_ROOT"); fi
         printf 'DRY graph-refresh: [%s] ' "$c"
         print_argv "${RUNNER_ARGV[@]}"
         printf '\n'
@@ -676,11 +684,24 @@ for c in "${CORPORA[@]}"; do
     if [ -n "$PREFLIGHT_MAPS_ID" ]; then RUNNER_ARGV+=(--maps-id "$PREFLIGHT_MAPS_ID"); fi
     if [ -n "$PREFLIGHT_VAULT_ID" ]; then RUNNER_ARGV+=(--maps-parent-id "$PREFLIGHT_VAULT_ID"); fi
     if [ "$c" = "luna" ]; then RUNNER_ARGV+=(--corpus-class luna-personal); fi
+    R_OUT_ROOT="$(graphify_out_root_for "$c")"
+    if [ -n "$R_OUT_ROOT" ]; then RUNNER_ARGV+=(--out-root "$R_OUT_ROOT"); fi
     echo "graph-refresh: [$c] refreshing (corpus-root $R_CORPUS_ROOT -> $VAULT/60-Maps/$R_SLUG.md)" >&2
     # The `if` guards the runner call from set -e so a failed leg is REPORTED and
     # the remaining legs still run (the operator wants the per-corpus summary for
     # BOTH, not a hard stop after the first failure).
-    if "${RUNNER_ARGV[@]}"; then
+    # HIMMEL-3718 CR round 3 (codex-1): when this corpus's resolver says
+    # in-corpus (R_OUT_ROOT empty), scrub an ambient GRAPHIFY_OUT_ROOT so a
+    # value the invoking shell happens to have exported (e.g. left over from
+    # testing luna's out-root) can't silently leak into this leg's child
+    # process and redirect it too -- refresh-graph-map.sh's own env fallback
+    # would otherwise honour it.
+    if [ -z "$R_OUT_ROOT" ]; then
+        RUNNER_CMD=(env -u GRAPHIFY_OUT_ROOT "${RUNNER_ARGV[@]}")
+    else
+        RUNNER_CMD=("${RUNNER_ARGV[@]}")
+    fi
+    if "${RUNNER_CMD[@]}"; then
         echo "graph-refresh: [$c] OK -- published $VAULT/60-Maps/$R_SLUG.md"
         # Himmel's graphify-out/ is TRACKED (HIMMEL-1123); the refresh regenerates
         # it on disk but does NOT ship it. The operator must publish it separately

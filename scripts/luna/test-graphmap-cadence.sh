@@ -1695,6 +1695,24 @@ luna_args=$(cat "$STATE/tasks/HIMMEL-GraphMap-Luna" 2>/dev/null || echo MISSING)
 himmel_args=$(cat "$STATE/tasks/HIMMEL-GraphMap-Himmel" 2>/dev/null || echo MISSING)
 assert_contains "luna override (XML time)"   "T01:15:00" "$luna_args"
 assert_contains "himmel override (XML time)" "T05:00:00" "$himmel_args"
+# HIMMEL-3718 CR round 2 (codex-3): the C-outroot unit test above only proves
+# cron_payload's own arg-handling; nothing here proved the REAL arm code path
+# actually threads graphify_out_root_for luna's nonempty default through to
+# the emitted runner, while leaving himmel (which stays in-corpus) untouched.
+# The payload lands in the .bat runner emit_bat writes, not the schtasks task
+# file read above (which only carries the /Create args, e.g. the XML time).
+luna_bat=$(cat "$BAT_DIR/graphmap-luna.bat" 2>/dev/null || echo MISSING)
+himmel_bat=$(cat "$BAT_DIR/graphmap-himmel.bat" 2>/dev/null || echo MISSING)
+assert_contains    "luna runner carries its default out-root"      "--out-root \"$HOME/.local/share/himmel/graphify/luna\"" "$luna_bat"
+assert_not_contains "himmel runner has no --out-root (stays in-corpus)" "--out-root" "$himmel_bat"
+# HIMMEL-3718 CR (codex-1): the Windows structural (AST) runner must get the
+# same out-root redirect its POSIX cron sibling (ast_cron_payload's
+# GRAPHIFY_OUT=) already carries -- otherwise luna's semantic and structural
+# legs write to different graph directories despite sharing a promote lock.
+ast_luna_bat=$(cat "$BAT_DIR/graphmap-ast-luna.bat" 2>/dev/null || echo MISSING)
+ast_himmel_bat=$(cat "$BAT_DIR/graphmap-ast-himmel.bat" 2>/dev/null || echo MISSING)
+assert_contains     "ast-luna runner carries its default out-root"       "set \"GRAPHIFY_OUT=$HOME/.local/share/himmel/graphify/luna/graphify-out\"" "$ast_luna_bat"
+assert_not_contains "ast-himmel runner has no GRAPHIFY_OUT (stays in-corpus)" "GRAPHIFY_OUT=" "$ast_himmel_bat"
 if [ "$(find "$STATE/tasks" -mindepth 1 | wc -l)" -eq 5 ]; then
     pass "still exactly five tasks after --force re-arm"
 else
@@ -2175,5 +2193,43 @@ if [ -n "${CYGPATH_STUB_DIR:-}" ]; then
         assert_contains "refusal names the missing cygpath" "cygpath not on PATH; cannot convert paths for schtasks" "$out"
     fi
 fi
+
+# Test C-outroot (HIMMEL-3718): cron_payload / ast_cron_payload accept an
+# optional out-root/out-dir arg and emit the flag ONLY when it is non-empty --
+# the empty case is already covered above (the luna/himmel runner asserts
+# never see --out-root/GRAPHIFY_OUT= today, since no test here sets
+# GRAPHIFY_LUNA_OUT_ROOT), so this unit-tests the plumbing directly rather
+# than re-running the whole hermetic cron_arm harness a second time.
+echo "TEST: cron_payload / ast_cron_payload out-root wiring (HIMMEL-3718)"
+CP_SRC="$(sed -n '/^cron_payload()/,/^}/p' "$SCRIPT")"
+ACP_SRC="$(sed -n '/^ast_cron_payload()/,/^}/p' "$SCRIPT")"
+run_cp() { bash -c "BACKEND=claude-cli"$'\n'"$CP_SRC"$'\n''cron_payload "$@"' _ "$@"; }
+run_acp() { bash -c "$ACP_SRC"$'\n''ast_cron_payload "$@"' _ "$@"; }
+
+cp_no_root=$(run_cp bash script.sh luna corpus maps title slug tag)
+assert_not_contains "cron_payload omits --out-root when unset" "--out-root" "$cp_no_root"
+cp_with_root=$(run_cp bash script.sh luna corpus maps title slug tag /out/root)
+assert_contains "cron_payload appends --out-root when set" "--out-root /out/root" "$cp_with_root"
+
+acp_no_dir=$(run_acp bash script.sh corpus)
+assert_not_contains "ast_cron_payload omits GRAPHIFY_OUT= when unset" "GRAPHIFY_OUT=" "$acp_no_dir"
+acp_with_dir=$(run_acp bash script.sh corpus /out/root/graphify-out)
+assert_contains "ast_cron_payload prefixes GRAPHIFY_OUT= when set" "GRAPHIFY_OUT=/out/root/graphify-out " "$acp_with_dir"
+
+# Test C-outroot-2 (HIMMEL-3718 CR panel round 6, codex-1): the himmel
+# semantic runner never passes --out-root, but refresh-graph-map.sh now
+# honors GRAPHIFY_OUT_ROOT from the environment as a fallback (line ~157) --
+# an ambient value (e.g. left over from a luna promote test in the same
+# shell) could otherwise redirect himmel's tracked graph out of its corpus.
+# cron_payload must unset it explicitly whenever it omits --out-root.
+assert_contains "cron_payload unsets GRAPHIFY_OUT_ROOT when --out-root is omitted" "unset GRAPHIFY_OUT_ROOT" "$cp_no_root"
+assert_not_contains "cron_payload leaves GRAPHIFY_OUT_ROOT alone when --out-root is set" "unset GRAPHIFY_OUT_ROOT" "$cp_with_root"
+
+# Test C-outroot-3 (HIMMEL-3718 CR panel round 7, codex-1): symmetric gap on
+# the structural (AST) leg -- ast-update.sh reads GRAPHIFY_OUT from its
+# environment the same way; an ambient value (e.g. from a manual luna AST
+# test run in the same shell) could redirect himmel's AST leg the same way.
+assert_contains "ast_cron_payload unsets GRAPHIFY_OUT when GRAPHIFY_OUT= is omitted" "unset GRAPHIFY_OUT" "$acp_no_dir"
+assert_not_contains "ast_cron_payload leaves GRAPHIFY_OUT alone when it is set" "unset GRAPHIFY_OUT" "$acp_with_dir"
 
 summary

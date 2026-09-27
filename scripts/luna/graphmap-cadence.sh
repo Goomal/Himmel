@@ -172,6 +172,15 @@ BAT_DIR="${GRAPHMAP_BAT_DIR:-$(resolve_user_home)/.claude/graphmap-cadence}"
 # so the runner fires the shipped refresh-graph-map.sh by absolute path.
 HIMMEL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)"
 REFRESH_SCRIPT="$HIMMEL_ROOT/scripts/graphify/refresh-graph-map.sh"
+# HIMMEL-3718: ONE resolver for the out-of-corpus promote destination — see
+# graph-out-root.sh for why (Obsidian hangs on the vault-internal
+# graphify-out/ churn). Empty for himmel (its graphify-out/ stays tracked +
+# in-corpus). Used by both the semantic pair (cron_payload --out-root) and
+# the structural pair (ast_cron_payload GRAPHIFY_OUT=) below, so the two legs
+# that share one promote lock (HIMMEL-1948) keep resolving the SAME directory.
+# shellcheck source=../graphify/graph-out-root.sh
+# shellcheck disable=SC1091
+. "$HIMMEL_ROOT/scripts/graphify/graph-out-root.sh"
 # Structural (AST) pair (HIMMEL-1948 CR r1b): routes through the promote-lock
 # wrapper, by absolute path, same rationale as REFRESH_SCRIPT above -- see
 # ast-update.sh's own header for why (HIMMEL-910 lock, shared graphify-out).
@@ -718,9 +727,10 @@ cmd_disarm() {
 # flags. All interpolated path values are already cmd-escaped by the caller;
 # name/slug/tag/backend are fixed ASCII literals.
 bat_payload() {
-    local script_esc="$1" name="$2" corpus_esc="$3" maps_esc="$4" title="$5" slug="$6" tag="$7"
+    local script_esc="$1" name="$2" corpus_esc="$3" maps_esc="$4" title="$5" slug="$6" tag="$7" out_root_esc="${8:-}"
     printf '"%s" --name %s --corpus-root "%s" --maps-dir "%s" --title "%s" --slug %s --backend %s --corpus-tag %s' \
         "$script_esc" "$name" "$corpus_esc" "$maps_esc" "$title" "$slug" "$BACKEND" "$tag"
+    if [ -n "$out_root_esc" ]; then printf ' --out-root "%s"' "$out_root_esc"; fi
 }
 
 # Structural (AST) payload builder (HIMMEL-1948 Task 3, routed through the
@@ -769,7 +779,7 @@ emit_bat() {
     # value left sitting among escaped ones, which is exactly how an unescaped
     # path gets used by accident later. Dropped rather than fed an escaped
     # value nothing reads.
-    local himmel_win_esc="$1" payload="$2" log_win_esc="$3" graphify_dir_win_esc="${4:-}" git_bin_esc="${5:-}" declare_ollama="${6:-0}" claude_dir_win_esc="${7:-}"
+    local himmel_win_esc="$1" payload="$2" log_win_esc="$3" graphify_dir_win_esc="${4:-}" git_bin_esc="${5:-}" declare_ollama="${6:-0}" claude_dir_win_esc="${7:-}" graphify_out_esc="${8:-}"
     printf 'rem %s %s\r\n' "$CADENCE_FORMAT_MARKER" "$CADENCE_RUNNER_FORMAT_VERSION"
     # Pin editor hooks to the no-op `true` so a cadence child (stdin closed under
     # schtasks) can never block on an editor prompt (HIMMEL-1753).
@@ -798,6 +808,13 @@ emit_bat() {
     # zero egress) without adding any bypass.
     if [ "$declare_ollama" -eq 1 ]; then
         printf 'set "GRAPHIFY_DECLARED_BACKEND=ollama"\r\n'
+    fi
+    # HIMMEL-3718 CR (codex-1): mirror ast_cron_payload's GRAPHIFY_OUT= prefix
+    # on the POSIX structural leg -- a .bat sets env vars as their own `set`
+    # line, not as part of the command, so this stays a separate emit_bat arg
+    # rather than something ast_bat_payload's payload string could carry.
+    if [ -n "$graphify_out_esc" ]; then
+        printf 'set "GRAPHIFY_OUT=%s"\r\n' "$graphify_out_esc"
     fi
     printf 'if exist "%s" move /y "%s" "%s.prev" > NUL 2>&1\r\n' "$log_win_esc" "$log_win_esc" "$log_win_esc"
     printf 'echo [fired %%DATE%% %%TIME%%] >> "%s" 2>&1\r\n' "$log_win_esc"
@@ -1385,8 +1402,28 @@ cmd_arm() {
     # but BOTH publish their curated MOC into the luna vault's 60-Maps ($maps_esc).
     # The luna vault is the single home for every map; the cross-corpus mix here
     # is intentional, not a copy-paste bug (HIMMEL-829 wiring decision).
+    # luna_out_root_esc (HIMMEL-3718): same graphify_out_root_for resolver the
+    # POSIX cron_payload path uses; himmel gets none (stays in-corpus), so its
+    # bat_payload call below omits the arg entirely.
+    local luna_out_root luna_out_root_esc
+    luna_out_root="$(graphify_out_root_for luna)"
+    luna_out_root_esc=""
+    if [ -n "$luna_out_root" ]; then
+        luna_out_root_esc=$(cadence_cmd_escape "$luna_out_root")
+    fi
+    # luna_out_dir_esc (HIMMEL-3718 CR, codex-1): the Windows structural
+    # (AST) runner's GRAPHIFY_OUT= counterpart to luna_out_root_esc above --
+    # same full out-dir (out-root/graphify-out) the POSIX q_out_dir_ast_luna
+    # resolves to. Like luna_out_root_esc's --out-root value, this is read by
+    # bash/ast-update.sh, not a native Windows exe, so it stays the raw POSIX
+    # path (no cygpath -w) -- only cmd-escaped for the .bat `set` line.
+    local luna_out_dir_esc
+    luna_out_dir_esc=""
+    if [ -n "$luna_out_root" ]; then
+        luna_out_dir_esc=$(cadence_cmd_escape "$luna_out_root/graphify-out")
+    fi
     local payload_luna payload_himmel
-    payload_luna=$(bat_payload "$script_esc" luna "$vault_esc" "$maps_esc" "$LUNA_TITLE" "$LUNA_SLUG" "$LUNA_TAG")
+    payload_luna=$(bat_payload "$script_esc" luna "$vault_esc" "$maps_esc" "$LUNA_TITLE" "$LUNA_SLUG" "$LUNA_TAG" "$luna_out_root_esc")
     payload_himmel=$(bat_payload "$script_esc" himmel "$himmel_esc" "$maps_esc" "$HIMMEL_TITLE" "$HIMMEL_SLUG" "$HIMMEL_TAG")
     # Both .bats get the bash exe prepended; assemble the full exec line.
     # bash_win is cmd-escaped like every other interpolated value (HIMMEL-1281
@@ -1498,7 +1535,7 @@ cmd_arm() {
             emit_task_xml "$bat_himmel_win" "$HIMMEL_TIME" "$sched_semantic" | sed 's/^/    /'
         fi
         echo "DRY graphmap-cadence: would write $bat_ast_luna:"
-        emit_bat "$himmel_win_esc" "$payload_ast_luna" "$log_ast_luna_esc" "$graphify_dir_win_esc" "$git_bin_esc" 1 | sed 's/^/    /'
+        emit_bat "$himmel_win_esc" "$payload_ast_luna" "$log_ast_luna_esc" "$graphify_dir_win_esc" "$git_bin_esc" 1 "" "$luna_out_dir_esc" | sed 's/^/    /'
         echo "DRY graphmap-cadence: would write $vbs_ast_luna:"
         cadence_vbs_wrapper "$bat_ast_luna_win" | sed 's/^/    /'
         echo "DRY graphmap-cadence: would write $bat_ast_himmel:"
@@ -1544,7 +1581,7 @@ cmd_arm() {
     tmp_ast_himmel_bat=$(mktemp "$BAT_DIR/.graphmap-ast-himmel.bat.XXXXXX")
     tmp_ast_luna_vbs=$(mktemp "$BAT_DIR/.graphmap-ast-luna.vbs.XXXXXX")
     tmp_ast_himmel_vbs=$(mktemp "$BAT_DIR/.graphmap-ast-himmel.vbs.XXXXXX")
-    emit_bat "$himmel_win_esc" "$payload_ast_luna" "$log_ast_luna_esc" "$graphify_dir_win_esc" "$git_bin_esc" 1 > "$tmp_ast_luna_bat"
+    emit_bat "$himmel_win_esc" "$payload_ast_luna" "$log_ast_luna_esc" "$graphify_dir_win_esc" "$git_bin_esc" 1 "" "$luna_out_dir_esc" > "$tmp_ast_luna_bat"
     emit_bat "$himmel_win_esc" "$payload_ast_himmel" "$log_ast_himmel_esc" "$graphify_dir_win_esc" "$git_bin_esc" 0 > "$tmp_ast_himmel_bat"
     cadence_vbs_wrapper "$bat_ast_luna_win" > "$tmp_ast_luna_vbs"
     cadence_vbs_wrapper "$bat_ast_himmel_win" > "$tmp_ast_himmel_vbs"
@@ -1824,9 +1861,15 @@ cron_existing() {
 # flags. bash/script/corpus/maps/title arrive pre-quoted (printf %q);
 # name/slug/tag/backend are fixed ASCII literals.
 cron_payload() {
-    local q_bash="$1" q_script="$2" name="$3" q_corpus="$4" q_maps="$5" q_title="$6" slug="$7" tag="$8"
+    local q_bash="$1" q_script="$2" name="$3" q_corpus="$4" q_maps="$5" q_title="$6" slug="$7" tag="$8" q_out_root="${9:-}"
+    # HIMMEL-3718 CR (codex-1, round 6): refresh-graph-map.sh now falls back to
+    # GRAPHIFY_OUT_ROOT from the environment when --out-root is absent -- clear
+    # it whenever this leg omits --out-root, so an ambient value left over from
+    # the OTHER leg's out-of-corpus run can't redirect this one.
+    if [ -z "$q_out_root" ]; then printf 'unset GRAPHIFY_OUT_ROOT; '; fi
     printf '%s %s --name %s --corpus-root %s --maps-dir %s --title %s --slug %s --backend %s --corpus-tag %s' \
         "$q_bash" "$q_script" "$name" "$q_corpus" "$q_maps" "$q_title" "$slug" "$BACKEND" "$tag"
+    if [ -n "$q_out_root" ]; then printf ' --out-root %s' "$q_out_root"; fi
 }
 
 # Structural (AST) payload builder, POSIX form (HIMMEL-1948 Task 3, routed
@@ -1835,7 +1878,15 @@ cron_payload() {
 # Mirrors ast_bat_payload's rationale -- --force now lives INSIDE
 # ast-update.sh, not on this command line.
 ast_cron_payload() {
-    local q_bash="$1" q_script="$2" q_corpus="$3"
+    local q_bash="$1" q_script="$2" q_corpus="$3" q_out_dir="${4:-}"
+    # ast-update.sh reads GRAPHIFY_OUT from its environment exactly the way
+    # graphify itself does (paths.py) -- an absolute value is used as-is, so
+    # this is the FULL out dir (out-root/graphify-out), not just the root, to
+    # land on the same directory refresh-graph-map.sh's --out-root resolves to.
+    # HIMMEL-3718 CR (codex-1, round 7): mirror cron_payload's unset -- clear
+    # an ambient GRAPHIFY_OUT whenever this leg omits its own GRAPHIFY_OUT=.
+    if [ -z "$q_out_dir" ]; then printf 'unset GRAPHIFY_OUT; '; fi
+    if [ -n "$q_out_dir" ]; then printf 'GRAPHIFY_OUT=%s ' "$q_out_dir"; fi
     printf '%s %s %s' "$q_bash" "$q_script" "$q_corpus"
 }
 
@@ -2027,13 +2078,26 @@ cron_arm() {
     q_log_ast_himmel=$(printf '%q' "$BAT_DIR/graphmap-ast-himmel.log")
     q_log_publish_himmel=$(printf '%q' "$BAT_DIR/graphmap-publish-himmel.log")
 
+    # HIMMEL-3718: luna's out-of-corpus destination, resolved ONCE and shared
+    # by both the semantic (--out-root) and structural (GRAPHIFY_OUT=) legs
+    # below -- see graph-out-root.sh. Empty when no override is configured
+    # (today's in-corpus default, byte-for-byte unchanged).
+    local luna_out_root q_out_root_luna q_out_dir_ast_luna
+    luna_out_root="$(graphify_out_root_for luna)"
+    q_out_root_luna=""
+    q_out_dir_ast_luna=""
+    if [ -n "$luna_out_root" ]; then
+        q_out_root_luna=$(printf '%q' "$luna_out_root")
+        q_out_dir_ast_luna=$(printf '%q' "$luna_out_root/graphify-out")
+    fi
+
     local payload_luna payload_himmel payload_ast_luna payload_ast_himmel payload_publish_himmel
-    payload_luna=$(cron_payload "$q_bash" "$q_script" luna "$q_vault" "$q_maps" "$q_luna_title" "$LUNA_SLUG" "$LUNA_TAG")
+    payload_luna=$(cron_payload "$q_bash" "$q_script" luna "$q_vault" "$q_maps" "$q_luna_title" "$LUNA_SLUG" "$LUNA_TAG" "$q_out_root_luna")
     payload_himmel=$(cron_payload "$q_bash" "$q_script" himmel "$q_himmel" "$q_maps" "$q_himmel_title" "$HIMMEL_SLUG" "$HIMMEL_TAG")
     # Structural (AST) payloads (HIMMEL-1948 Task 3, routed through the
     # promote-lock wrapper as of CR r1b): same asymmetric corpus roots as the
     # semantic pair (luna = vault, himmel = repo).
-    payload_ast_luna=$(ast_cron_payload "$q_bash" "$q_ast_script" "$q_vault")
+    payload_ast_luna=$(ast_cron_payload "$q_bash" "$q_ast_script" "$q_vault" "$q_out_dir_ast_luna")
     payload_ast_himmel=$(ast_cron_payload "$q_bash" "$q_ast_script" "$q_himmel")
     # Publish leg (HIMMEL-2095): himmel repo only (v1).
     payload_publish_himmel=$(publish_cron_payload "$q_bash" "$q_publish_script" "$q_himmel")

@@ -783,6 +783,15 @@ diff_row noleak "non-seam \$(( )) assignment as the chokepoint argument" '@P@ $(
 diff_row residual "indirect: x=SEAM=0; (( x )) assigns via the VALUE (HIMMEL-3195)" 'x=HIMMEL_CONSOLE_LEG=0; (( x )); @P@'
 rm -rf "$ORACLE_DIR"
 
+# --- Seam-var env-prefix denies onto the suite chokepoints (unrelated to any
+# invoked-program check; these are ordinary registered chokepoints). ---
+QR="scripts/quiet-run.sh"
+assert_deny "HIMMEL_SUITE_SLOT_HELD= prefix on quiet-run suite" "$(j "HIMMEL_SUITE_SLOT_HELD=/tmp/x bash $QR suite -- bash scripts/test-quiet-run.sh")"
+assert_deny "HIMMEL_SUITE_SLOTS= prefix on quiet-run suite"     "$(j "HIMMEL_SUITE_SLOTS=9 bash $QR suite -- bun test")"
+assert_deny "HIMMEL_SUITE_SLOTS= prefix on run-shell-tests"     "$(j "HIMMEL_SUITE_SLOTS=9 bash scripts/ci/run-shell-tests.sh .")"
+assert_allow "SUITE_LOCK_WAIT= prefix on quiet-run suite"      "$(j "SUITE_LOCK_WAIT=60 bash $QR suite -- bash scripts/test-quiet-run.sh")"
+assert_allow "run-shell-tests.sh (the CI chokepoint)"          "$(j "bash scripts/ci/run-shell-tests.sh --shard 1/8 .")"
+
 # --- ALLOWED: fail-open proofs ---
 assert_allow "bare sanctioned invocation (no prefix)"   "$(j "bash $MERGE_ON_GREEN")"
 assert_allow "bare invocation, other chokepoint"         "$(j "bash $STOP_WORKER --list")"

@@ -2567,4 +2567,116 @@ else
   echo "negative control confirmed: marker '$real_marker' != deliberately wrong '$wrong_marker'"
 fi
 
+# T67 (HIMMEL-2650): git < 2.31 does NOT fail on an unsupported --path-format
+# -- it ECHOES the option back as an ordinary output line and still exits 0
+# with a garbage, non-absolute value (proven directly: `git rev-parse
+# --totally-unknown-option --git-common-dir` on this station's real git
+# prints the unknown option then the path, rc=0). The faithful stub below
+# reproduces that exact mechanism for the flag the code no longer even
+# calls at this site (--path-format=absolute) -- strips it out of argv,
+# echoes it back, execs real git with the rest -- to prove the fix does not
+# regress if the flag ever reappears nearby. Run DIRECTLY AT anchor13's own
+# root (not a linked worktree): that's the scenario where plain
+# `--git-common-dir` (no --path-format) returns a RELATIVE ".git", which is
+# exactly the shape the old `--path-format=absolute`-only code could not
+# recover from -- empirically confirmed pre-fix (base logic, same shim, same
+# cwd) this misclassifies the anchor's own root as adopter, and the fixed
+# code (plain --git-common-dir + a `cd -P`/`pwd -P` absolutization,
+# validated by looks_like_absolute_path) correctly stays himmel.
+#
+# anchor13 is checked out on 'main' at this point (every earlier test's
+# worktree adds branch off it without switching it) -- HIMMEL-2773's
+# default-branch refusal (rc=4) fires before this fix's own code ever runs
+# there. Switch it to a non-default branch first: the "own root, not a
+# linked worktree" scenario this test targets does not require main itself,
+# only that cwd's git-common-dir resolves to the anchor's own .git.
+(cd "$anchor13" && git checkout -q -b t67-anchor-root) || { echo "FAIL: T67 could not switch anchor13 off main"; fail=1; }
+real_git67=$(command -v git)
+fakegit_dir67="$tmp/pathformat230-fake-git-bin"
+mkdir -p "$fakegit_dir67"
+cat > "$fakegit_dir67/git" <<GITSHIM67
+#!/usr/bin/env bash
+saw_path_format=0
+args=()
+for a in "\$@"; do
+    if [ "\$a" = "--path-format=absolute" ]; then
+        saw_path_format=1
+        continue
+    fi
+    args+=("\$a")
+done
+if [ "\$saw_path_format" -eq 1 ]; then
+    echo "--path-format=absolute"
+fi
+exec "$real_git67" "\${args[@]}"
+GITSHIM67
+chmod +x "$fakegit_dir67/git"
+
+# Positive control (codex-1, HIMMEL-2650): the assertion below never passes
+# --path-format=absolute to this shim (the code under test no longer calls
+# it at this site), so without this control T67 could pass even if the shim
+# were broken and never echoed anything at all. Call the shim directly with
+# that flag first, and confirm it actually reproduces the git<2.31 echo-back
+# it claims to -- proving the no-op result below is "the flag isn't passed",
+# not "the shim is inert".
+shim_direct67="$(cd "$anchor13" && PATH="$fakegit_dir67:$PATH" git rev-parse --path-format=absolute --git-common-dir)"
+case "$shim_direct67" in
+  *"--path-format=absolute"*) echo "positive control confirmed: shim echoes --path-format=absolute back, matching git<2.31" ;;
+  *) echo "FAIL: T67 positive control - shim did not echo --path-format=absolute back when passed directly"; fail=1 ;;
+esac
+
+out67="$(cd "$anchor13" && PATH="$fakegit_dir67:$PATH" HIMMEL_REPO="$anchor13" bash "$anchor13/scripts/cr/pr-check-context.sh")"
+rc67=$?
+check "$rc67" "0" "T67 rc"
+check "$(get_kv "$out67" anchor_lane)" "himmel" "T67 anchor_lane=himmel (a real himmel-lane run at the anchor root survives a git-2.30-shaped --path-format echo-back nearby, not silently downgraded to adopter)"
+
+# T68 (HIMMEL-2650): when the common-dir resolution genuinely cannot produce
+# an absolute value at all (not just the --path-format echo-back shape),
+# the fix must still fail CLOSED to the adopter lane -- and must say so
+# loudly on stderr, never silently (per the console's REDIRECT ruling).
+fakegit_dir68="$tmp/unresolvable-fake-git-bin"
+mkdir -p "$fakegit_dir68"
+cat > "$fakegit_dir68/git" <<GITSHIM68
+#!/usr/bin/env bash
+if [ "\$1" = "rev-parse" ] && [ "\$2" = "--git-common-dir" ]; then
+    echo "totally-unresolvable-garbage"
+    exit 0
+fi
+exec "$real_git67" "\$@"
+GITSHIM68
+chmod +x "$fakegit_dir68/git"
+out68="$(cd "$anchor13" && PATH="$fakegit_dir68:$PATH" HIMMEL_REPO="$anchor13" bash "$anchor13/scripts/cr/pr-check-context.sh" 2>"$tmp/t68.err")"
+rc68=$?
+check "$rc68" "0" "T68 rc (fails closed, not hard-abort)"
+check "$(get_kv "$out68" anchor_lane)" "adopter" "T68 anchor_lane=adopter (an unresolvable common dir fails to the conservative lane)"
+grep -q 'could not resolve an absolute git-common-dir' "$tmp/t68.err" || { echo "FAIL: T68 missing the loud stderr diagnostic naming the cause"; fail=1; }
+
+# T69 (HIMMEL-2650, console REDIRECT): the relative-common-dir resolution
+# must not consult CDPATH. Bash's `cd` searches CDPATH for a bare relative
+# name like ".git" even when the cwd already has its own `.git` -- CDPATH
+# wins over the local match (verified empirically). Left unguarded, a
+# caller whose environment happens to set CDPATH to a directory containing
+# the anchor turns an adopter-lane cwd into anchor_lane=himmel: a lane
+# ESCALATION, trusting the reviewed repo's own scripts/cr/, not the safe
+# adopter fallback the other branches take.
+#
+# T69a: a genuinely foreign repo (its own real `.git`) reviewed with CDPATH
+# poisoned toward anchor13 must still classify adopter.
+foreign69="$tmp/foreign-repo-69"
+mkdir -p "$foreign69"
+(cd "$foreign69" && git init -q -b main .) || { echo "FAIL: T69 could not init foreign69"; fail=1; }
+(cd "$foreign69" && git config user.email t@t) || { echo "FAIL: T69 could not config foreign69 email"; fail=1; }
+(cd "$foreign69" && git config user.name t) || { echo "FAIL: T69 could not config foreign69 name"; fail=1; }
+(cd "$foreign69" && git commit -q --allow-empty -m init) || { echo "FAIL: T69 could not commit foreign69"; fail=1; }
+(cd "$foreign69" && git checkout -q -b t69a-foreign) || { echo "FAIL: T69 could not switch foreign69 off main"; fail=1; }
+out69a="$(cd "$foreign69" && CDPATH="$anchor13" HIMMEL_REPO="$anchor13" bash "$anchor13/scripts/cr/pr-check-context.sh")"
+check "$(get_kv "$out69a" anchor_lane)" "adopter" "T69a anchor_lane=adopter (CDPATH poisoned toward the anchor must not escalate a foreign repo with its own .git)"
+
+# T69b: the legitimate himmel-lane match must survive CDPATH poisoned
+# toward an unrelated directory (no false NEGATIVE from the same fix).
+unrelated69="$tmp/unrelated-cdpath-69"
+mkdir -p "$unrelated69"
+out69b="$(cd "$anchor13" && CDPATH="$unrelated69" HIMMEL_REPO="$anchor13" bash "$anchor13/scripts/cr/pr-check-context.sh")"
+check "$(get_kv "$out69b" anchor_lane)" "himmel" "T69b anchor_lane=himmel (CDPATH poisoned toward an unrelated dir must not break the legitimate himmel-lane match)"
+
 [ "$fail" -eq 0 ] && echo "PASS test-pr-check-context" || exit 1

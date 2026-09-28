@@ -327,7 +327,10 @@ if ! root="$(handover_root)"; then
     err "set HANDOVER_DIR or run /handover-setup."
     exit 2
 fi
-if ! slug="$(user_slug)"; then
+# #1410: resolve from this script's OWN checkout, like load_dotenv above --
+# user_slug's forge/git-config fallbacks read the cwd, and the plugin console
+# runs from any directory, so a foreign cwd forked the chain into another slug.
+if ! slug="$(cd "$HERE/../../.." && user_slug)"; then
     err "cannot resolve USER_SLUG. Set USER_SLUG or configure your forge login / git user.name."
     exit 2
 fi

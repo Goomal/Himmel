@@ -1917,4 +1917,22 @@ check "74 the refusal is --project's own message" \
     "$(printf '%s\n' "$out74" | grep -c "^console: --project must be an existing directory, got '$tmp/no-such-dir-74'\$")" "1"
 check "74 nothing falls back to himmel's bucket" "$(printf '%s\n' "$out74" | grep -c '^would-doc:')" "0"
 
+# 75 (#1410): the user slug resolves from console.sh's OWN checkout, never the
+# caller's cwd -- the same pinning HIMMEL-3533 gave load_dotenv. The plugin
+# /himmel-ops:console runs console.sh from any directory; from a non-git one
+# forge_detect found no origin, so the slug fell back to the cwd's slugified
+# git user.name and the chain forked into a second user dir.
+tmp75="$tmp/t75"
+mkdir -p "$tmp75/bin" "$tmp75/foreign-cwd"
+# shellcheck disable=SC2016  # $1/$2 are the stub gh's own args, not ours
+printf '#!/usr/bin/env bash\n[ "$1 $2" = "api user" ] && { echo forge-login-75; exit 0; }\nexit 1\n' > "$tmp75/bin/gh"
+chmod +x "$tmp75/bin/gh"
+printf '[user]\n\tname = Cwd Fallback\n' > "$tmp75/gitconfig"
+git -C "$fixture_repo" remote add origin https://github.com/example/himmel.git
+out75="$( cd "$tmp75/foreign-cwd" && env -u USER_SLUG -u FORGE HANDOVER_DIR="$root" JIRA_PROJECT_KEY=DEMO \
+    CONSOLE_WORK_DIR="$tmp/defaultwork" GIT_CONFIG_GLOBAL="$tmp75/gitconfig" GH_CMD="$tmp75/bin/gh" \
+    bash "$C" new --dry-run --bucket slug75 2>&1 )"
+check "75 slug is console.sh's own checkout's forge login, not the cwd's git user.name" \
+    "$(printf '%s\n' "$out75" | grep -c "^would-doc: $root/forge-login-75/slug75/")" "1"
+
 [ "$fails" -eq 0 ] && echo "ALL PASS" || { echo "$fails FAILED"; exit 1; }

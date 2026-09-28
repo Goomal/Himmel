@@ -1204,6 +1204,49 @@ assert "word-glued >&2nd.txt: PASS under GNU sed (control)" \
 assert "word-glued >&2nd.txt: PASS under POSIX sed too (J1397A finding 3)" \
     PASS "$(decide_posix "$(j_bash 'grep x f >&2nd.txt')")"
 
+# --- HIMMEL-3793 (J1397A finding 4): a backslash-escaped CR, or a trailing
+# backslash, right after an fd-dup target still writes a junk file. SCAN_MASK
+# blanks BOTH bytes of an unquoted `\<x>` pair to spaces, so the fd-dup
+# boundary check at :1571 sees a plain space right after the digit and treats
+# it as a valid boundary — but to real bash the backslash keeps the CR
+# literal, so the redirect word is "2<CR>" (a real file), not the digit 2.
+# VERIFIED (real bash): `grep x f >&2\<CR>` creates a file named `2\r`;
+# `grep x f >&2\` (trailing backslash, no CR) creates `2\`.
+assert "fd-dup >&2 + backslash-escaped CR writes a junk file (must not ALLOW)" \
+    PASS "$(decide "$(j_bash "grep x f >&2\\"$'\r')")"
+assert "fd-dup >&2 + trailing backslash writes a junk file (must not ALLOW)" \
+    PASS "$(decide "$(j_bash "grep x f >&2\\")")"
+# Same root cause, a different consumer: an unquoted, backslash-escaped `&`
+# is correctly kept as a LITERAL `&` argument (not a live separator) — but
+# that literal survives as uniq's 2nd positional, which real uniq treats as
+# an OUTPUT file, not another input. VERIFIED (real bash): `uniq -c f \&`
+# creates a file named `&`; `uniq -c f a\&\&b` creates `a&&b`.
+#
+# NOT fixed by this PR (console ruling, HIMMEL-3793): an earlier draft of
+# this PR added a uniq-specific "2nd positional = output file" guard to
+# close these two, but three straight /pr-check panel rounds each found a
+# new real bypass in that guard (a bare "-" miscounted as a flag, a quoted
+# `'>' ` miscounted as a redirect, a backslash-escaped `2\>` miscounted as a
+# redirect, and finally `uniq -- -input output` miscounted post-`--`). A
+# guard that keeps yielding a new real bypass every round gets cut, not
+# patched further — so these two remain ALLOWed on this head, same as main,
+# and stay open on HIMMEL-3793 as part of the broader "uniq/sort-style
+# positional output operand" class (ticket comment has the full bypass list).
+assert "uniq 2nd positional via escaped bare & still ALLOW (known gap, HIMMEL-3793 stays open)" \
+    ALLOW "$(decide "$(j_bash 'uniq -c f \&')")"
+assert "uniq 2nd positional via escaped & inside a word still ALLOW (known gap, HIMMEL-3793 stays open)" \
+    ALLOW "$(decide "$(j_bash 'uniq -c f a\&\&b')")"
+# Controls: ordinary fd-dups must keep ALLOWing — this fix must not regress
+# anything main already approves.
+assert "fd-dup >&2, no escape, still ALLOW (control)" \
+    ALLOW "$(decide "$(j_bash 'grep x f >&2')")"
+assert "fd-dup 2>&1, no escape, still ALLOW (control)" \
+    ALLOW "$(decide "$(j_bash 'grep x f 2>&1')")"
+assert "uniq single positional (no 2nd/output arg) still ALLOW (control)" \
+    ALLOW "$(decide "$(j_bash 'uniq -c f')")"
+assert "a plain backslash-escaped & INSIDE quotes still ALLOW (control)" \
+    ALLOW "$(decide "$(j_bash 'grep "\&" f')")"
+
 echo ""
 if [ "$FAILED" -eq 0 ]; then
     echo "All cases passed."

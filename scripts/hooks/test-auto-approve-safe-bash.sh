@@ -77,6 +77,29 @@ decide_win() {
     fi
 }
 
+# decide_posix — same contract as decide(), but the hook sees POSIX-bracket
+# sed semantics (BSD/macOS sed), a proxy for a platform not available on this
+# Linux test box: under POSIX brackets `\t`/`\n` in `[...]` mean the literal
+# characters `\` and `t`/`n`, not TAB/LF (judge J1397A findings 2/3).
+POSIX_SED_SHIM_DIR="$(mktemp -d "${TMPDIR:-/tmp}/posix-sed-shim.XXXXXX")" || exit 1
+REAL_SED="$(command -v sed)"
+cat > "$POSIX_SED_SHIM_DIR/sed" <<EOF
+#!/usr/bin/env bash
+exec "$REAL_SED" --posix "\$@"
+EOF
+chmod +x "$POSIX_SED_SHIM_DIR/sed"
+decide_posix() {
+    local out
+    out=$(printf '%s' "$1" | PATH="$POSIX_SED_SHIM_DIR:$PATH" bash "$HOOK" 2>/dev/null)
+    if grepq "$out" '"permissionDecision":"deny"'; then
+        echo "DENY"
+    elif grepq "$out" '"permissionDecision":"allow"'; then
+        echo "ALLOW"
+    else
+        echo "PASS"
+    fi
+}
+
 assert() {
     local label="$1" expected="$2" actual="$3"
     if [ "$actual" = "$expected" ]; then
@@ -1106,6 +1129,80 @@ assert "double-quoted backslash before real &&: visible chain (control)" \
 # fd-dup must still parse as one safe segment even right after this fix.
 assert "2>&1 fd-dup still safe post-fix"   ALLOW "$(decide "$(j_bash 'grep x f 2>&1 | head')")"
 assert "amp-redirect &>devnull still safe post-fix" ALLOW "$(decide "$(j_bash 'grep x f &>/dev/null')")"
+
+# --- HIMMEL-3782 (judge J1387B): an unquoted `>&2` followed by a lone CR is
+# not a valid fd-dup word to real bash — the CR glues onto the digit, so the
+# redirect target word is "2<CR>" (not the digit 2), and bash opens a REAL
+# FILE named "2<CR>" instead of duplicating fd 2. VERIFIED (real bash, scratch
+# dir): `grep x f >&2<CR>` creates a junk file literally named `2\r`. Must not
+# auto-approve: falls through to PASS (the normal prompt), same as any other
+# real-file redirect.
+assert "fd-dup >&2 + lone CR writes a junk file (must not ALLOW)" \
+    PASS "$(decide "$(j_bash "grep x f >&2"$'\r')")"
+assert "fd-dup >&2 + CR then a second line (must not ALLOW)" \
+    PASS "$(decide "$(j_bash "grep x f >&2"$'\r'"echo y")")"
+# 2>&1 + lone CR: real bash raises "ambiguous redirect" (word "1<CR>" is not
+# all-digit) instead of writing a file, but it is still not a genuine
+# fd-dup — must not auto-approve either.
+assert "fd-dup 2>&1 + lone CR is ambiguous, not a real fd-dup (must not ALLOW)" \
+    PASS "$(decide "$(j_bash "grep x f 2>&1"$'\r')")"
+# Controls: the CR-free originals must keep ALLOWing — this fix must not
+# regress the ordinary fd-dup case.
+assert "fd-dup >&2, no CR, still ALLOW (control)" \
+    ALLOW "$(decide "$(j_bash 'grep x f >&2')")"
+assert "fd-dup 2>&1, no CR, still ALLOW (control)" \
+    ALLOW "$(decide "$(j_bash 'grep x f 2>&1')")"
+# >&- (close fd) + CR was never matched by the digit-only strip pattern in the
+# first place, so it already stays PASS — pin it so a future rewrite of the
+# strip regex doesn't accidentally start ALLOWing it.
+assert "fd-dup >&- + CR stays PASS (pre-existing, pin)" \
+    PASS "$(decide "$(j_bash "grep x f >&-"$'\r')")"
+
+# Same shapes under the CRLF-rendering jq shim (Windows jq.exe path): the
+# embedded CR is not a line terminator by itself, so fold_crlf's CRLF-fold
+# leaves it in place same as native — the fix must hold under both renderings.
+assert "fd-dup >&2 + lone CR, CRLF-shim rendering (must not ALLOW)" \
+    PASS "$(decide_win "$(j_bash "grep x f >&2"$'\r')")"
+assert "fd-dup 2>&1 + lone CR, CRLF-shim rendering (must not ALLOW)" \
+    PASS "$(decide_win "$(j_bash "grep x f 2>&1"$'\r')")"
+
+# --- J1397A finding 1: ordinary trailing fd-dup must still ALLOW under the
+# CRLF-shim (Windows jq.exe) rendering. jq.exe's own final-line CRLF leaves a
+# stray, unpaired CR on the end of every command it renders (the LF/CR pair
+# `$()` strips is only jq's very last newline); before this fix that stray CR
+# was indistinguishable from a HIMMEL-3782 crafted CR and fell through to
+# PASS on every ordinary command ending in a bare fd-dup. Must go back to
+# ALLOW, while the genuinely crafted CR above (which arrives DOUBLED under
+# this same rendering) still stays PASS.
+assert "ordinary >&2, no CR, still ALLOW under CRLF-shim (J1397A finding 1)" \
+    ALLOW "$(decide_win "$(j_bash 'echo "msg" >&2')")"
+assert "ordinary 2>&1, no CR, still ALLOW under CRLF-shim (J1397A finding 1)" \
+    ALLOW "$(decide_win "$(j_bash 'ls 2>&1')")"
+
+# --- HIMMEL-3786 (judge J1391A): pin the escaped ->-before-fd-dup-& shapes
+# (2\>&1 / \>&2) that #1391 (HIMMEL-3777) fixed but never got an explicit test
+# row for. Escaping the `>` leaves a live, unescaped `&` right after it — the
+# exact shape the &-branch's fd-dup lookback misparsed before #1391; the fix
+# keeps it from being read as a hidden second command, at the cost of not
+# auto-approving it either (PASS, not ALLOW) — same verdict as any other case
+# scan_cmd can't prove safe.
+assert "escaped \\>&1 before fd-dup &: not falsely ALLOW/DENY (HIMMEL-3786 pin)" \
+    PASS "$(decide "$(j_bash 'grep x f 2\>&1 | head')")"
+assert "escaped \\>&2: not falsely ALLOW/DENY (HIMMEL-3786 pin)" \
+    PASS "$(decide "$(j_bash 'grep x f \>&2 | head')")"
+
+# --- J1397A findings 2/3: the fd-dup boundary class must use [:blank:]
+# (space + tab, POSIX-portable) instead of the GNU-only \t/\n bracket
+# escapes, so BSD/macOS sed (where `\t`/`\n` inside `[...]` mean the literal
+# characters `\` and `t`/`n`, not TAB/LF) behaves identically to GNU sed.
+assert "fd-dup 2>&1 + TAB boundary: ALLOW under GNU sed (control)" \
+    ALLOW "$(decide "$(j_bash "grep x f 2>&1"$'\t'"| head")")"
+assert "fd-dup 2>&1 + TAB boundary: ALLOW under POSIX sed too (J1397A finding 2)" \
+    ALLOW "$(decide_posix "$(j_bash "grep x f 2>&1"$'\t'"| head")")"
+assert "word-glued >&2nd.txt: PASS under GNU sed (control)" \
+    PASS "$(decide "$(j_bash 'grep x f >&2nd.txt')")"
+assert "word-glued >&2nd.txt: PASS under POSIX sed too (J1397A finding 3)" \
+    PASS "$(decide_posix "$(j_bash 'grep x f >&2nd.txt')")"
 
 echo ""
 if [ "$FAILED" -eq 0 ]; then

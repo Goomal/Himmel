@@ -768,7 +768,8 @@ _console_dir_component_unsafe() {
         return 0
     fi
     local mode
-    mode=$(stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null)  # gnu-ok: GNU stat -c is paired with the BSD stat -f fallback on this same line
+    # #1413: BSD %Lp drops the sticky bit (/tmp -> 777); %Mp%Lp keeps it (1777), like GNU %a.
+    mode=$(stat -c %a "$1" 2>/dev/null || stat -f %Mp%Lp "$1" 2>/dev/null)  # gnu-ok: GNU stat -c is paired with the BSD stat -f fallback on this same line
     [ -n "$mode" ] || return 0  # unreadable bits: fail closed, treat as unsafe
     local oth="${mode: -1}" grp="${mode%?}"
     grp="${grp: -1}"

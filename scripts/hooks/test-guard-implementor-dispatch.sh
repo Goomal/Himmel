@@ -442,6 +442,149 @@ RC104=$(run_hook readonly-numbered-steps-write-code "$REG_CLAUDEX" "$(payload ge
 3. write the code for retries')")
 assert_rc "read-only + numbered-list 'write the code for retries' is governed (J1388A row 6)" 2 "$RC104"
 
+# J1398B ruling (console J, HIMMEL-3784, responding to J1398A Finding 2): the
+# "write up" idiom exemption is cut entirely -- main has no "up" idiom
+# support at all, and that is exactly why main governs "then write up your
+# summary module"/"then write up my notes file" (Finding 2's own examples).
+# "write up your findings" now falls through to gate_action and is GOVERNED
+# again, matching main; that loss is an accepted trade, not a regression.
+RC105=$(run_hook writeup-report "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Investigate why the suite is flaky and write up your findings.')")
+assert_rc "'then write up your findings' (no 'up' idiom support, matches main) governed (HIMMEL-3784, J1398B)" 2 "$RC105"
+
+RC106=$(run_hook write-overview "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Plan only: design the retry policy and write an overview.')")
+assert_rc "'and write an overview' (report brief) allows (HIMMEL-3784)" 0 "$RC106"
+assert_empty "write-overview report brief silent" "$(combined_output write-overview)"
+
+# J1398A (Finding 2, Critical): the adjective slot ("(a|an|the|your|my)
+# [a-z]+ (summary|report|...)") is dropped with no right-anchor replacement
+# (console J ruling, this round) -- "write a short summary" no longer
+# matches the bare determiner+noun branch and is GOVERNED again, matching
+# main. Accepted trade, not a regression.
+RC107=$(run_hook write-short-summary "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Locate where the lane router reads its config and write a short summary.')")
+assert_rc "'and write a short summary' (adjective slot dropped) governed (HIMMEL-3784, J1398A)" 2 "$RC107"
+
+# J1398A (Finding 3, Critical): the gate_text commit-history/edit-distance
+# strip is deleted entirely (its tightened boundary still admitted a literal
+# tab after a sentence-final mark), so gate_action is computed straight off
+# $text again, byte-identical to main. "commit history"/"edit distance" as a
+# research noun is GOVERNED again on both main and head; that loss is an
+# accepted trade, not a regression.
+RC108=$(run_hook commit-history "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Review the PR description and commit history for the parser module.')")
+assert_rc "'commit history' (gate_text strip deleted, matches main) governed (HIMMEL-3784, J1398A)" 2 "$RC108"
+
+RC109=$(run_hook edit-distance "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Research the parser and edit distance heuristics used elsewhere.')")
+assert_rc "'edit distance' (gate_text strip deleted, matches main) governed (HIMMEL-3784, J1398A)" 2 "$RC109"
+
+# codex-1 (round 1 panel, HIMMEL-3784): the commit-history/edit-distance
+# exclusions above must not be checked against the WHOLE brief -- an
+# unrelated "then/and commit history" or "then/and edit distance" phrase
+# elsewhere must not suppress a genuine, separate "then commit"/"then edit"
+# action transition in the same brief.
+RC110=$(run_hook commit-history-plus-action "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Then commit the change to the config file. Then commit history matters here.')")
+assert_rc "genuine 'then commit' action still governed despite unrelated 'then commit history' elsewhere (codex-1)" 2 "$RC110"
+
+RC111=$(run_hook edit-distance-plus-action "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Then edit the config file. Also and edit distance heuristics come up here.')")
+assert_rc "genuine 'then edit' action still governed despite unrelated 'and edit distance' elsewhere (codex-1)" 2 "$RC111"
+
+# codex-1 (round 2 panel, HIMMEL-3784): the write-clause exemption's
+# leading-words-before-noun match must not fire without a determiner --
+# two arbitrary bare words ("patch", "for") must not satisfy it just
+# because a report noun happens to follow later in the same clause. (A
+# "write code for report" phrasing also trips the independent bare
+# "write code" implementation detector, so it doesn't isolate this exact
+# regex bug on its own; "write patch for report" avoids that overlap.)
+RC112=$(run_hook write-patch-for-report "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Investigate the bug, then write patch for report.')")
+assert_rc "'then write patch for report' (genuine implementation, not a report noun phrase) still governed (codex-1 round 2)" 2 "$RC112"
+
+# J1398A (Finding 1, Critical): path_scope (the sentence-boundary truncation
+# codex round 4 added) is reverted to main's whole-write_tail veto -- a path
+# named in a genuinely unrelated LATER sentence is GOVERNED again, the same
+# as main, and the same as a path naming a real write target in a later
+# sentence (RC113 below). Accepted, ticketed known over-breadth (codex-1),
+# not a regression: correctness on the write-target direction matters more.
+RC110=$(run_hook write-summary-unrelated-later-path "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Research the parser, then write a summary. Also check scripts/router.sh for reference.')")
+assert_rc "path in an unrelated LATER sentence governs again (path_scope reverted, HIMMEL-3784, J1398A)" 2 "$RC110"
+
+RC111=$(run_hook write-summary-version-number "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Research the parser, then write a summary mentioning version 1.0 of the API.')")
+assert_rc "a version number is not a file extension (HIMMEL-3784, codex round 4)" 0 "$RC111"
+assert_empty "version-number brief silent" "$(combined_output write-summary-version-number)"
+
+RC112=$(run_hook commit-history-still-governed "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Investigate the routing logic, then commit the change to history.log.')")
+assert_rc "a real path after 'commit' still governs (HIMMEL-3784 exclusion stays narrow)" 2 "$RC112"
+
+RC113=$(run_hook write-summary-then-second-write "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Research the parser, then write a summary. Then create the file src/tok.ts.')")
+assert_rc "a genuine second write clause chained by 'Then' still governs (HIMMEL-3784, whole write_tail veto)" 2 "$RC113"
+
+RC114=$(run_hook modify-bare-object-still-governed "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Investigate the routing logic, then modify the config.')")
+assert_rc "'then modify <bare object>' still governs (HIMMEL-3784 exclusion is phrase-literal, not grammatical)" 2 "$RC114"
+
+# CodeRabbit (this PR, PR #1398): "then edit distance.py" is a genuine file
+# edit, not the descriptive "edit distance" phrase -- the exclusion's old
+# trailing boundary treated the "." before "py" as the end of the phrase and
+# stripped "then", losing the action trigger.
+RC115=$(run_hook edit-distance-dot-py-still-governed "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Investigate the routine, then edit distance.py.')")
+assert_rc "'then edit distance.py' (a real file, not the descriptive phrase) still governed (CodeRabbit)" 2 "$RC115"
+
+# CodeRabbit (this PR, PR #1398): the sentence-boundary "Z" placeholder is a
+# letter, so a genuine read-only chain ("write a summary. Then explain the
+# findings") produced "summary.Zthen...", which the extension check then
+# misread as a file extension and wrongly gated the chain.
+RC116=$(run_hook write-summary-then-explain-chain-allows "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Research the parser, then write a summary. Then explain the findings.')")
+assert_rc "'write a summary. Then explain the findings' (a read-only chain, not a file write) allows (CodeRabbit)" 0 "$RC116"
+assert_empty "write-summary-then-explain-chain-allows brief silent" "$(combined_output write-summary-then-explain-chain-allows)"
+
+# codex-1 (round 4 panel, HIMMEL-3784): "write up" was exempt unconditionally
+# regardless of what followed it, so a genuine implementation object after
+# "up" (not a report noun) still slipped through as a report brief. (A
+# trailing "to reproduce it" would independently trip the existing "to/into"
+# veto and mask this exact bug, so the fixture avoids it.) J1398B (console J
+# ruling, this round): the "up" idiom exemption itself is now cut entirely,
+# so this row is governed for a different reason than round 4 intended --
+# "write up" has no exemption at all any more -- but the assertion (GOVERNED)
+# is unchanged.
+RC117=$(run_hook write-up-shell-script-still-governed "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Investigate the bug, then write up a shell script.')")
+assert_rc "'then write up a shell script' (genuine implementation, not a report) still governed (codex-1 round 4)" 2 "$RC117"
+
+# codex-2 (round 4 panel, HIMMEL-3784): the commit-history/edit-distance
+# exclusion's trailing boundary accepted "/" as closing the descriptive
+# phrase, so a real path with a slash ("distance/parser.py") lost its "then"
+# the same way a bare extension did.
+RC118=$(run_hook edit-distance-slash-path-still-governed "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Investigate the routine, then edit distance/parser.py.')")
+assert_rc "'then edit distance/parser.py' (a real path, not the descriptive phrase) still governed (codex-2 round 4)" 2 "$RC118"
+
+# codex-1 (round 5 panel, HIMMEL-3784): a hyphen closed the boundary the
+# same way "." and "/" did, so a real hyphenated filename lost its "then".
+RC119=$(run_hook edit-distance-hyphen-path-still-governed "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Investigate the routine, then edit distance-parser.py.')")
+assert_rc "'then edit distance-parser.py' (a real file, not the descriptive phrase) still governed (codex-1 round 5)" 2 "$RC119"
+
+# J1398A (Opus judge, PR #1398, Finding 1, Critical) hand-written example.
+# The write TARGET is in a sentence after the report clause; path_scope used
+# to truncate at the first sentence boundary and miss it entirely. Reverted
+# to main's whole-write_tail veto (this round) -- governed again.
+RC120=$(run_hook j1398a-finding1-later-sentence-target "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Research the tokenizer, then write a summary. Afterwards create src/tok.ts with the new class.')")
+assert_rc "J1398A Finding 1 example: write target in a later sentence governs (path_scope reverted)" 2 "$RC120"
+
+# J1398A (Opus judge, PR #1398, Finding 2, Critical) hand-written examples.
+# Neither uses the adjective slot (determiner sits directly before the
+# noun) -- the escape was the now-deleted "write up" idiom exemption, not
+# the adjective slot. Cutting "write up" entirely (console J ruling, this
+# round) governs both again, matching main.
+RC121=$(run_hook j1398a-finding2-write-up-summary-module "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Explore X and then write up your summary module.')")
+assert_rc "J1398A Finding 2 example: 'then write up your summary module' governs ('up' idiom cut)" 2 "$RC121"
+
+RC122=$(run_hook j1398a-finding2-write-up-notes-file "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Investigate the bug, then write up my notes file.')")
+assert_rc "J1398A Finding 2 example: 'then write up my notes file' governs ('up' idiom cut)" 2 "$RC122"
+
+# J1398A (Opus judge, PR #1398, Finding 3, Critical) hand-written examples.
+# Both are a real verb+object continuation, not the descriptive noun phrase
+# the old gate_text strip tried to exempt; the strip is deleted entirely
+# (this round), so gate_action is computed straight off $text, same as main.
+RC123=$(run_hook j1398a-finding3-edit-distance-thresholds "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Investigate the fuzzy matcher, then edit distance thresholds in config/match.yaml to 0.8.')")
+assert_rc "J1398A Finding 3 example: 'then edit distance thresholds in config/match.yaml' governs (gate_text deleted)" 2 "$RC123"
+
+RC124=$(run_hook j1398a-finding3-commit-history-files "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-3784 dispatch' 'Review the branch, then commit history files to the repo.')")
+assert_rc "J1398A Finding 3 example: 'then commit history files to the repo' governs (gate_text deleted)" 2 "$RC124"
+
 RC5=$(run_hook worktree "$REG_CLAUDEX" "$(payload general-purpose sonnet 'HIMMEL-1513 worker' 'C:/repo/.claude/worktrees/fix-lane; Platforms tested: windows')")
 assert_rc "worktree/trailer-shaped dispatch refuses" 2 "$RC5"
 

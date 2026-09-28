@@ -214,6 +214,22 @@ fi
 if grepq "$text" -Eqi '(^|[^[:alnum:]_])(research|explore|investigate|analy[sz]e|review|audit|plan|design|locate|trace|explain|read-only)([^[:alnum:]_]|$)'; then
     research=1
 fi
+# J1398A (Opus judge, PR #1398, Finding 3, Critical): the "commit history"/
+# "edit distance" exclusion this comment used to describe (rounds 1, 3, 4, 5)
+# accepted a bare space -- and ":"/";" -- as closing the excluded phrase, so
+# it also fired on a genuine verb+object continuation in the SAME sentence,
+# e.g. "then edit distance thresholds in config/match.yaml to 0.8" or "then
+# commit history files to the repo" -- both real actions, not a research
+# noun, losing their "then"/"and" action trigger. A tightened allowlist
+# (sentence-final punctuation only, dropping the bare-space/":"/";" cases)
+# still passes adversarial whitespace shapes such as a literal tab standing
+# in for the space after the sentence-final mark. Per the judge's own
+# fallback ("if that is not simple and obviously correct, delete the strip
+# entirely instead"), the exclusion is dropped rather than re-patched a
+# sixth time: "then review the commit history" and "then analyze edit
+# distance heuristics" are GOVERNED again, matching main, and this whole
+# gate_text detour is gone -- gate_action is computed straight off $text,
+# same as main.
 if grepq "$text" -Eqi '(^|[^[:alnum:]_])(then|and)([[:space:][:punct:]]+)(implement|fix|land|apply|edit|modify|commit)([^[:alnum:]_]|$)'; then
     gate_action=1
 fi
@@ -240,11 +256,67 @@ fi
 # write/edit/etc. transition anywhere in that remainder is already covered
 # by the existing danger alternation (it includes "write"), so no separate
 # occurrence loop is needed -- one unbounded tail check subsumes it.
+# HIMMEL-3784: the round-3 exemption only recognized a report noun
+# immediately after "write"/"write a"/"write the", so "write an OVERVIEW"
+# still fell through to gate_action -- newly governing genuinely read-only
+# report briefs. Widened (round-4/round-2-panel-codex-1) to accept a
+# determiner+noun phrase. A one-word adjective slot between the determiner
+# and the noun was tried in that round ("write a SHORT summary") and dropped
+# again by J1398A below -- see the comment on the exemption's grepq call.
+# "write a short summary" is GOVERNED again; that loss is an accepted trade,
+# not a regression.
+#
+# J1398B ruling (console J, HIMMEL-3784, responding to J1398A Finding 2): a
+# round-4 "write up" idiom exemption used to live here too, so "write up
+# your findings" and bare "write up" were exempt. Cut entirely, not
+# right-anchored: main has no "up" idiom support at all, which is exactly
+# why main governs "then write up your summary module" and "then write up my
+# notes file" (J1398A's own Finding 2 examples) -- head only escaped them
+# because of this "up" exemption. Adding a right anchor instead would be
+# another exemption shape to get right, and the last two rounds already
+# spent their budget failing to make one safe. "write up your findings"
+# and bare "write up" are GOVERNED again, matching main; that loss is an
+# accepted trade, not a regression.
+#
+# codex (PR #1388 round 4): the extension pattern originally matched an
+# ordinary version number ("version 1.0"); the match now requires a letter
+# first, so a bare digit run ("1.0") does not satisfy it. This tightening
+# stays (J1398A "Suggested direction": "the letter-first extension
+# tightening can stay").
+#
+# J1398A (Opus judge, PR #1398, Finding 1, Critical): round 4 also scoped the
+# path/extension veto to path_scope -- the tail truncated at the first
+# sentence boundary -- so a code- or file-write TARGET named in a LATER
+# sentence of the same brief escaped the veto entirely, e.g. "Research the
+# tokenizer, then write a summary. Afterwards create src/tok.ts with the new
+# class." never saw "src/tok.ts" because path_scope cut the tail at the
+# first ". ". That is a regression against main, which never existed before
+# this PR (main has no path_scope at all): main checks the path/extension/
+# to-into veto against the WHOLE, unbounded write_tail. Reverted to that:
+# path_scope/protected_tail are gone, and the veto below reads $write_tail
+# directly. This re-accepts the round-4 codex-1 over-breadth (a path named
+# in a genuinely unrelated later sentence, e.g. "write a summary. Also check
+# scripts/router.sh for reference", is GOVERNED again even though it isn't a
+# write target) as a known, ticketed trade -- correctness on the write-target
+# direction matters more than that one over-governed shape.
 if grepq "$text" -Eqi '(^|[^[:alnum:]_])(then|and)([[:space:][:punct:]]+)write([^[:alnum:]_]|$)'; then
     lower_text=$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]')
     write_trigger=$(printf '%s' "$lower_text" | grep -Eo '(^|[^[:alnum:]_])(then|and)[[:space:][:punct:]]+write' | head -1)
     write_tail=${lower_text#*"$write_trigger"}
-    if [ -n "$write_trigger" ] && grepq "$write_tail" -Eq '^[[:space:]]+(a[[:space:]]+|the[[:space:]]+)?(summary|report|findings|notes|answer|overview|write-up)([^[:alnum:]_]|$)' && ! grepq "$write_tail" -Eq '/|\.[a-zA-Z0-9]+([^[:alnum:]]|$)|[[:space:]](to|into)[[:space:]]|(then|and)[[:space:][:punct:]]+(implement|fix|land|apply|edit|modify|commit|write)'; then
+    # J1398A (Finding 2, Critical): the one-word adjective/possessive slot
+    # between the determiner and the report noun ("(a|an|the|your|my)
+    # [a-z]+ (summary|report|...)") had no right anchor past the noun, so it
+    # admitted a code artifact disguised as an adjective+noun pair, e.g.
+    # "then write a new report module" matched "a"+"new"+"report" and never
+    # inspected "module". Dropped entirely, with no right-anchored
+    # replacement (per the judge's ruling, "no right-anchor variant" this
+    # round).
+    # J1398B (console J ruling): the "up" idiom exemption that used to sit in
+    # this alternation is also gone -- see the comment above this if-block.
+    # Only the bare determiner+noun branch remains.
+    if [ -n "$write_trigger" ] \
+        && grepq "$write_tail" -Eq '^[[:space:]]+((a|an|the)[[:space:]]+)?(summary|report|findings|notes|answer|overview|write-up)([^[:alnum:]_]|$)' \
+        && ! grepq "$write_tail" -Eq '/|\.[a-zA-Z][a-zA-Z0-9]*([^[:alnum:]]|$)|[[:space:]](to|into)[[:space:]]|(then|and)[[:space:][:punct:]]+(implement|fix|land|apply|edit|modify|commit|write)'; then
         :
     else
         gate_action=1

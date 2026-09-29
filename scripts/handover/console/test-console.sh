@@ -1935,4 +1935,17 @@ out75="$( cd "$tmp75/foreign-cwd" && env -u USER_SLUG -u FORGE HANDOVER_DIR="$ro
 check "75 slug is console.sh's own checkout's forge login, not the cwd's git user.name" \
     "$(printf '%s\n' "$out75" | grep -c "^would-doc: $root/forge-login-75/slug75/")" "1"
 
+# 76 (#1410, CR): an inherited GIT_DIR must not steer the slug either -- the cd
+# into console.sh's checkout is void if git still answers about GIT_DIR's repo
+# (no origin -> no forge login -> that repo's own user.name wins).
+tmp76="$tmp/t76"
+mkdir -p "$tmp76/foreign-cwd"
+git init -q "$tmp76/poison"
+git -C "$tmp76/poison" config user.name "Env Poison"
+out76="$( cd "$tmp76/foreign-cwd" && env -u USER_SLUG -u FORGE HANDOVER_DIR="$root" JIRA_PROJECT_KEY=DEMO \
+    CONSOLE_WORK_DIR="$tmp/defaultwork" GIT_CONFIG_GLOBAL="$tmp75/gitconfig" GH_CMD="$tmp75/bin/gh" \
+    GIT_DIR="$tmp76/poison/.git" bash "$C" new --dry-run --bucket slug76 2>&1 )"
+check "76 slug ignores an inherited GIT_DIR (checkout's forge login, not GIT_DIR's user.name)" \
+    "$(printf '%s\n' "$out76" | grep -c "^would-doc: $root/forge-login-75/slug76/")" "1"
+
 [ "$fails" -eq 0 ] && echo "ALL PASS" || { echo "$fails FAILED"; exit 1; }

@@ -409,6 +409,26 @@ test("detectCap lane semantics", () => {
   expect(detectCap(BENIGN, "glm")).toBe(false);
 });
 
+// --- HIMMEL-3848: a model: tag's opus/sonnet alias is pinned to the 5.5 full id ---
+test("spawnSpec pins the opus/sonnet tier aliases to the 5.5 ids, leaves haiku and the GLM alias alone (HIMMEL-3848)", () => {
+  const model = (s: { cmd: string[] }) => s.cmd[s.cmd.indexOf("--model") + 1];
+  expect(model(spawnSpec("p", undefined, undefined, "opus"))).toBe("claude-opus-5-5");
+  expect(model(spawnSpec("p", undefined, undefined, "sonnet"))).toBe("claude-sonnet-5-5");
+  expect(model(spawnSpec("p", undefined, undefined, "haiku"))).toBe("haiku");
+  // an inherited Object.prototype name is not a tier alias
+  expect(model(spawnSpec("p", undefined, undefined, "constructor"))).toBe("constructor");
+  // GLM's "opus" is a Z.ai alias (ANTHROPIC_DEFAULT_OPUS_MODEL), never an Anthropic id;
+  // the glm lane needs a key (CI has none), so set one and put the ambient value back
+  const ambientKey = process.env.ZAI_API_KEY;
+  process.env.ZAI_API_KEY = "k-3848";
+  try {
+    expect(model(spawnSpec("p", undefined, "glm"))).toBe(GLM_MODEL_ALIAS);
+  } finally {
+    if (ambientKey === undefined) delete process.env.ZAI_API_KEY;
+    else process.env.ZAI_API_KEY = ambientKey;
+  }
+});
+
 // --- HIMMEL-3482: the lane registry's effort reaches a native dispatch ---
 const REAL_LANES = JSON.parse(readFileSync(join(REPO_ROOT, "scripts", "lanes", "lanes.json"), "utf8"));
 const tierEffort = (id: string) => REAL_LANES.lanes.find((l: { id: string }) => l.id === id).effort;

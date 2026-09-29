@@ -121,7 +121,7 @@ Stages currently wired:
 - **Oxlint ratchets (pre-commit):** oxlint-complexity-ratchet (no NEW
   function above the audited max; HIMMEL-2154),
   oxlint-hardening-zero-violations (bug-class hardening — zero violations;
-  pinned oxlint 1.81.0, with root/cwd diagnostics; findings and tool/JSON
+  pinned oxlint 1.86.0, with root/cwd diagnostics; findings and tool/JSON
   failures block, while only a missing `bunx` fails open; HIMMEL-2163/2802).
 - **Doctor check-ID + shell platform-guard gates (pre-commit):**
   doctor-check-ids (`check-doctor-check-ids.sh`, scoped to
@@ -160,6 +160,15 @@ Stages currently wired:
   **ON by default**, including for an adopter with no `.env` at all;
   `TICKET_ID_REQUIRED=0` is the explicit opt-out. Merge/revert commits and the configurable comma-list
   `TICKET_ID_EXEMPT_AUTHORS` (default `dependabot[bot],dependabot`) are exempt.
+  **CI applies the ticket-ID half to internal committers only (HIMMEL-3806):**
+  HIMMEL is a private Jira, so an external contributor cannot cite an ID. The
+  allowlist is `scripts/ci/ticket-id-internal-authors.txt` (one GitHub login per
+  line, case-insensitive, default `yotamleo`) — add a login there to bind a new
+  internal committer. `check-commit-range.sh` and `check-pr-title.sh` compare
+  the PR author (`TICKET_ID_TRUSTED_AUTHOR`) against it; an unlisted author gets
+  a `NOTE` and skips only the ticket-ID check (conventional shape and every other
+  gate still apply). An empty login or an unreadable/empty allowlist keeps the ID
+  required (fail-safe), and the local commit-msg hook is unchanged.
   The `.pre-commit-config.yaml` entry must keep `pass_filenames: true` — the
   commit-msg stage's filename argument IS the message file. Handed none, the
   hook falls back to `.git/COMMIT_EDITMSG`; only when that fallback does not
@@ -3276,6 +3285,40 @@ on missing `jq`, malformed, or empty stdin. Claude lane only —
 `ScheduleWakeup` is a Claude Code tool, so `.codex/hooks.json` carries no twin.
 Suite: `scripts/hooks/test-guard-leg-wakeup.sh`.
 
+### `guard-agent-model.sh` — Fable model-override deny on Agent (HIMMEL-3847)
+
+Fires on `Agent`. Denies a `tool_input.model` matching a pattern in
+`scripts/guardrails/agent-model-policy.json` (`blocked_model_patterns`; today
+`fable` / `claude-fable-*`, matched case-insensitively), and a
+`console-judge` dispatch (`subagent_type` `console-judge`, plugin-namespaced or
+not) whose `model` is not Opus — its frontmatter tier — unless the prompt
+carries a line of its own `ESCALATION: <reason>` (the CLAUDE.md
+"Fable is the escalation target for ONE hard call" lane; a mid-sentence mention
+does not count). The reason must be real: empty, shorter than `min_reason_chars`
+(10) or a listed `placeholder_reasons` entry (`test`, `n/a`, `tbd`, …, compared
+after lowercasing and collapsing punctuation) is treated as no reason and still
+denies. A marker that rescues a would-be deny is echoed on stderr as
+`agent-model-escalation: … allowed by ESCALATION reason: <reason>` (exit 0) so
+overrides are auditable. **The block list is data, not code:** unblocking a
+future Fable is a one-line reviewed edit to the policy file (remove or narrow
+the pattern), not a hook rewrite; the suite proves a listed pattern denies and
+the same pattern removed allows. A missing or malformed policy file, or an
+invalid regex in it, fails open (the suite asserts the shipped file parses).
+HIMMEL-3630 retired Fable as the judge
+default (Opus 5.5 high measured ~2.7x cheaper per verdict, $8.23 vs $21.94,
+HIMMEL-3595); `headed-arm-leg.sh --judge` pins that for judge *sessions*, but an
+in-process `Agent` call passing `model: fable` silently overrides the agent's
+frontmatter, so this is the structural twin. The deny names HIMMEL-3630, the
+marker and the measured reason. No `model` (frontmatter/default applies), any
+other model, another tool, or an unparseable payload → exit 0 with **no output**
+(workflow nudge, not a security fence: fails open, like `guard-leg-wakeup.sh`).
+The suite asserts `console-judge.md` still says `model: opus`, so a tier change
+there fails it. Not covered: a `Workflow` script's `agent()` dispatches — no
+per-dispatch hook seam is known (they run inside the one `Workflow` tool call;
+`ponytail:` in the hook header, follow-up ticket in the PR body). Claude lane only — `.codex/hooks.json` has no PreToolUse `Agent`
+matcher, so there is no twin.
+Suite: `scripts/hooks/test-guard-agent-model.sh`.
+
 ### `read-clamp.sh` — read-clamp PreToolUse hook (HIMMEL-2993)
 
 Fires on `Read`/`Grep` and `Bash`, keyed on `HIMMEL_CONSOLE_LEG=1` (same gate as
@@ -4084,6 +4127,18 @@ always cheaper than a bricked session. Detail lives in
 [`scripts/observability/README.md`](../../scripts/observability/README.md)
 and [`../architecture.md`](../architecture.md), not duplicated here.
 
+### `log-classifier-denial.sh` — classifier-denial tap (HIMMEL-3724)
+
+Wired on `PermissionDenied`. Same fail-open, always-exit-0 contract as the taps
+above: it appends one redacted JSON line per denial to
+`~/.himmel/state/classifier-denials.jsonl` (session/tool/reason_tag, a capped
+and redacted `input_head`, and a normalised `input_sha` — never unredacted
+command text), and never blocks, delays, or `ask`s. `tick.sh` reads that log
+into a `denials=<leg>:<n>[:SHIP-STEP|REPEAT|PAUSE-RISK]` field so a console
+sees a repeated or escalating denial within one tick instead of only when a
+leg happens to report it. Paired smoke test:
+`scripts/hooks/test-log-classifier-denial.sh`.
+
 ### `auto-arm-on-subagent-cap.sh` — subagent-result cap watchdog (HIMMEL-276)
 
 Closes the detection gap left by `auto-arm-on-cap.sh`: when the cap hits
@@ -4652,6 +4707,7 @@ protection, which does not soften this reasoning: the two bindings still point
 opposite ways — this script's pin NARROWS what a human-only,
 `CLAUDECODE`-self-refusing chokepoint may touch, while merge-on-green's WIDENS a
 boundary an agent runs under.
+**Protection source (HIMMEL-3808).** The widened public-origin gate is satisfied by classic branch protection, by an effective ruleset, or by both, per `HIMMEL_PROTECTION_SOURCE` in `merge-on-green.sh`: `classic`, `ruleset`, `either` (default) or `both` (both must pass). Like `HIMMEL_PUBLIC_ORIGIN_NWO` it is a fixed literal in the script, never an env seam (`ruleset`/`either` are widening choices; an ambient variable must not steer a merge gate) — an adopter chooses by editing the line, and an unknown value refuses (exit 12, `unknown-protection-source=<value>`). Classic = `enforce_admins` on AND a non-empty required-status-checks list (unchanged). Ruleset = `rules/branches/<base>` carries at least one required status check AND every contributing ruleset (`rulesets/<id>`) is `enforcement: active` with an EMPTY `bypass_actors` — any bypass actor (admin `RepositoryRole`, `pull_request` or `always` mode) refuses, since it can merge past the required checks; an API error, null/non-array field or zero checks refuses too. `either` reads classic first and never touches the ruleset endpoints when classic passes. Both call sites (guard 2b and the fresh pre-merge re-read) share one function, and each success writes `PROTECTION-OK[-PREMERGE] source=classic|ruleset|classic+ruleset detail=…` to the audit log. With the live yotamleo/Himmel ruleset (`protect-main`, admin bypass `pull_request`) the ruleset path refuses and classic protection carries the merge; relaxing that bypass is an operator call.
 `merge-on-green.sh` exits 18 (GitHub-blocked, HIMMEL-3381) on a fresh pre-merge `BLOCKED` + `REVIEW_REQUIRED` policy read after green checks, an explicit GitHub base-branch policy / required-check / ruleset rejection at merge time, or `check-ci.sh` exit 5 (a required check never reported, or the required set is unreadable) — once, with one operator DM per (repo, PR, head) and no poll or retry (exit 17 is now the console-GO refusal only); if no automation identity can satisfy the required review, the merge is a human admin action; on this repo the operator relaxed `protect-main` on 2026-09-09 (HIMMEL-2887).
 The Jira auto-transition is opt-in per merge (HIMMEL-3143): without `--jira-transition` `merge-on-green.sh` merges, then only records `jira-transition=would-transition key=<KEY> status=<target>` on the `MERGED` audit line — no Jira comment, no transition — so the caller decides (a leg reads its brief's `completes-ticket: yes|no` line, `docs/handover/leg-preface.md` § Shipping — HIMMEL-3271); with the flag it comments and transitions the ticket named by the PR title's `[PROJ-N]` tag (never an Epic/Story; any unreadable step degrades to a `skip=…` result, never a failed merge). It used to fire on every merge and closed a ticket whose sibling work was still owed, which no "no other open PR" heuristic can detect, so it stays opt-in rather than heuristic. A PR carrying two ticket tags transitions only the first.
 It also exits 17 (`policy-refused phase=console-go`) when `HIMMEL_CONSOLE_LEG` is set — exported by `console-kit/headed-arm-leg.sh` into every console-spawned leg — and `go_gate` (`scripts/lib/go-gate.sh`, shared with `block-unresolved-cr-merge.sh`'s Console-GO gate and with `go.sh`; see there) finds `<handover_root>/.locks/go/<pr>.<certified head sha>` missing or not carrying `head=<that sha>` (a broken/truncated `go-gate.sh` refuses too: `phase=console-go-lib-missing` / `console-go-symbol-missing`); the gate runs before the marker clear and before `--dry-run`, so a refused leg mutates nothing and a dry run reports the refusal, and the merge itself pins `--match-head-commit` to that same certified sha; only the console writes it, via `console-kit/go.sh` (which refuses under the marker), and `scripts/chokepoints.json` registers the marker so a per-call `HIMMEL_CONSOLE_LEG=` prefix is denied (HIMMEL-2919). A `--judge` leg (HIMMEL-3133) is the same `HIMMEL_CONSOLE_LEG=1` process, so it is blocked from writing its own `GO` by this exact same gate — no separate `HIMMEL_CONSOLE_JUDGE` marker was added; "the judge is a leg" (design §3.2) means Guard E already covered it.

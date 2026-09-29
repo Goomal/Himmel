@@ -23,6 +23,7 @@ byte-identity cross-check).
 ```text
 ${HIMMEL_PROVENANCE_DIR:-$HOME/.himmel}/provenance.jsonl              # the ledger, mode 0600
 ${HIMMEL_PROVENANCE_DIR:-$HOME/.himmel}/provenance-backups/<iid>/     # pre-state copies, mode 0700
+${HIMMEL_PROVENANCE_DIR:-$HOME/.himmel}/retained-<UTC yyyymmddThhmmssZ>/   # `uninstall.sh --purge-state --keep-backups` output; see below
 ```
 
 One JSON object per line, appended with a single write. A reader must skip a
@@ -116,6 +117,60 @@ prov_end ok
 Test seams: `HIMMEL_PROVENANCE_NOW` fixes `t`; `prov_begin --iid` fixes the
 session id; `HIMMEL_PROVENANCE_DIR` relocates the ledger. Every test runs under a
 scratch `HOME` and never touches the real `~/.himmel`.
+
+## Reading verdicts and backup retention (HIMMEL-3787 S2a)
+
+`scripts/lib/provenance-read.sh` folds raw rows into units and derives a
+verdict (`prov_read_verdict`) uninstall acts on. Besides the base
+`remove ours` / `restore ours` / `keep no-backup` / `keep already-absent` /
+`keep user-modified` rows, two more can fire when live content (`L`) differs
+from himmel's post-install content (`ours`, `O`):
+
+- `keep already-base` — `L` equals the pre-install backup (`B`) even though it
+  differs from `O`: the unit is resolved and its backup may be released.
+- `surgical container-children` — for a whole-object `json-key` container unit
+  at exactly `/env` or `/hooks`: fires when every governed child unit under it
+  is itself clean (removed/restored this run, `keep already-base`, or
+  `keep already-absent` with no backup to hold). The container is never
+  restored or written whole; only its children are ever touched.
+
+`prov_read_unit_resolved` is the single predicate for "this unit's backup may
+be deleted": true for an outcome of `removed`/`restored` this session, or a
+verdict of `keep already-base` / `surgical *`. Every other state — including
+`keep user-modified` and bare `keep already-absent` — holds its backup, and
+`prov_read_prune_backups` / `uninstall.sh --purge-state`'s scan both refuse to
+delete a held backup.
+
+`--purge-state --keep-backups` no longer leaves the ledger deleted and
+`provenance-backups/` behind as a permanent orphan (J1393A Minor 1): it
+retain-moves both the ledger and the backups directory together into one
+`retained-<UTC yyyymmddThhmmssZ>/` directory, which is never deleted
+automatically. With that flag, a purge with held backups succeeds (nothing is
+lost); without it, a held backup still refuses, naming `--keep-backups` as the
+way out. The retain is all-or-nothing in order (J1408A F1/F2): the ledger moves
+only after the backups directory moved, so a failed backups move leaves both
+live; and the `retained-*` mkdir is retried only on a name collision — any other
+failure (permission denied, read-only fs) fails at once with the real error.
+
+### TTY `[r]estore` saves the live file first (HIMMEL-3787 S2b)
+
+On a real terminal without `--yes`, a `keep user-modified` unit with a readable
+backup offers `[k]eep` (default) or `[r]estore what you had before himmel`. A
+restore would overwrite the operator's current bytes, so `uninstall.sh` first
+copies the live file to `<path>.himmel-uninstall-backup` and prints that path;
+the unit is then restored and recorded `restored`. If the save cannot be made
+(an earlier sidecar or a symlink already sits at that path, or the copy fails)
+nothing is restored: the unit is recorded `failed` and its backup is kept.
+`--yes` never restores. The offer reads the terminal through fd 8, saved at
+start-up, because `ledger_apply_unit` runs inside heredoc loops where fd 0 is
+not a terminal.
+
+The same save guards `[d]elete`. A `keep user-modified` unit that himmel
+created (no readable backup) offers `[k]eep` (default) or `[d]elete anyway`.
+`[d]` copies the live file to the same sidecar and prints the path before it
+removes anything; if the save cannot be made the file is kept, the unit is
+recorded `failed` and the run exits non-zero. `--yes` and non-TTY runs never
+reach the prompt, so they never delete.
 
 ## Known limits
 

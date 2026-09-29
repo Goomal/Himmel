@@ -405,6 +405,53 @@ git -C "$FX" commit -q -m "chore: add no-deps suite, drop root package.json"
 out="$( cd "$FX" && bash "$IS" --run scripts/test-no-deps.sh 2>&1 )"; rc=$?
 if [ "$rc" -eq 0 ] && grepq "$out" 'unaffected'; then pass "--run: a suite with no package.json ancestor runs unchanged"; else fail "--run no-deps suite: rc=$rc out=$out"; fi
 
+# --- 21. HIMMEL-3798 round 3: --check --from-file reads verdict lines from a
+# path instead of stdin. -------------------------------------------------
+change scripts/machine-setup/uninstall-plugins.sh
+FF="$FX/from-file-21.txt"
+printf 'SUITE scripts/test-uninstall.sh = PASS\nSUITE scripts/lanes/tests/plugins.test.mjs = SKIP no node on this host\n' > "$FF"
+err="$( cd "$FX" && bash "$IS" --check "$range" --from-file "$FF" 2>&1 >/dev/null )"; rc=$?
+if [ "$rc" -eq 0 ]; then pass "--check --from-file with the impacted suite's verdict -> clean (rc0)"; else fail "--from-file full verdict set refused: rc=$rc err=$err"; fi
+
+# --- 22. --from-file without --check refuses (rc2). -------------------------
+( cd "$FX" && bash "$IS" "$range" --from-file "$FF" >/dev/null 2>&1 ); rc=$?
+if [ "$rc" -eq 2 ]; then pass "--from-file without --check refuses (rc2)"; else fail "--from-file sans --check: rc=$rc"; fi
+
+# --- 23. --from-file naming a missing path refuses (rc2), fails closed. -----
+err="$( cd "$FX" && bash "$IS" --check "$range" --from-file "$FX/nope-23.txt" 2>&1 >/dev/null )"; rc=$?
+if [ "$rc" -eq 2 ] && grepq "$err" 'does not exist'; then pass "--from-file missing path -> rc2, names the reason"; else fail "--from-file missing path: rc=$rc err=$err"; fi
+
+# --- 24. --from-file naming a symlink refuses (rc2) without reading through
+# it. `ln -s` silently falls back to a plain copy without admin/Developer-Mode
+# privilege on Windows — skip the assertion there (same probe idiom as T4e in
+# test-write-verdicts.sh). --------------------------------------------------
+printf 'SUITE scripts/test-uninstall.sh = PASS\n' > "$FX/real-24.txt"
+ln -s "$FX/real-24.txt" "$FX/link-24.txt" 2>/dev/null
+if [ -L "$FX/link-24.txt" ]; then
+    err="$( cd "$FX" && bash "$IS" --check "$range" --from-file "$FX/link-24.txt" 2>&1 >/dev/null )"; rc=$?
+    if [ "$rc" -eq 2 ] && grepq "$err" 'symlink'; then pass "--from-file symlinked path -> rc2, names the reason"; else fail "--from-file symlink: rc=$rc err=$err"; fi
+else
+    echo "SKIP 24: platform cannot create symlinks without elevated privilege"
+fi
+
+# --- 25. HIMMEL-3798 round 4: --from-file naming a genuinely empty regular
+# file is ALLOWED (same "no candidates" semantics as empty stdin, test 9) —
+# but --check's own n_impacted/n_missing reconciliation, computed independently
+# from the diff rather than from this file, still catches it as a missing
+# verdict (rc1) when the impacted set from `change scripts/machine-setup/
+# uninstall-plugins.sh` (test 21) is non-empty: this is the downstream catch
+# for a wrongly-empty --from-file when real candidates exist. -----------------
+: > "$FX/empty-25.txt"
+out="$( cd "$FX" && bash "$IS" --check "$range" --from-file "$FX/empty-25.txt" 2>&1 )"; rc=$?
+if [ "$rc" -eq 1 ] && grepq "$out" 'without a verdict'; then pass "--from-file empty path with a non-empty impacted set -> rc1, names the gap"; else fail "--from-file empty path against impacted suites: rc=$rc out=$out"; fi
+
+# --- 26. --from-file naming a genuinely empty file against a genuinely empty
+# impacted set is clean (rc0) — the case the runbook's own zero-candidate
+# instruction relies on. ------------------------------------------------------
+change docs/bar/other-26.md
+out="$( cd "$FX" && bash "$IS" --check "$range" --from-file "$FX/empty-25.txt" 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && grepq "$out" '0 impacted'; then pass "--from-file empty path with an empty impacted set -> rc0 '0 impacted'"; else fail "--from-file empty path against no impacted suites: rc=$rc out=$out"; fi
+
 echo
 if [ "$failures" -eq 0 ]; then echo "OK: all cases passed"; exit 0; fi
 echo "FAIL: $failures case(s) failed"

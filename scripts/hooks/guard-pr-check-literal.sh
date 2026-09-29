@@ -145,6 +145,24 @@ deny() {
     exit 2
 }
 
+# HIMMEL-3798 round 3: the inline quoted-heredoc and `< <file>` redirect
+# shapes this hook used to accept for the two STDIN-only /pr-check writers
+# (write-verdicts.sh, impacted-suites.sh --check) are CUT, not patched a
+# third time - a regex matching a line as bash grammar is only ever an
+# approximation, and each round's fix (widening an excluded-character class)
+# just narrowed the gap the next round found: round 2's separator gap, then
+# round 3's unquoted `#` swallowing the heredoc/redirect operator into a real
+# bash comment while the guard's regex still matched the line as a valid
+# heredoc header, so a "body" line the guard treated as inert stdin data
+# actually ran as a separate shell command. The sanctioned shape now is
+# `--from-file <path>` only: the caller writes the verdict lines with a real
+# editing tool first, then runs ONE ordinary literal command naming the path
+# as a plain argument - nothing for a regex to approximate bash's grammar
+# for. A pipe into either writer is still denied below (a second command
+# that can rewrite what runs before the writer does).
+# shellcheck disable=SC2016 # regex, matched as text
+FROM_FILE_TOKEN_RE='--from-file[[:space:]]+([^[:space:]]+)'
+
 input=""
 IFS= read -r -d '' input 2>/dev/null || true
 case "$input" in
@@ -929,6 +947,26 @@ case "$flat" in
         ;;
 esac
 
+# HIMMEL-3798 codex-1: the anchor-prefix exemption above trusts the COMMAND
+# TEXT's "$HIMMEL_REPO/..." shape unconditionally, without checking that this
+# hook's own actual HIMMEL_REPO environment value is one a real shell would
+# resolve to himmel's checkout. On Git Bash an unset/empty HIMMEL_REPO makes
+# "$HIMMEL_REPO/scripts/cr/pr-check-step0.sh" resolve to a root-relative path
+# an ordinary user can plant (main's pr-check.md documents the same
+# unset/empty hazard for this exact fence) - a regression from the prior
+# two-fence flow, which gated the anchor fence on a passing
+# `printenv HIMMEL_REPO | grep .` first. Require it non-empty, absolute, and
+# actually himmel's checkout before honouring the exemption at all.
+if [ "$himmel_anchor_prefix" -eq 1 ]; then
+    himmel_repo_ok=0
+    case "${HIMMEL_REPO:-}" in
+        /*) [ -f "$HIMMEL_REPO/scripts/cr/pr-check-step0.sh" ] && himmel_repo_ok=1 ;;
+    esac
+    if [ "$himmel_repo_ok" -eq 0 ]; then
+        deny "HIMMEL_REPO is unset, empty, not absolute, or its checkout has no scripts/cr/pr-check-step0.sh, so the \"\$HIMMEL_REPO/...\" anchor-prefix exemption cannot be trusted; export HIMMEL_REPO to himmel's primary checkout in your launching shell, or run the canonical fence non-anchor form."
+    fi
+fi
+
 # glob_is_literal_elsewhere <raw-token> <normalised> - a glob operand that
 # cannot name a target (HIMMEL-3433): its directory part is literal (no glob,
 # brace, $, ~, .., // or /./) and is not scripts/cr, or it is a bare * (or
@@ -1083,6 +1121,22 @@ shown=${shown:0:200}
     || deny "'$unresolved' does not resolve to this root's scripts/cr/ or scripts/handover/ writer by its text alone (a glob, a variable, or a path outside the root), so the bytes it runs cannot be checked."
 [ "$chdir" -eq 0 ] \
     || deny "the command changes directory, so the relative path does not resolve against the cwd the conditions are checked in."
+# HIMMEL-3798 round 3 disposition 2: --from-file's value must be a single
+# literal token - no shell metacharacter, quote or glob, no whitespace - so
+# what the writer actually opens can never diverge from what this text scan
+# saw. Checked against the RAW $cmd (not $flat, which has already dropped
+# quotes) so a quoted metacharacter is not invisible to this scan.
+case " $entries " in
+    *' write-verdicts.sh '*|*' impacted-suites.sh '*)
+        if [[ "$cmd" =~ $FROM_FILE_TOKEN_RE ]]; then
+            ff_val=${BASH_REMATCH[1]}
+            case "$ff_val" in
+                *[\;\&\|\(\)\<\>\`\$\#\'\"\*\?\[\]\~]*)
+                    deny "the --from-file path '$ff_val' is not a single literal token (a shell metacharacter, quote or glob is not accepted)." ;;
+            esac
+        fi
+        ;;
+esac
 # Only one simple command can be checked: the conditions hold for the bytes
 # at match time, and another command in the same call (cp, a redirect, a
 # pipe) can rewrite them before the script runs; a wrapper's operands can

@@ -38,7 +38,9 @@
 #
 # API (after sourcing):
 #   suite_sem_acquire <label> <retry-hint>  -> 0 slot held (or re-entrant),
-#                                              75 busy, 2 bad config
+#                                              75 busy, 2 bad config (incl. a
+#                                              non-contention reclaim-guard
+#                                              mkdir failure, HIMMEL-3791)
 #   suite_sem_release                        -> frees only a slot WE acquired
 # bash 3.2-safe; set -e/-u safe. ASCII only.
 
@@ -131,7 +133,13 @@ _suite_sem_stale() {
     case "$SO_PID" in
         ''|*[!0-9]*) SUITE_SEM_STALE_WHY='owner record has no valid pid'; return 0 ;;
     esac
-    proc_tree_process_identity_matches "$SO_PID" "$SO_ID" || rc=$?
+    # HIMMEL-3778: SO_ID can be empty (the ps probe failed at acquire time,
+    # see _suite_sem_try below) -- proc_tree_process_identity_matches alone
+    # always answers 2 (unavailable) for an empty expected, which made a
+    # confirmed-dead holder with no recorded identity reclaimable ONLY by the
+    # TTL. proc_tree_liveness_matches falls back to identity-free liveness in
+    # that case, so a dead holder is still confirmed dead even without one.
+    proc_tree_liveness_matches "$SO_PID" "$SO_ID" || rc=$?
     if [ "$rc" -eq 1 ]; then
         SUITE_SEM_STALE_WHY="owner pid $SO_PID is gone or now names another process"
         return 0
@@ -161,9 +169,21 @@ _suite_sem_stale() {
 _suite_sem_reclaim() {
     local slot="$1" guard="$1.reclaim" tomb
     if ! mkdir "$guard" 2>/dev/null; then
-        # A reclaimer killed mid-way leaves the guard behind; free it late.
-        [ -n "$(find "$guard" -maxdepth 0 -mmin +1 2>/dev/null)" ] && rmdir "$guard" 2>/dev/null  # gnu-ok: -maxdepth/-mmin are BSD find too
-        return 1
+        if [ -d "$guard" ]; then
+            # A reclaimer killed mid-way leaves the guard behind; free it late.
+            [ -n "$(find "$guard" -maxdepth 0 -mmin +1 2>/dev/null)" ] && rmdir "$guard" 2>/dev/null  # gnu-ok: -maxdepth/-mmin are BSD find too
+            return 1
+        fi
+        # No guard at all: mkdir failed for a reason OTHER than another
+        # reclaimer holding it (EACCES, a missing parent, ...). The holder may
+        # also have RELEASED it between our failed mkdir and that test, so
+        # retry once; only a second failure with the guard still absent is
+        # permanent -> return 3 (HIMMEL-3791). _suite_lock_reclaim in
+        # scripts/ci/run-shell-tests.sh keeps this same shape.
+        if ! mkdir "$guard" 2>/dev/null; then
+            [ -d "$guard" ] && return 1
+            return 3
+        fi
     fi
     if _suite_sem_stale "$slot"; then
         tomb="$slot.tomb.$$.$RANDOM"
@@ -188,7 +208,10 @@ _suite_sem_held_ok() {
     _suite_sem_read_owner "$held" || return 1
     case "$SO_PID" in ''|*[!0-9]*) return 1 ;; esac
     _suite_sem_is_ancestor "$SO_PID" || return 1
-    proc_tree_process_identity_matches "$SO_PID" "$SO_ID"
+    # HIMMEL-3778: an empty SO_ID (failed ps probe at acquire) must not refuse
+    # our OWN re-entrant child -- fall back to identity-free liveness, same as
+    # _suite_sem_stale above.
+    proc_tree_liveness_matches "$SO_PID" "$SO_ID"
 }
 
 # _suite_sem_try <slot> <label> -- take <slot>; 0 on success.
@@ -230,7 +253,7 @@ _suite_sem_busy_report() {
 }
 
 suite_sem_acquire() {
-    local label="$1" hint="$2" dir n wait poll deadline i
+    local label="$1" hint="$2" dir n wait poll deadline i rc
     if _suite_sem_held_ok; then
         return 0
     fi
@@ -250,7 +273,12 @@ suite_sem_acquire() {
         while [ "$i" -le "$n" ]; do
             _suite_sem_try "$dir/slot-$i" "$label" && return 0
             if _suite_sem_stale "$dir/slot-$i"; then
-                _suite_sem_reclaim "$dir/slot-$i" || true
+                # if/else keeps a contention rc 1 from tripping a set -e caller.
+                if _suite_sem_reclaim "$dir/slot-$i"; then rc=0; else rc=$?; fi
+                if [ "$rc" -eq 3 ]; then
+                    printf 'ERR suite-semaphore: cannot create the reclaim guard %s.reclaim (permission or IO failure, not contention)\n' "$dir/slot-$i" >&2
+                    return 2
+                fi
                 _suite_sem_try "$dir/slot-$i" "$label" && return 0
             fi
             i=$((i + 1))

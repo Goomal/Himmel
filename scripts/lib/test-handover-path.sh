@@ -449,6 +449,43 @@ else
     echo "SKIP T10f: this host's realpath has no -m (no GNU reference to compare against)"
 fi
 
+# T11 (HIMMEL-3719): macOS folds identity case only when the lowercased path is
+# the SAME file (APFS case-insensitive). A hard link stands in for that on any
+# host: Foo11.md and foo11.md are one inode. Linux/Windows output is unchanged.
+# ponytail: hard link + lowercase symlink stand in for APFS, so the real
+# case-insensitive volume is only proven by the macOS shard (G1.4b), HIMMEL-3719.
+T11_DIR="$TMP/t11"; mkdir -p "$T11_DIR"
+printf 'x\n' > "$T11_DIR/Foo11.md"
+ln "$T11_DIR/Foo11.md" "$T11_DIR/foo11.md" 2>/dev/null
+printf 'x\n' > "$T11_DIR/Bar11.md"
+printf 'y\n' > "$T11_DIR/bar11.md"
+printf 'x\n' > "$T11_DIR/Baz11.md"
+# The fold lowercases the WHOLE path (APFS folds directories too), so a mktemp
+# dir with capitals needs a lowercase alias to stand in for that.
+_hp_ascii_lower "$TMP"; T11_ALIAS="$_HP_LOWER"
+T11_ALIAS_MADE=0
+T11_ALIAS_PARENT="${T11_ALIAS%/*}"
+[ "$T11_ALIAS" = "$TMP" ] || { mkdir -p "$T11_ALIAS_PARENT" && ln -s "$TMP" "$T11_ALIAS" 2>/dev/null && T11_ALIAS_MADE=1; }
+if [ "$T11_DIR/Foo11.md" -ef "$T11_DIR/foo11.md" ]; then
+    assert_eq "T11a macos folds a case variant that is the same file" \
+        "$(PLATFORM=macos _arm_identity_path "$T11_DIR/foo11.md")" "$(PLATFORM=macos _arm_identity_path "$T11_DIR/Foo11.md")"
+    assert_eq "T11b linux keeps the case (byte-identical to realpath)" \
+        "$(_arm_realpath "$T11_DIR/Foo11.md")" "$(PLATFORM=linux _arm_identity_path "$T11_DIR/Foo11.md")"
+else
+    echo "SKIP T11a/b: this host cannot hard-link"
+fi
+# T11c/d need a case-SENSITIVE volume: on APFS Bar11.md/bar11.md are one file
+# and baz11.md resolves to Baz11.md, so their premise cannot be built there.
+if [ "$T11_DIR/Bar11.md" -ef "$T11_DIR/bar11.md" ] || [ -e "$T11_DIR/baz11.md" ]; then
+    echo "SKIP T11c/d: this volume is case-insensitive (T11a covers the fold)"
+else
+    assert_eq "T11c macos keeps case when the lowercase name is a DIFFERENT file" \
+        "$(_arm_realpath "$T11_DIR/Bar11.md")" "$(PLATFORM=macos _arm_identity_path "$T11_DIR/Bar11.md")"
+    assert_eq "T11d macos keeps case when the lowercase name does not exist" \
+        "$(_arm_realpath "$T11_DIR/Baz11.md")" "$(PLATFORM=macos _arm_identity_path "$T11_DIR/Baz11.md")"
+fi
+if [ "$T11_ALIAS_MADE" = 1 ]; then rm -f "$T11_ALIAS"; rmdir -p "$T11_ALIAS_PARENT" 2>/dev/null || true; fi
+
 if [ "$FAILED" -gt 0 ]; then
     echo "---"
     echo "FAIL $FAILED case(s)"

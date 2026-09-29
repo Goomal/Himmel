@@ -29,6 +29,10 @@
 # call -- exactly how proc_tree_process_alive invokes it -- so the call still
 # goes through the real proc_tree_process_alive, only the OS-level kill(2)
 # underneath is faked.
+# shellcheck disable=SC2218  # T11 below re-defines proc_tree_process_identity_matches
+# (already sourced from proc-tree.sh, real at T4-T6b) as a stub to confirm
+# delegation; shellcheck's whole-file scan misreads the earlier REAL calls as
+# forward references to that later local redefinition.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -143,6 +147,77 @@ kill() {
 rc=0; proc_tree_process_alive 4242 || rc=$?
 check "T8 posix arm: simulated EPERM -> probe unavailable (2), NOT confirmed" "$rc" "2"
 unset -f kill
+
+# --- proc_tree_liveness_matches (HIMMEL-1838/HIMMEL-3778) ---------------------
+# An empty expected identity means the identity probe FAILED AT RECORD TIME
+# (e.g. `ps` unavailable when the owner was branded), not that the pid is
+# unprobeable now -- so liveness_matches must fall back to the identity-free
+# proc_tree_process_alive rather than returning identity_matches' unconditional
+# 2 for an empty expected (line 147 above). Still the POSIX (kill -0) arm.
+
+# T9: empty identity + a pid confirmed gone via the real kill builtin -> falls
+# back to proc_tree_process_alive's confirmed-absent contract (rc 1), not the
+# "probe unavailable" rc 2 that proc_tree_process_identity_matches alone would
+# give an empty expected.
+rc=0; proc_tree_liveness_matches 2147483647 "" || rc=$?
+check "T9 liveness_matches: empty identity + confirmed-gone pid -> rc 1" "$rc" "1"
+
+# T10: empty identity + this test's own live pid ($$) -> rc 0. A dead holder's
+# empty-identity slot must not block reclaim, but a genuinely live one -- e.g.
+# a holder's own child probing its ancestor -- must not be refused either.
+rc=0; proc_tree_liveness_matches $$ "" || rc=$?
+check "T10 liveness_matches: empty identity + live pid -> rc 0 (own-process not refused)" "$rc" "0"
+
+# T11: a NON-empty expected identity must delegate to
+# proc_tree_process_identity_matches rather than reimplementing its logic --
+# stub it to a distinguishable rc and confirm liveness_matches propagates that
+# exact rc unchanged, proving delegation rather than a second code path.
+# shellcheck disable=SC2317,SC2329  # invoked indirectly by proc_tree_liveness_matches below.
+proc_tree_process_identity_matches() { return 1; }
+rc=0; proc_tree_liveness_matches 4242 "some-identity" || rc=$?
+check "T11 liveness_matches: non-empty identity delegates to identity_matches (rc 1 propagated)" "$rc" "1"
+unset -f proc_tree_process_identity_matches
+
+# --- proc_tree_process_identity: TZ/COLUMNS independence (HIMMEL-3791 judge
+# finding J1396A). The identity is `ps -o lstart= -o command=`; lstart is
+# printed in the caller's TZ and command is truncated to the caller's COLUMNS,
+# so a live holder recorded in one environment looked "dead" to a contender
+# reading it in another -- a false-positive double-acquire. Real background
+# process, real ps, no stubs.
+#
+# T6/T11 above stub proc_tree_process_identity /
+# proc_tree_process_identity_matches then `unset -f` them -- unset -f removes
+# a function outright, it does not restore whatever definition preceded the
+# stub, so the REAL implementations sourced at the top of this file are gone
+# from here on unless re-sourced.
+# shellcheck source=proc-tree.sh
+# shellcheck disable=SC1091
+. "$HERE/proc-tree.sh"
+
+sleep 60 & livepid=$!
+
+# T12: identity recorded under TZ=Asia/Jerusalem, judged under TZ=UTC, must
+# still match -- before the fix this diverged and liveness_matches judged a
+# live process dead (rc 1).
+recorded=$(TZ=Asia/Jerusalem proc_tree_process_identity "$livepid")
+check "T12 identity: ps probe recorded a nonempty identity (not a vacuous pass)" "$([ -n "$recorded" ] && echo 1 || echo 0)" "1"
+rc=0; TZ=UTC proc_tree_liveness_matches "$livepid" "$recorded" || rc=$?
+check "T12 identity: TZ mismatch (recorded JLM, judged UTC) still matches live pid -> rc 0" "$rc" "0"
+kill "$livepid" 2>/dev/null
+
+# T13: identity recorded under a narrow COLUMNS, judged under a wide one, must
+# still match -- before the fix, ps truncated `command` to the narrower width
+# and the two strings diverged. A short argv (e.g. bare `sleep 60`) is already
+# shorter than a narrow COLUMNS and never triggers ps's truncation, so this
+# needs a long argv to actually exercise the width cut.
+long_arg=$(printf 'A%.0s' $(seq 1 200))
+bash -c 'while :; do sleep 5; done' "$long_arg" & livepid=$!
+recorded=$(COLUMNS=20 proc_tree_process_identity "$livepid")
+check "T13 identity: ps probe recorded a nonempty identity (not a vacuous pass)" "$([ -n "$recorded" ] && echo 1 || echo 0)" "1"
+rc=0; COLUMNS=200 proc_tree_liveness_matches "$livepid" "$recorded" || rc=$?
+check "T13 identity: COLUMNS mismatch (recorded 20, judged 200) still matches live pid -> rc 0" "$rc" "0"
+
+kill "$livepid" 2>/dev/null
 
 if [ "$fails" -eq 0 ]; then
     echo "ALL PASS"

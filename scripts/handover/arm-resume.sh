@@ -1239,7 +1239,19 @@ if [ "$DRY_RUN" -eq 0 ]; then
         # bank-status READ.
         _arm_fleet_leg="${HANDOVER_PATH:-arm-resume}"
         _arm_fleet_leg="${_arm_fleet_leg//\//-}"
-        _arm_fleet_token="$(CADENCE_BANK_LEG="$_arm_fleet_leg" CADENCE_BANK_LAUNCH=1 CADENCE_BANK_CALLER_PID="$$" bash "$_ARM_BANK_PREFLIGHT" </dev/null)"
+        # HIMMEL-3846: only SKIPPED-FLEET is read from this call, and the producer
+        # refresh it runs rewrites the shared usage cache under the CALLER's
+        # identity (a test suite arming for real under a fixture
+        # CLAUDE_ACCOUNT_CONFIG stamped the live cache 233bed9c... and turned
+        # every bank read on the host BANK-UNKNOWN). So skip the refresh -- EXCEPT
+        # when the slot lookup below (smart via the live cache, or auto) reads that
+        # cache by mtime and relies on this refresh to have made it fresh.
+        _arm_skip_refresh=1
+        case "$RESUME_TIME" in
+            smart) [ -n "${RESUME_SLOT_CACHE:-}" ] || _arm_skip_refresh="" ;;
+            auto) _arm_skip_refresh="" ;;
+        esac
+        _arm_fleet_token="$(CADENCE_BANK_LEG="$_arm_fleet_leg" CADENCE_BANK_LAUNCH=1 CADENCE_BANK_CALLER_PID="$$" CADENCE_BANK_SKIP_REFRESH="${_arm_skip_refresh:-${CADENCE_BANK_SKIP_REFRESH:-}}" bash "$_ARM_BANK_PREFLIGHT" </dev/null)"
         if [ "$_arm_fleet_token" = SKIPPED-FLEET ]; then
             echo "ERR arm-resume: fleet-size cap reached (bank-preflight: SKIPPED-FLEET) — refusing to arm another leg. Override with FLEET_CAP_OK=1 in the LAUNCHING shell." >&2
             exit 22
@@ -6400,7 +6412,8 @@ cat <<EOF
   it just armed, exit before the fire time -- the relaunch starts a NEW
   claude on that same document, and two processes on one handover can
   race (file races, doubled API spend, double-pushes from auto-commit).
-  Exiting also gives the relaunch a clean prompt cache.
+  (Exiting does not change the relaunch's prompt cache: a new session's
+  first turn is normally warm -- docs/internals/prompt-cache.md.)
   Arming a different handover (e.g. a console arming a leg)? No exit
   is needed.
 ================================================================

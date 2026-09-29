@@ -25,6 +25,8 @@ trap 'rm -rf "$TMP"' EXIT
 . "$SCRIPT_DIR/../lib/fleet-slots-shield.sh"
 fleet_slots_shield "$TMP" || exit 1
 export ARM_RESUME_LOG_DIR="$TMP/arm-logs"
+# HIMMEL-3846: keep the real bank-preflight's usage-cache refresh off the live cache.
+export CADENCE_BANK_CACHE="$TMP/bank-cache.json" CLAUDE_USAGE_CACHE="$TMP/bank-cache.json"
 export SKILL_TELEMETRY_DIR="$TMP/telemetry"
 export WORKSPACE_TRUST_CONFIG="$TMP/claude-trust.json"
 export HIMMEL_FLOW_RUNS_LEDGER="$TMP/flow-runs.jsonl"
@@ -98,13 +100,26 @@ run_body() {  # $1 = shell binary, $2 = body, $3 = rec file
     env PATH="$STUB_BIN:$PATH" CLAUDE_REC="$3" "$1" -c "$2" </dev/null >"$TMP/job.out" 2>&1
 }
 
-HAVE_SCRIPT=0; command -v script >/dev/null 2>&1 && HAVE_SCRIPT=1
+HAVE_SCRIPT=0; command -v script >/dev/null 2>&1 && HAVE_SCRIPT=1; HAVE_PTY=$HAVE_SCRIPT
+# Capability probe (macOS): BSD script(1) needs a real tty on its stdin
+# (`tcgetattr/ioctl: Operation not supported`), which a CI runner does not
+# have, so no pty can be made there. Probe through the lib itself: if it cannot
+# run `true` under a pty, the pty-dependent cases below cannot run on this host.
+if [ "$HAVE_SCRIPT" -eq 1 ] && [ -r "$LIB" ]; then
+    # shellcheck source=/dev/null
+    if ! ( . "$LIB"; _himmel_pty_run true </dev/null >/dev/null 2>&1 ); then
+        HAVE_PTY=0
+        # ponytail: real-pty cases stay unproven wherever BSD script(1) needs a
+        # tty on stdin (macOS CI); a pty-allocating seam would lift it, HIMMEL-3719.
+        echo "SKIP P1-P6/Q1-Q2: script(1) cannot allocate a pty on this host (no controlling tty)"
+    fi
+fi
 
 BODY=$(at_body)
 assert_contains "P0 dry-run yields an at body" "cd " "$BODY"
 assert_contains "P0 body still launches claude with the leg argv" "--autocompact" "$BODY"
 
-if [ "$HAVE_SCRIPT" -eq 1 ]; then
+if [ "$HAVE_PTY" -eq 1 ]; then
     REC="$TMP/rec1"; run_body sh "$BODY" "$REC"; rc=$?
     R=$(cat "$REC" 2>/dev/null)
     assert_contains "P1 claude sees a tty on stdin under an at-shaped job" "tty0=yes" "$R"
@@ -134,7 +149,7 @@ if [ -r "$LIB" ]; then
     # shellcheck disable=SC2016  # the stub's own $@/$a must stay literal here
     printf '#!/usr/bin/env bash\nfor a in "$@"; do printf "[%%s]\\n" "$a"; done > "$CLAUDE_REC"\nexit 0\n' > "$STUB_BIN/claude"
     export CLAUDE_REC="$ARGS_REC" PATH="$STUB_BIN:$PATH"
-    if [ "$HAVE_SCRIPT" -eq 1 ]; then
+    if [ "$HAVE_PTY" -eq 1 ]; then
         EVIL="\$(touch $TMP/pwned)"
         _himmel_pty_run claude "it's" 'a "b"' "$EVIL" '' 'x y  z' </dev/null
         GOT=$(cat "$ARGS_REC")

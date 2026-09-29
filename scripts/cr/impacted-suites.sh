@@ -20,8 +20,11 @@
 #       test-*.sh (what run-shell-tests.sh can run); the *.test.mjs / .js / .ts
 #       suites are listed without it and are run by their own runner — see
 #       --runner below for which one.
-#   impacted-suites.sh --check <base>..<head>
-#       The verdict gate. Reads one line per impacted suite from stdin:
+#   impacted-suites.sh --check <base>..<head> [--from-file <path>]
+#       The verdict gate. Reads one line per impacted suite from stdin, or
+#       from --from-file <path> when given (HIMMEL-3798 round 3: replaces the
+#       cut inline heredoc/`<` redirect shapes — write the lines with a real
+#       editing tool, then run ONE simple literal command naming the path):
 #           SUITE <path> = PASS
 #           SUITE <path> = SKIP <reason>          (reason required)
 #           SUITE <path> = BLOCKED <denial>       (denial required)
@@ -129,6 +132,9 @@ runner_for() {
         marketplace/plugins/luna-correlate/*.test.mjs|marketplace/plugins/luna-correlate/*.test.js|marketplace/plugins/luna-correlate/*.test.ts)
             rel="${path#marketplace/plugins/luna-correlate/}"
             printf 'cd marketplace/plugins/luna-correlate && bun test %q\n' "$rel" ;;
+        marketplace/plugins/telegram-himmel/*.test.mjs|marketplace/plugins/telegram-himmel/*.test.js|marketplace/plugins/telegram-himmel/*.test.ts)
+            rel="${path#marketplace/plugins/telegram-himmel/}"
+            printf 'cd marketplace/plugins/telegram-himmel && bun test %q\n' "$rel" ;;
         *)
             echo "impacted-suites.sh: --runner has no CI-runner mapping for '${path}' — refusing to guess" >&2
             return 2 ;;
@@ -168,6 +174,7 @@ luna-vitals|bun-test|scripts/luna-vitals && bun install
 telegram-suites|bun-test|bun test scripts/telegram --dots
 vault-suites|bun-test|bun test scripts/vault/tests --dots
 luna-correlate|bun-test|marketplace/plugins/luna-correlate && bun install
+telegram-himmel|bun-test|marketplace/plugins/telegram-himmel && bun install
 EOF
 }
 
@@ -316,10 +323,14 @@ range=""
 runner_path=""
 runner_check_mode=0
 run_path=""
+from_file=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --check) check=1; shift ;;
         --shell) shell_only=1; shift ;;
+        --from-file)
+            [ "$#" -ge 2 ] || { echo "impacted-suites.sh: --from-file requires a path" >&2; exit 2; }
+            from_file="$2"; shift 2 ;;
         --runner)
             [ "$#" -ge 2 ] || { echo "impacted-suites.sh: --runner requires a path" >&2; exit 2; }
             runner_path="$2"; shift 2 ;;
@@ -336,6 +347,29 @@ while [ "$#" -gt 0 ]; do
             range="$1"; shift ;;
     esac
 done
+
+if [ -n "$from_file" ] && [ "$check" -eq 0 ]; then
+    echo "impacted-suites.sh: --from-file requires --check" >&2; exit 2
+fi
+# HIMMEL-3798 round 4: same fail-closed contract as write-verdicts.sh's
+# --from-file — refuse a symlinked, missing or unreadable path before the
+# --check awk ever reads it. A genuinely empty regular file is NOT refused:
+# /pr-check's own runbook mandates an empty --from-file when zero suites are
+# impacted, and --check's own n_impacted/n_missing reconciliation below
+# already catches an empty file paired with a NON-empty impacted set (it is
+# computed independently, from the diff, not from this file).
+if [ -n "$from_file" ]; then
+    if [ -L "$from_file" ]; then
+        echo "impacted-suites.sh: refusing to read through a symlink at $from_file" >&2; exit 2
+    fi
+    if [ ! -f "$from_file" ]; then
+        echo "impacted-suites.sh: --from-file path does not exist or is not a regular file: $from_file" >&2; exit 2
+    fi
+    if [ ! -r "$from_file" ]; then
+        echo "impacted-suites.sh: --from-file path is not readable: $from_file" >&2; exit 2
+    fi
+    exec < "$from_file"
+fi
 
 if [ -n "$runner_path" ]; then
     runner_for "$runner_path"

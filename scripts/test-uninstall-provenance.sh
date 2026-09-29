@@ -227,7 +227,19 @@ run_uninstall() {
     CLAUDE_CALL_LOG="$CASE_CLAUDE_LOG" STUB_PLUGINS_JSON="$CASE_PLUGINS_JSON" \
     STUB_MARKETPLACES_JSON="$CASE_MARKETPLACES_JSON" \
     PATH="$SUITE_TMP/bin:$PATH" \
-    bash "$repo_root/scripts/uninstall.sh" "$@" </dev/null 2>&1 )
+    _run_uninstall_inner "$@" )
+}
+
+# HIMMEL-3787 S2b: with RUN_TTY_ANSWER set, uninstall.sh runs on a real pty
+# (util-linux `script`) with that answer typed at its first prompt, so the
+# [ -t 0 ] && [ -t 1 ] TTY offers are reachable; otherwise stdin is /dev/null.
+_run_uninstall_inner() {
+  if [ -n "${RUN_TTY_ANSWER:-}" ]; then
+    printf '%s\n' "$RUN_TTY_ANSWER" \
+      | script -qec "$(printf '%q ' bash "$repo_root/scripts/uninstall.sh" "$@")" /dev/null 2>&1
+  else
+    bash "$repo_root/scripts/uninstall.sh" "$@" </dev/null 2>&1
+  fi
 }
 
 echo "==== RED3: plugin ownership via ledger register rows ===="
@@ -530,7 +542,7 @@ vault_after14=$(jq -r '.env.LUNA_VAULT_PATH // "ABSENT"' "$CASE_SETTINGS")
 check "RED14 codex-5: LUNA_VAULT_PATH unit never reached after the halt is left untouched, not legacy-stripped" \
   "$vault_after14" "/opt/red14-preexisting-vault"
 
-echo "==== RED15 (codex-6): --purge-state --keep-backups spares provenance-backups/ ===="
+echo "==== RED15 (codex-6, HIMMEL-3787 S2a): --purge-state --keep-backups RETAINS ledger + backups, never orphans them ===="
 new_case red15
 mkdir -p "$CASE_DIR/cwd/scripts"
 DEST15="$CASE_DIR/cwd/scripts/red15.sh"
@@ -553,10 +565,18 @@ LEDGER_PATH15="$(prov_ledger_path)"
 # (HIMMEL-3386: the former note about --skip-settings and the unbound
 # `_LEDGER_PROTECTED` was stale -- uninstall.sh initialises it globally now.)
 run_uninstall --yes --purge-state --keep-backups --skip-tasks --skip-plugins --skip-hooks >/dev/null
+# HIMMEL-3787 S2a (J1393A Minor 1): the OLD contract left the ledger deleted
+# and provenance-backups/ behind as a permanent orphan at these exact paths.
+# The fixed contract retain-MOVES both together into one never-auto-deleted
+# retained-<stamp>/ directory -- so the old paths are now BOTH gone, and a
+# retained-* dir holding both the ledger and the backup content exists.
 ledger_gone15=$([ -f "$LEDGER_PATH15" ] && echo present || echo gone)
-backup_kept15=$([ -f "$BACKUP15" ] && echo yes || echo no)
-check "RED15 codex-6: --purge-state --keep-backups removes the ledger but keeps a kept-unit's backup" \
-  "$ledger_gone15|$backup_kept15" "gone|yes"
+backup_gone15=$([ -f "$BACKUP15" ] && echo present || echo gone)
+RETAINED15=$(find "$(prov_dir)" -maxdepth 1 -type d -name 'retained-*' | head -n1)
+retained_ledger15=$([ -n "$RETAINED15" ] && [ -f "$RETAINED15/provenance.jsonl" ] && echo yes || echo no)
+retained_backup15=$([ -n "$RETAINED15" ] && find "$RETAINED15/provenance-backups" -type f 2>/dev/null | grep -q . && echo yes || echo no)
+check "RED15 codex-6 (S2a): --purge-state --keep-backups retain-moves ledger+backups, no orphan at the old paths" \
+  "$ledger_gone15|$backup_gone15|$retained_ledger15|$retained_backup15" "gone|gone|yes|yes"
 
 echo "==== RED16 (R2-codex8): DRY preview never announces removing a unit the ledger pass already kept ===="
 new_case red16
@@ -1875,6 +1895,310 @@ check "RED57: the orphan backup file itself still exists" "$([ -f "$ORPHAN57" ] 
 AFTER_GOOD57_BYTES=$(cat "$DEST_GOOD57")
 check "RED57: the good row's unit still restores normally despite the orphan backup" \
   "$AFTER_GOOD57_BYTES" "$ORIG_GOOD57_BYTES"
+
+echo "==== RED58 (HIMMEL-3787 S2a, spec case a): a kept user-modified unit's backup is HELD by --purge-state, not silently purged (J1390A Finding 4) ===="
+new_case red58
+mkdir -p "$CASE_DIR/cwd/scripts"
+DEST58="$CASE_DIR/cwd/scripts/red58.sh"
+printf '#!/bin/sh\necho original-user-script\n' > "$DEST58"
+SNAP58=$(mktemp "$SUITE_TMP/SNAP58.XXXXXX") || exit 1; cp -p "$DEST58" "$SNAP58"
+printf '#!/bin/sh\necho himmel-installed-script\n' > "$DEST58"
+( prov_begin --writer adopt.sh -- seed-red58 >/dev/null
+  prov_record replace file "$DEST58" --scope project --class code --row adopter-scripts \
+    --writer adopt.sh --pre-file "$SNAP58" --backup --post-file "$DEST58" >/dev/null
+  prov_end ok >/dev/null )
+rm -f "$SNAP58"
+# the operator edits the file again after install recorded it -- verdict
+# "keep user-modified": held, not resolved (§5.1). --purge-state (WITHOUT
+# --keep-backups) must refuse rather than silently deleting this backup.
+printf '#!/bin/sh\necho operator-edited-after-install\n' > "$DEST58"
+BACKUP58=$(find "$(prov_dir)/provenance-backups" -type f | head -n1)
+[ -n "$BACKUP58" ] || { echo "FAIL - RED58 setup: backup for DEST58 not found"; fails=$((fails+1)); }
+out58=$(run_uninstall --yes --purge-state --skip-tasks --skip-plugins --skip-hooks)
+rc58=$?
+refused58=$([ "$rc58" -ne 0 ] && echo yes || echo no)
+backup_kept58=$([ -f "$BACKUP58" ] && echo yes || echo no)
+check "RED58 (S2a case a): --purge-state refuses on a held keep-user-modified backup, not silently purged" \
+  "$refused58|$backup_kept58" "yes|yes"
+warn58=$(printf '%s\n' "$out58" | grep -c -F -- "--keep-backups")
+check "RED58: the refusal text names --keep-backups as the escape hatch" \
+  "$([ "$warn58" -ge 1 ] && echo yes || echo no)" "yes"
+
+echo "==== RED59 (HIMMEL-3787 S2a, spec case b): --purge-state --keep-backups retains, then a reinstall+purge is not a permanent orphan refusal (J1393A P11) ===="
+new_case red59
+mkdir -p "$CASE_DIR/cwd/scripts"
+DEST59="$CASE_DIR/cwd/scripts/red59.sh"
+printf '#!/bin/sh\necho original-user-script\n' > "$DEST59"
+SNAP59=$(mktemp "$SUITE_TMP/SNAP59.XXXXXX") || exit 1; cp -p "$DEST59" "$SNAP59"
+printf '#!/bin/sh\necho himmel-installed-script\n' > "$DEST59"
+( prov_begin --writer adopt.sh -- seed-red59 >/dev/null
+  prov_record replace file "$DEST59" --scope project --class code --row adopter-scripts \
+    --writer adopt.sh --pre-file "$SNAP59" --backup --post-file "$DEST59" >/dev/null
+  prov_end ok >/dev/null )
+rm -f "$SNAP59"
+printf '#!/bin/sh\necho operator-edited-after-install\n' > "$DEST59"
+run_uninstall --yes --purge-state --keep-backups --skip-tasks --skip-plugins --skip-hooks >/dev/null
+RETAINED59=$(find "$(prov_dir)" -maxdepth 1 -type d -name 'retained-*' | head -n1)
+[ -n "$RETAINED59" ] || { echo "FAIL - RED59 setup: no retained-* dir after the first purge"; fails=$((fails+1)); }
+# A reinstall records a fresh, clean session (nothing held) at the standard
+# live ledger path. The earlier retained-* dir is a sibling the orphan-backup
+# scan never looks inside, so it must not poison this second purge -- on
+# main, --keep-backups left provenance-backups/ behind at its OLD path as a
+# permanent orphan, so EVERY later purge refused forever (P11).
+DEST59B="$CASE_DIR/cwd/scripts/red59b.sh"
+printf '#!/bin/sh\necho reinstalled\n' > "$DEST59B"
+( prov_begin --writer adopt.sh -- seed-red59-reinstall >/dev/null
+  prov_record create file "$DEST59B" --scope project --class code --row adopter-scripts \
+    --writer adopt.sh --pre-absent --post-file "$DEST59B" >/dev/null
+  prov_end ok >/dev/null )
+run_uninstall --yes --purge-state --skip-tasks --skip-plugins --skip-hooks >/dev/null
+rc59=$?
+check "RED59 (S2a case b): a purge after a reinstall is not permanently blocked by an earlier retained-* purge" \
+  "$rc59" "0"
+check "RED59: the earlier retained-* dir is left untouched (never auto-deleted)" \
+  "$([ -d "$RETAINED59" ] && echo yes || echo no)" "yes"
+
+echo "==== RED60 (HIMMEL-3787 S2a, spec case c; HIMMEL-3787 codex-1 panel round 1): a container whose governed children were NEVER reverted (--skip-settings) must not release its backup ===="
+# Same fixture as the old CASE60, but --skip-settings means the settings
+# unwire step (which would physically revert the children) never runs -- the
+# live file stays exactly at post-install. _provread_container_child_clean
+# used to accept a bare "remove"/"restore" VERDICT as clean (a recommendation
+# prov_read_verdict computes from CURRENT live state, not a record that the
+# action ran), so the container's own backup was released here while a
+# governed child (HANDOVER_DIR) was still live and installed, with no backup
+# left to restore it from -- confirmed on this exact fixture before the fix
+# (backup released, HANDOVER_DIR still present). The fix in
+# provenance-read.sh drops that blanket accept; only a verdict that already
+# reflects a REVERTED live state (keep already-base / keep already-absent
+# with no backup) counts as clean now, so --skip-settings + a live governed
+# child must refuse or hold, never release.
+new_case red60
+# /env was explicitly null before this install (the only real shape that
+# gives the /env container itself a backup -- wire-himmel-repo.sh only
+# records a container row when .env was absent or null beforehand).
+printf '{"env": null}\n' > "$CASE_SETTINGS"
+( prov_begin --writer wire-himmel-repo.sh -- seed-red60 >/dev/null
+  prov_record replace json-key "$CASE_SETTINGS" --unit /env --scope user --class code \
+    --writer wire-himmel-repo.sh --row user-settings \
+    --pre-json null --backup \
+    --post-json '{"HANDOVER_DIR":"/opt/red60-handover","LUNA_VAULT_PATH":"/opt/red60-vault"}' >/dev/null
+  prov_record create json-key "$CASE_SETTINGS" --unit /env/HANDOVER_DIR --scope user --class code \
+    --writer wire-himmel-repo.sh --row user-settings \
+    --pre-absent --post-json '"/opt/red60-handover"' >/dev/null
+  prov_record create json-key "$CASE_SETTINGS" --unit /env/LUNA_VAULT_PATH --scope user --class code \
+    --writer wire-himmel-repo.sh --row user-settings \
+    --pre-absent --post-json '"/opt/red60-vault"' >/dev/null
+  prov_end ok >/dev/null )
+BACKUP60=$(find "$(prov_dir)/provenance-backups" -type f | head -n1)
+[ -n "$BACKUP60" ] || { echo "FAIL - RED60 setup: backup for the /env container not found"; fails=$((fails+1)); }
+# The live file: both governed children are untouched since install (clean,
+# verdict "remove ours" -- a recommendation, never executed under
+# --skip-settings), plus a bystander key the operator added by hand that
+# himmel never recorded a unit for -- so the CONTAINER's own live value
+# differs from what it recorded (L != O).
+cat > "$CASE_SETTINGS" <<JSON
+{
+  "env": {
+    "HANDOVER_DIR": "/opt/red60-handover",
+    "LUNA_VAULT_PATH": "/opt/red60-vault",
+    "MY_USER_KEY": "operator-bystander-value"
+  }
+}
+JSON
+run_uninstall --yes --purge-state --skip-tasks --skip-plugins --skip-hooks --skip-settings >/dev/null
+rc60=$?
+check "RED60 (S2a case c, codex-1 gap): --purge-state refuses/holds while a governed child is still live under --skip-settings" \
+  "$([ "$rc60" -ne 0 ] && echo yes || echo no)" "yes"
+check "RED60: the bystander key the operator added by hand is never touched" \
+  "$(jq -r '.env.MY_USER_KEY // "ABSENT"' "$CASE_SETTINGS")" "operator-bystander-value"
+check "RED60: the still-live governed child is untouched (never reverted by --skip-settings)" \
+  "$(jq -r '.env.HANDOVER_DIR // "ABSENT"' "$CASE_SETTINGS")" "/opt/red60-handover"
+check "RED60: the container's own backup is HELD, not released while a child is still live" \
+  "$([ -f "$BACKUP60" ] && echo held || echo released)" "held"
+
+echo "==== GREEN60 (HIMMEL-3787 S2a, spec case c): once the settings unwire step ACTUALLY reverts the children (no --skip-settings), the container resolves via its clean children and its backup releases ===="
+# Identical ledger + live-file fixture to RED60, but this run does NOT pass
+# --skip-settings: the real settings-unwire step ([6/8]) reverts the two
+# governed children for real before the [8/8] purge scan runs, so by the
+# time _provread_container_child_clean looks at them their verdict has
+# already re-derived to "keep already-base"/"keep already-absent" from their
+# OWN live state -- the same acceptance path RED60 shows must not be
+# shortcut to when the revert never actually happened.
+new_case green60
+printf '{"env": null}\n' > "$CASE_SETTINGS"
+( prov_begin --writer wire-himmel-repo.sh -- seed-green60 >/dev/null
+  prov_record replace json-key "$CASE_SETTINGS" --unit /env --scope user --class code \
+    --writer wire-himmel-repo.sh --row user-settings \
+    --pre-json null --backup \
+    --post-json '{"HANDOVER_DIR":"/opt/green60-handover","LUNA_VAULT_PATH":"/opt/green60-vault"}' >/dev/null
+  prov_record create json-key "$CASE_SETTINGS" --unit /env/HANDOVER_DIR --scope user --class code \
+    --writer wire-himmel-repo.sh --row user-settings \
+    --pre-absent --post-json '"/opt/green60-handover"' >/dev/null
+  prov_record create json-key "$CASE_SETTINGS" --unit /env/LUNA_VAULT_PATH --scope user --class code \
+    --writer wire-himmel-repo.sh --row user-settings \
+    --pre-absent --post-json '"/opt/green60-vault"' >/dev/null
+  prov_end ok >/dev/null )
+BACKUPG60=$(find "$(prov_dir)/provenance-backups" -type f | head -n1)
+[ -n "$BACKUPG60" ] || { echo "FAIL - GREEN60 setup: backup for the /env container not found"; fails=$((fails+1)); }
+cat > "$CASE_SETTINGS" <<JSON
+{
+  "env": {
+    "HANDOVER_DIR": "/opt/green60-handover",
+    "LUNA_VAULT_PATH": "/opt/green60-vault",
+    "MY_USER_KEY": "operator-bystander-value"
+  }
+}
+JSON
+run_uninstall --yes --purge-state --skip-tasks --skip-plugins --skip-hooks >/dev/null
+rcg60=$?
+check "GREEN60 (S2a case c): --purge-state succeeds once settings-unwire has actually reverted the children" \
+  "$rcg60" "0"
+check "GREEN60: the bystander key the operator added by hand is never touched" \
+  "$(jq -r '.env.MY_USER_KEY // "ABSENT"' "$CASE_SETTINGS")" "operator-bystander-value"
+check "GREEN60: the governed children were actually removed by the real settings-unwire step" \
+  "$(jq -r '.env.HANDOVER_DIR // "ABSENT"' "$CASE_SETTINGS")" "ABSENT"
+check "GREEN60: the container's own backup is released, not held forever" \
+  "$([ -f "$BACKUPG60" ] && echo held || echo released)" "released"
+
+# seed_modified_unit <dest> -- one adopter-scripts file whose ledger says
+# himmel replaced it (original -> installed, backup taken), then the operator
+# edits it again: verdict "keep user-modified", backup readable. Sets BACKUP_SM.
+seed_modified_unit() {
+  local dest="$1" snap
+  mkdir -p "$(dirname "$dest")"
+  printf '#!/bin/sh\necho original-user-script\n' > "$dest"
+  snap=$(mktemp "$SUITE_TMP/SNAPSM.XXXXXX") || exit 1; cp -p "$dest" "$snap"
+  printf '#!/bin/sh\necho himmel-installed-script\n' > "$dest"
+  ( prov_begin --writer adopt.sh -- seed-sm >/dev/null
+    prov_record replace file "$dest" --scope project --class code --row adopter-scripts \
+      --writer adopt.sh --pre-file "$snap" --backup --post-file "$dest" >/dev/null
+    prov_end ok >/dev/null )
+  rm -f "$snap"
+  printf '#!/bin/sh\necho operator-edited-after-install\n' > "$dest"
+  BACKUP_SM=$(find "$(prov_dir)/provenance-backups" -type f | head -n1)
+}
+
+echo "==== RED61 (HIMMEL-3787 S2b, spec 5.5): a TTY [r]estore on a user-modified file saves the live bytes to a sidecar FIRST ===="
+new_case red61
+DEST61="$CASE_DIR/cwd/scripts/red61.sh"
+seed_modified_unit "$DEST61"
+SIDE61="$DEST61.himmel-uninstall-backup"
+# "y" answers the Proceed? confirm, "r" the per-unit [k]eep/[r]estore offer.
+out61=$(RUN_TTY_ANSWER=$'y\nr' run_uninstall --skip-tasks --skip-plugins --skip-hooks)
+check "RED61: the sidecar holds the operator's live bytes" \
+  "$(cat "$SIDE61" 2>/dev/null)" "$(printf '#!/bin/sh\necho operator-edited-after-install')"
+check "RED61: the file was restored to the pre-himmel original" \
+  "$(cat "$DEST61")" "$(printf '#!/bin/sh\necho original-user-script')"
+check "RED61: the report names the sidecar path" \
+  "$([ "$(printf '%s\n' "$out61" | grep -c -F -- "$SIDE61")" -ge 1 ] && echo yes || echo no)" "yes"
+
+echo "==== RED61b (HIMMEL-3787 S2b): --yes never restores, even on a TTY, and writes no sidecar ===="
+new_case red61b
+DEST61B="$CASE_DIR/cwd/scripts/red61b.sh"
+seed_modified_unit "$DEST61B"
+RUN_TTY_ANSWER=r run_uninstall --yes --skip-tasks --skip-plugins --skip-hooks >/dev/null
+check "RED61b: --yes leaves the operator's edit in place" \
+  "$(cat "$DEST61B")" "$(printf '#!/bin/sh\necho operator-edited-after-install')"
+check "RED61b: --yes writes no sidecar" \
+  "$([ -e "$DEST61B.himmel-uninstall-backup" ] && echo yes || echo no)" "no"
+
+echo "==== RED61c (HIMMEL-3787 S2b): a sidecar that cannot be written fails closed -- no restore, failed, backup kept ===="
+new_case red61c
+DEST61C="$CASE_DIR/cwd/scripts/red61c.sh"
+seed_modified_unit "$DEST61C"
+# an earlier save already sits at the sidecar path: never clobbered, so the
+# save is refused and the restore must not run.
+printf 'earlier-save\n' > "$DEST61C.himmel-uninstall-backup"
+RUN_TTY_ANSWER=$'y\nr' run_uninstall --skip-tasks --skip-plugins --skip-hooks >/dev/null
+check "RED61c: the live file is NOT restored" \
+  "$(cat "$DEST61C")" "$(printf '#!/bin/sh\necho operator-edited-after-install')"
+check "RED61c: the earlier save is untouched" \
+  "$(cat "$DEST61C.himmel-uninstall-backup")" "earlier-save"
+check "RED61c: the backup is kept" "$([ -f "$BACKUP_SM" ] && echo yes || echo no)" "yes"
+check "RED61c: a failed outcome row is written" \
+  "$(jq -r 'select(.op=="failed") | .op' "$(prov_dir)/provenance.jsonl" 2>/dev/null | head -n1)" "failed"
+
+# seed_created_unit <dest> -- one file himmel CREATED (pre-absent, so no backup),
+# then the operator edits it: verdict "keep user-modified", no readable backup,
+# which is the shape that offers [k]eep / [d]elete.
+seed_created_unit() {
+  local dest="$1"
+  mkdir -p "$(dirname "$dest")"
+  printf '#!/bin/sh\necho himmel-created-script\n' > "$dest"
+  ( prov_begin --writer adopt.sh -- seed-created >/dev/null
+    prov_record create file "$dest" --scope project --class code --row adopter-scripts \
+      --writer adopt.sh --pre-absent --post-file "$dest" >/dev/null
+    prov_end ok >/dev/null )
+  printf '#!/bin/sh\necho operator-edited-created-file\n' > "$dest"
+}
+
+echo "==== RED64 (HIMMEL-3787 S2b, ruling 2026-09-29): a TTY [d]elete on a user-modified created file saves the live bytes to a sidecar FIRST ===="
+new_case red64
+DEST64="$CASE_DIR/cwd/scripts/red64.sh"
+seed_created_unit "$DEST64"
+SIDE64="$DEST64.himmel-uninstall-backup"
+out64=$(RUN_TTY_ANSWER=$'y\nd' run_uninstall --skip-tasks --skip-plugins --skip-hooks)
+check "RED64: the sidecar holds the operator's live bytes" \
+  "$(cat "$SIDE64" 2>/dev/null)" "$(printf '#!/bin/sh\necho operator-edited-created-file')"
+check "RED64: the file was deleted" "$([ -e "$DEST64" ] && echo present || echo gone)" "gone"
+check "RED64: the report names the sidecar path" \
+  "$([ "$(printf '%s\n' "$out64" | grep -c -F -- "$SIDE64")" -ge 1 ] && echo yes || echo no)" "yes"
+
+echo "==== RED64b (HIMMEL-3787 S2b): Enter keeps the file; --yes (tty or not) never deletes; no sidecar in either ===="
+new_case red64b
+DEST64B="$CASE_DIR/cwd/scripts/red64b.sh"
+seed_created_unit "$DEST64B"
+RUN_TTY_ANSWER=$'y\n' run_uninstall --skip-tasks --skip-plugins --skip-hooks >/dev/null
+check "RED64b: the default (Enter) keeps the operator's edit" \
+  "$(cat "$DEST64B")" "$(printf '#!/bin/sh\necho operator-edited-created-file')"
+RUN_TTY_ANSWER=d run_uninstall --yes --skip-tasks --skip-plugins --skip-hooks >/dev/null
+check "RED64b: --yes on a tty never deletes" \
+  "$(cat "$DEST64B")" "$(printf '#!/bin/sh\necho operator-edited-created-file')"
+run_uninstall --yes --skip-tasks --skip-plugins --skip-hooks >/dev/null
+check "RED64b: a non-tty --yes run never deletes" \
+  "$(cat "$DEST64B")" "$(printf '#!/bin/sh\necho operator-edited-created-file')"
+check "RED64b: no sidecar written by any keep path" \
+  "$([ -e "$DEST64B.himmel-uninstall-backup" ] && echo yes || echo no)" "no"
+
+echo "==== RED64c (HIMMEL-3787 S2b): a [d]elete whose sidecar cannot be written fails closed -- file kept, failed row, non-zero ===="
+new_case red64c
+DEST64C="$CASE_DIR/cwd/scripts/red64c.sh"
+seed_created_unit "$DEST64C"
+printf 'earlier-save\n' > "$DEST64C.himmel-uninstall-backup"
+RUN_TTY_ANSWER=$'y\nd' run_uninstall --skip-tasks --skip-plugins --skip-hooks >/dev/null
+rc64c=$?
+check "RED64c: the live file is NOT deleted" \
+  "$(cat "$DEST64C")" "$(printf '#!/bin/sh\necho operator-edited-created-file')"
+check "RED64c: the earlier save is untouched" \
+  "$(cat "$DEST64C.himmel-uninstall-backup")" "earlier-save"
+check "RED64c: a failed outcome row is written" \
+  "$(jq -r 'select(.op=="failed") | .op' "$(prov_dir)/provenance.jsonl" 2>/dev/null | head -n1)" "failed"
+check "RED64c: the run exits non-zero" "$([ "$rc64c" -ne 0 ] && echo nonzero || echo zero)" "nonzero"
+
+echo "==== RED62 (HIMMEL-3787 S2b, J1408A F1): a failed backups-dir mv must not move the ledger into retained-* ===="
+new_case red62
+DEST62="$CASE_DIR/cwd/scripts/red62.sh"
+seed_modified_unit "$DEST62"
+chmod 0555 "$(prov_dir)/provenance-backups"
+run_uninstall --yes --purge-state --keep-backups --skip-tasks --skip-plugins --skip-hooks >/dev/null
+chmod 0755 "$(prov_dir)/provenance-backups"
+check "RED62: the ledger stays live when the backups could not be retained" \
+  "$([ -f "$(prov_dir)/provenance.jsonl" ] && echo live || echo moved)" "live"
+check "RED62: the backups stay where the ledger points" \
+  "$([ -f "$BACKUP_SM" ] && echo yes || echo no)" "yes"
+
+echo "==== RED63 (HIMMEL-3787 S2b, J1408A F2): an unwritable base dir fails fast, not after ~53 s of EACCES retries ===="
+new_case red63
+DEST63="$CASE_DIR/cwd/scripts/red63.sh"
+seed_modified_unit "$DEST63"
+chmod 0555 "$(prov_dir)"
+_t63=$SECONDS
+out63=$(run_uninstall --yes --purge-state --keep-backups --skip-tasks --skip-plugins --skip-hooks)
+_d63=$((SECONDS - _t63))
+chmod 0755 "$(prov_dir)"
+check "RED63: fails fast (under 15 s)" "$([ "$_d63" -lt 15 ] && echo fast || echo slow:$_d63)" "fast"
+check "RED63: the real mkdir error is surfaced" \
+  "$([ "$(printf '%s\n' "$out63" | grep -c -i 'permission denied')" -ge 1 ] && echo yes || echo no)" "yes"
 
 echo "==== REAL-LEDGER TRIPWIRE ===="
 REAL_LEDGER_AFTER=$(real_ledger_state)

@@ -4670,9 +4670,9 @@ c40_setup() {
     c40_t="$(mktemp -d "${TMPDIR:-/tmp}/himmel-doctor-c40.XXXXXX")" || { fail "C40 setup: mktemp -d failed"; exit 1; }
     cat > "$c40_t/curl" <<'STUB'
 #!/usr/bin/env bash
-m=""; d=""; w=""
+m=""; d=""; w=""; k=""
 while [ $# -gt 0 ]; do
-    case "$1" in -m) m="$2"; shift ;; -d) d="$2"; shift ;; -w) w="$2"; shift ;; esac
+    case "$1" in -m) m="$2"; shift ;; -d) d="$2"; shift ;; -w) w="$2"; shift ;; -K) k=$(cat) ;; esac
     shift
 done
 mode="${C40_MODE:-ok}"
@@ -4696,6 +4696,8 @@ case "$d" in
             reset) finish 000 52 ;;
             empty204) finish 204 0 ;;
             foreign) pfx; printf '%s' '{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"other-server"}}}'; finish 200 ;;
+            # HIMMEL-5227: the HIMMEL-5002 daemon's real reply without its bearer token.
+            auth) case "$k" in *"Authorization: Bearer "*) ;; *) printf '%s' '{"error":"Unauthorized"}'; finish 401 ;; esac ;;
         esac
         [ "$mode" = init_multiline ] && { printf '{\n  "result": {\n    "serverInfo": {\n      "version": "2.8.3",\n      "name": "qmd"\n    }\n  }\n}\n'; finish 200; }
         pfx; printf '%s' "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"name\":\"qmd\",\"version\":\"2.8.3\"},\"instructions\":\"QMD is your local search engine.$note\"}}"
@@ -4736,7 +4738,9 @@ c40_run() { # <mode>
         foreign) c40_status true degraded "a process answers but it is NOT qmd (initialize reply has no qmd serverInfo)" ;;
         *) c40_status true present "initialize answered in 0.3s" ;;
     esac
-    PATH="$FAKEBIN:$PATH" C40_MODE="$1" C40_PENDING="${C40_PENDING:-12}" C40_LOG="$c40_t/log" HIMMEL_DOCTOR_QMD_CURL="$c40_t/curl" DOCTOR_STATUS_JSON="$c40_t/status.json" \
+    # CI runners export XDG_CONFIG_HOME, which would point the token path past the fixture HOME.
+    env -u XDG_CONFIG_HOME -u QMD_HTTP_AUTH_FILE -u QMD_HTTP_TOKEN_FILE \
+        PATH="$FAKEBIN:$PATH" C40_MODE="$1" C40_PENDING="${C40_PENDING:-12}" C40_LOG="$c40_t/log" HIMMEL_DOCTOR_QMD_CURL="$c40_t/curl" DOCTOR_STATUS_JSON="$c40_t/status.json" \
         CLAUDE_DIR="$c40_t/claude" HOME="$c40_t/home" bash "$DOC" --no-color 2>&1
 }
 c40_precond() { # <mode> — the stub must answer the init payload the way the mode says
@@ -4773,6 +4777,23 @@ else
     else
         fail "C40 served vec probe -> $(printf '%s' "$out" | grep -A1 C40) log=$(tr '\n' ' ' < "$c40_t/log")"
     fi
+fi
+rm -rf "$c40_t"
+
+echo "== C40: daemon that requires the bearer token (HIMMEL-5227, RED) =="
+c40_setup
+out="$(c40_run auth)"
+if grepq "$out" 'WARN C40-qmd-vec.*HTTP 401.*bearer token' && ! grepq "$out" 'NOT qmd'; then
+    pass "C40 401 without a token file -> WARN naming the bearer token, not NOT-qmd"
+else
+    fail "C40 401 without a token file -> $(printf '%s' "$out" | grep -A1 C40)"
+fi
+mkdir -p "$c40_t/home/.config/qmd"; printf 'tok-for-the-test-only\n' > "$c40_t/home/.config/qmd/http-token"; chmod 600 "$c40_t/home/.config/qmd/http-token"
+out="$(c40_run auth)"
+if grepq "$out" 'OK   C40-qmd-vec' && ! grepq "$out" 'WARN C40-qmd-vec'; then
+    pass "C40 with the token file -> initialize and vec probe authenticate -> OK"
+else
+    fail "C40 with the token file -> $(printf '%s' "$out" | grep -A1 C40)"
 fi
 rm -rf "$c40_t"
 

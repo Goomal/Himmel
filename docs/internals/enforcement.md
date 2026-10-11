@@ -1732,6 +1732,22 @@ settings.json, a hook-wiring change (the "three places" rule in
 PR — the operator no longer hand-edits `.claude/settings.json` inside each
 leg's worktree for every hook-wiring change.
 
+**`env -S` text (HIMMEL-4521).** The Bash arm decodes GNU `env -S` escapes
+(`\c \f \n \r \t \v \# \$ \_ \\ \' \"`, `${NAME}`) and judges the decoded
+words. Anything it does not fully model stays denied: an unknown escape, `\c`,
+an unterminated quote, a `${...}` beyond a plain name, a nested `env`. Because
+env splices the decoded words back into its own argv and getopt re-parses
+them, a first word (decoded or plain) that is an env option (`-S`, `-C`, `-i`,
+`-u`, `--split-string`) or a `NAME=VALUE` assignment is also denied by shape,
+with no attempt to model env's options inside `-S` text. The `-S` text is
+reached after env's own `-a`/`--argv0`/`--unset`/`--chdir` argument as well,
+including any unique prefix of those long options (`--argv`, `--un`, `--ch`).
+`-S` text followed by further operands in the same command is denied too: env
+appends them to the split words, so the text alone is not the command. This
+over-denies the `PYTHONPATH=...` example in GNU's manual on purpose. A text
+decoder cannot close this class (HIMMEL-5233); the structural upgrade is
+HIMMEL-5236, denying live-settings writes by effect, not by command text.
+
 **The Bash/PowerShell arm is textual and blunt (HIMMEL-1525, HIMMEL-3468,
 HIMMEL-3499, HIMMEL-3555).** It does not parse commands. It fires when the
 command text names `settings.json`/`settings.local.json` (rule 1, any verb)

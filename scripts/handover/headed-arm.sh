@@ -405,7 +405,13 @@ if [ "${HEADED_ARM_CONTEXT_PID:-}" = "$$" ]; then
     _context_profile="${HEADED_ARM_CONTEXT_PROFILE:-console}"
     _context_profiles="${HEADED_ARM_LEG_PROFILES:-$_context_profiles}"
 fi
-unset HEADED_ARM_CONTEXT_PROFILE HEADED_ARM_LEG_PROFILES HEADED_ARM_CONTEXT_PID
+# HIMMEL-5193: the audited 400k A/B arm marker, set only by headed-arm-leg.sh.
+# Same PID pairing as above, so an ambient value from another process is ignored.
+_ab_autocompact=""
+if [ "${HEADED_ARM_CONTEXT_PID:-}" = "$$" ]; then
+    _ab_autocompact="${HEADED_ARM_AB_AUTOCOMPACT:-}"
+fi
+unset HEADED_ARM_CONTEXT_PROFILE HEADED_ARM_LEG_PROFILES HEADED_ARM_CONTEXT_PID HEADED_ARM_AB_AUTOCOMPACT
 if ! _context_json="$(node "$_context_profiles" "$_context_profile" --context)" \
     || ! _profile_mode="$(printf '%s' "$_context_json" | jq -er '.contextMode | select(. == "standard" or . == "1m")')" \
     || ! _profile_autocompact="$(printf '%s' "$_context_json" | jq -er '.autocompact | select(type == "number" and . >= 200000 and . <= 1000000 and floor == .)')"; then
@@ -441,6 +447,10 @@ if [ "$_context_profile" != "console" ] && [ "$CONTEXT" = "1m" ] && [ "${CONSOLE
     echo "headed-arm: refusing 1m context: set CONSOLE_CONTEXT=1m in the launching shell to opt in; omit [context] or pass standard for the --autocompact 200000 default." >&2
     exit 2
 fi
+if [ -n "$_ab_autocompact" ] && { [ "$_ab_autocompact" != "400000" ] || [ "$CONTEXT" != "standard" ] || [ "$_context_profile" = "console" ]; }; then
+    echo "headed-arm: refusing HEADED_ARM_AB_AUTOCOMPACT=$_ab_autocompact: only 400000 on a standard-context leg arm is accepted (HIMMEL-5193)" >&2
+    exit 2
+fi
 # Fable-family match (shared with arm-resume.sh via console_context_model_is_fable)
 # -- only an explicit Fable [model] takes this branch now (the default MODEL
 # is Opus, HIMMEL-3079).
@@ -457,6 +467,7 @@ fi
 AUTOCOMPACT="$_profile_autocompact"
 if [ "$CONTEXT" = "standard" ]; then
     AUTOCOMPACT="200000"
+    [ "$_ab_autocompact" != "400000" ] || AUTOCOMPACT="400000"
 elif [ "$_context_profile" = "console" ] || [ "${CONSOLE_CONTEXT:-}" = "1m" ]; then
     AUTOCOMPACT="auto"
 fi
@@ -547,6 +558,19 @@ HEADLESS="${HEADED_ARM_HEADLESS:-0}"
 CLAUDE_CLI="${HEADED_ARM_CLAUDE_CLI:-claude}"
 LAUNCH_RECORD="${HEADED_ARM_LAUNCH_RECORD:-}"
 unset HEADED_ARM_HEADLESS HEADED_ARM_LAUNCH_RECORD
+# HIMMEL-4832 (himmel-bus T9): the launcher registered $NAME on the bus and sets
+# HEADED_ARM_BUS=1 to have the claude pid confirmed below bound to it. Read once
+# and cleared, so the flag can never ride into the launched session's env.
+BUS_BIND="${HEADED_ARM_BUS:-0}"
+BUS_CLI="${HEADED_ARM_BUS_CLI:-$(dirname "$0")/../../marketplace/plugins/himmel-bus/bin/bus}"
+# HIMMEL-5207: the registry lock is `flock -x` with no -w, so a stuck holder
+# would hang this detached process. The bind gets this many seconds, then dies.
+BUS_BIND_SECS="${HEADED_ARM_BUS_BIND_SECS:-15}"
+case "$BUS_BIND_SECS" in
+    ''|*[!0-9]*) BUS_BIND_SECS=15 ;;
+esac
+unset HEADED_ARM_BUS HEADED_ARM_BUS_CLI HEADED_ARM_BUS_BIND_SECS
+SESSION_PID=""
 # HIMMEL-2975 (renamed HIMMEL-3133): a console session must never inherit a
 # relay marker from whatever armed it -- ROLE_ENV_UNSET is an extra `-u`
 # token added to BOTH konsole launch branches' env -u list below,
@@ -833,19 +857,10 @@ NAME_ERE="$(ere_escape "$NAME")"
 # pre-filter is made PERMISSIVE rather than precise: `(space or
 # end-of-line)` after the name, via the ERE alternation `( |$)` every call
 # site below uses.
-_argv_has_n_name() { # _argv_has_n_name <pid> - true iff /proc/<pid>/cmdline
-                      # has an element exactly "-n" immediately followed by
-                      # an element exactly equal to $NAME (positional and
-                      # exact, from the real NUL-separated argv - never a
-                      # substring or regex match against flattened text)
-    local pid="$1" prev="" cur
-    [ -r "$PROC/$pid/cmdline" ] || return 1
-    while IFS= read -r -d '' cur; do
-        [ "$prev" = "-n" ] && [ "$cur" = "$NAME" ] && return 0
-        prev="$cur"
-    done < "$PROC/$pid/cmdline"
-    return 1
-}
+# HIMMEL-5201: factored out so arm-resume's bus rebind helper shares it. It
+# reads the PROC and NAME globals set above, exactly as it did inline here.
+# shellcheck source=argv-has-n-name.sh
+. "$(cd "$(dirname "$0")" && pwd)/argv-has-n-name.sh"
 # HIMMEL-3484: the no-/proc equivalent of _argv_has_n_name. `ps -o args=`
 # is the only argv source a stock Mac offers from the shell, and it joins the
 # elements with spaces, so this walks whitespace TOKENS and lets only the
@@ -928,14 +943,14 @@ session_confirmed() { # session_confirmed <pgrep-ere-pattern> - returns
             args="$(ps -ww -o args= -p "$pid" 2>/dev/null)" || ps_rc=$?
             [ "$ps_rc" -eq 1 ] && continue
             [ "$ps_rc" -eq 0 ] || return 2
-            _flat_argv_has_n_name "$args" && return 0
+            _flat_argv_has_n_name "$args" && { SESSION_PID="$pid"; return 0; }
         done
         return 1
     fi
     for pid in $pids; do
         comm="$(cat "$PROC/$pid/comm" 2>/dev/null)" || continue
         [ "$comm" = claude ] || continue
-        _argv_has_n_name "$pid" && return 0
+        _argv_has_n_name "$pid" && { SESSION_PID="$pid"; return 0; }
     done
     return 1
 }
@@ -1631,6 +1646,39 @@ if [ "$sv_indeterminate" -eq 1 ]; then
     exit 9
 fi
 if [ "$sv_seen" -eq 1 ]; then
+    # HIMMEL-4832: bind the confirmed claude pid to the name the launcher
+    # registered. Best-effort: a failed bind leaves the session unbound (bus
+    # send refused) and never changes the launch result.
+    if [ "$BUS_BIND" = "1" ] && [ -n "$SESSION_PID" ]; then
+        # Background + poll, not `timeout`: portable to bash 3.2 / macOS, and
+        # the output goes to a file so no pipe is held open by a stuck child.
+        bus_tmp="$(mktemp "${TMPDIR:-/tmp}/headed-arm-bus.XXXXXX" 2>/dev/null)" || bus_tmp=/dev/null
+        "$BUS_CLI" bind "$NAME" "$SESSION_PID" >"$bus_tmp" 2>&1 &
+        bus_pid=$!
+        bus_n=0
+        bus_timed_out=0
+        while kill -0 "$bus_pid" 2>/dev/null; do
+            if [ "$bus_n" -ge "$BUS_BIND_SECS" ]; then
+                kill "$bus_pid" 2>/dev/null
+                bus_timed_out=1
+                # SIGTERM can be ignored or deferred: one second of grace,
+                # then SIGKILL, so the `wait` below can never block.
+                sleep 1
+                kill -0 "$bus_pid" 2>/dev/null && kill -9 "$bus_pid" 2>/dev/null
+                break
+            fi
+            sleep 1
+            bus_n=$((bus_n + 1))
+        done
+        bus_rc=0
+        wait "$bus_pid" 2>/dev/null || bus_rc=$?
+        if [ "$bus_timed_out" -eq 1 ] || [ "$bus_rc" -ne 0 ]; then
+            bus_out="$(cat "$bus_tmp" 2>/dev/null)"
+            [ "$bus_timed_out" -eq 1 ] && bus_out="timed out after ${BUS_BIND_SECS}s: $bus_out"
+            echo "$(date +%F_%T) WARN: bus bind of $NAME to pid $SESSION_PID failed - session stays unbound: $bus_out" >> "$LOG"
+        fi
+        [ "$bus_tmp" = /dev/null ] || rm -f "$bus_tmp"
+    fi
     exit 0
 fi
 # r8-codex-4: only reached once session_confirmed has ALSO never found a

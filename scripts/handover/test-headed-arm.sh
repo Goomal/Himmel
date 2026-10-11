@@ -345,6 +345,39 @@ for ambient in profile resolver both stale; do
   not_contains "ambient profile inputs ($ambient): no profile 1m ceiling" "$out" "--autocompact 600000"
 done
 
+# --- 1e (HIMMEL-5193). the audited 400k A/B arm: HEADED_ARM_AB_AUTOCOMPACT is
+# honoured only when paired to this exec's PID (the wrapper's `export
+# HEADED_ARM_CONTEXT_PID=$$; exec` shape), the context is standard and the
+# value is exactly 400000. A wrong pid is ignored; 1m or another value refuses.
+ab_run() { # <pid-mode: paired|stale|none> <context> <value> <tag>
+  local mode="$1" ctx="$2" val="$3" tag="$4" pidx
+  case "$mode" in
+    paired) pidx='export HEADED_ARM_CONTEXT_PID="$$"' ;;
+    stale)  pidx='export HEADED_ARM_CONTEXT_PID=1' ;;
+    *)      pidx=':' ;;
+  esac
+  env -u CONSOLE_CONTEXT HEADED_ARM_CONTEXT_PROFILE=leg-impl HEADED_ARM_LEG_PROFILES="$HERE/../lanes/plugin-profiles.mjs" \
+    HEADED_ARM_AB_AUTOCOMPACT="$val" KONSOLE_CMD="$BASH" PGREP_CMD="$BASH" \
+    bash -c "$pidx"'; exec bash "$@"' _ "$SCRIPT" --dry-run "HIMMEL-5193-$tag-leg" some/doc.md /tmp/nosig 99999999999 "$tmp/ab-$tag.log" claude-sonnet-5 "$ctx" 2>&1
+}
+rc=0; out="$(ab_run paired standard 400000 ok)" || rc=$?
+check "A/B arm (paired pid, standard, 400000): exit 0" "$rc" "0"
+contains "A/B arm (paired pid, standard, 400000): argv carries --autocompact 400000" "$out" "--autocompact 400000"
+rc=0; out="$(ab_run paired standard "" none)" || rc=$?
+check "A/B arm control (paired, no marker): exit 0" "$rc" "0"
+contains "A/B arm control (paired, no marker): stays 200000" "$out" "--autocompact 200000"
+rc=0; out="$(ab_run stale standard 400000 stale)" || rc=$?
+check "A/B arm (stale pid): ignored, exit 0" "$rc" "0"
+contains "A/B arm (stale pid): stays 200000" "$out" "--autocompact 200000"
+not_contains "A/B arm (stale pid): no 400000" "$out" "--autocompact 400000"
+rc=0; out="$(ab_run none standard 400000 nopid)" || rc=$?
+contains "A/B arm (no pid pairing): stays 200000" "$out" "--autocompact 200000"
+rc=0; out="$(ab_run paired 1m 400000 onem)" || rc=$?
+check "A/B arm (1m context): refused exit 2" "$rc" "2"
+rc=0; out="$(ab_run paired standard 300000 other)" || rc=$?
+check "A/B arm (value 300000): refused exit 2" "$rc" "2"
+not_contains "A/B arm (value 300000): no launch argv" "$out" "--autocompact 300000"
+
 # --- 1d (HIMMEL-2973). positional 1m WITH the env is accepted ---------------
 d1d="$tmp/c1d"; mk_stub "$d1d" 1 alive "HIMMEL-9999d-leg"
 rc1d=0
@@ -1567,6 +1600,8 @@ mutant36="$mutant36dir/scripts/handover/headed-arm.sh"
 # shellcheck disable=SC2016 # single-quoted sed script; $RECORDER must stay literal
 sed 's/if \[ "\$RECORDER" = "1" \]; then/if true; then/' "$SCRIPT" > "$mutant36"
 cp "$HERE/../lib/console-context.sh" "$mutant36dir/scripts/lib/console-context.sh"
+# HIMMEL-5201: headed-arm.sh sources its argv check from its own directory.
+cp "$HERE/argv-has-n-name.sh" "$mutant36dir/scripts/handover/argv-has-n-name.sh"
 fixture_profiles "$mutant36dir/scripts"
 chmod 755 "$mutant36"
 d37="$tmp/c37"; mk_stub "$d37" 1 alive "HIMMEL-red36"
@@ -2158,5 +2193,85 @@ out43=$(HEADED_ARM_HEADLESS=1 LEG_PROFILE_SETTINGS=/dev/null HEADED_ARM_CLAUDE_C
 check "43 headless console --dry-run: exit 0" "$rc43" "0"
 contains "43 headless console: argv is the background launch" "$out43" "--bg"
 contains "43 headless console: argv keeps the console --settings (HIMMEL-4052)" "$out43" "--settings"
+
+# --- bb (HIMMEL-4832): HEADED_ARM_BUS=1 makes the confirmed claude pid bound to
+# the session name via `bus bind <name> <pid>`. The bus CLI is a recording stub
+# (HEADED_ARM_BUS_CLI); the flag is consumed, never leaked into the session.
+dbb="$tmp/cbb"; mk_stub "$dbb" 1 alive "HIMMEL-busbb"
+cat > "$dbb/bus" <<'BUS_EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$(dirname "$0")/bus-calls"
+[ -z "${BUS_STUB_FAIL:-}" ]
+BUS_EOF
+chmod 755 "$dbb/bus"
+rcbb=0
+HEADED_ARM_BUS=1 HEADED_ARM_BUS_CLI="$dbb/bus" run_headed_arm "$dbb" "$REPO" "HIMMEL-busbb" "docbb.md" "$dbb/signal-never" "$PAST" >/dev/null 2>&1 || rcbb=$?
+wait_record "$dbb" || true
+check "bba bind: launch exit 0" "$rcbb" "0"
+check "bbb bind: bus bind <name> <confirmed pid> called exactly once" "$(cat "$dbb/bus-calls" 2>/dev/null)" "bind HIMMEL-busbb 9001"
+dbbb="$tmp/cbbb"; mk_stub "$dbbb" 1 alive "HIMMEL-busbbb"
+cp "$dbb/bus" "$dbbb/bus"
+rcbbb=0
+HEADED_ARM_BUS_CLI="$dbbb/bus" run_headed_arm "$dbbb" "$REPO" "HIMMEL-busbbb" "docbb.md" "$dbbb/signal-never" "$PAST" >/dev/null 2>&1 || rcbbb=$?
+wait_record "$dbbb" || true
+check "bbc no flag: launch exit 0" "$rcbbb" "0"
+check "bbd no flag: bus is never called" "$([ -e "$dbbb/bus-calls" ] && echo called || echo none)" "none"
+dbbc="$tmp/cbbc"; mk_stub "$dbbc" 1 alive "HIMMEL-busbbc"
+cp "$dbb/bus" "$dbbc/bus"
+rcbbc=0
+BUS_STUB_FAIL=1 HEADED_ARM_BUS=1 HEADED_ARM_BUS_CLI="$dbbc/bus" run_headed_arm "$dbbc" "$REPO" "HIMMEL-busbbc" "docbb.md" "$dbbc/signal-never" "$PAST" >/dev/null 2>&1 || rcbbc=$?
+wait_record "$dbbc" || true
+check "bbe failed bind: launch still exits 0" "$rcbbc" "0"
+contains "bbf failed bind: warned into the arm log" "$(cat "$dbbc/log" 2>/dev/null)" "bus bind of HIMMEL-busbbc to pid 9001 failed"
+
+# --- bg (HIMMEL-5207): a bind that hangs (a stuck registry lock: flock -x with no
+# -w) is bounded by HEADED_ARM_BUS_BIND_SECS; the launch result is unchanged and
+# the timeout is warned into the arm log. The stub stands in for the stuck lock.
+dbg="$tmp/cbg"; mk_stub "$dbg" 1 alive "HIMMEL-busbg"
+cat > "$dbg/bus" <<'BUS_EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$(dirname "$0")/bus-calls"
+exec sleep 60
+BUS_EOF
+chmod 755 "$dbg/bus"
+HEADED_ARM_BUS=1 HEADED_ARM_BUS_CLI="$dbg/bus" HEADED_ARM_BUS_BIND_SECS=2 \
+  run_headed_arm "$dbg" "$REPO" "HIMMEL-busbg" "docbg.md" "$dbg/signal-never" "$PAST" >/dev/null 2>&1 &
+pidbg=$!
+nbg=0
+while kill -0 "$pidbg" 2>/dev/null && [ "$nbg" -lt 150 ]; do sleep 0.1; nbg=$((nbg+1)); done
+if kill -0 "$pidbg" 2>/dev/null; then
+  hungbg=yes; kill "$pidbg" 2>/dev/null; pkill -f "$dbg/bus" 2>/dev/null || true
+else
+  hungbg=no
+fi
+rcbg=0; wait "$pidbg" 2>/dev/null || rcbg=$?
+check "bgg hung bind: headed-arm.sh returns within 15s" "$hungbg" "no"
+check "bgh hung bind: launch exit 0 (fail-open)" "$rcbg" "0"
+contains "bgi hung bind: timeout warned into the arm log" "$(cat "$dbg/log" 2>/dev/null)" "bus bind of HIMMEL-busbg to pid 9001 failed"
+
+# --- bj (HIMMEL-5207, review round 1): a bind that IGNORES SIGTERM is escalated to
+# SIGKILL after a one-second grace, so the post-timeout `wait` cannot hang.
+dbj="$tmp/cbj"; mk_stub "$dbj" 1 alive "HIMMEL-busbj"
+cat > "$dbj/bus" <<'BUS_EOF'
+#!/usr/bin/env bash
+trap '' TERM
+while :; do sleep 1; done
+BUS_EOF
+chmod 755 "$dbj/bus"
+HEADED_ARM_BUS=1 HEADED_ARM_BUS_CLI="$dbj/bus" HEADED_ARM_BUS_BIND_SECS=2 \
+  run_headed_arm "$dbj" "$REPO" "HIMMEL-busbj" "docbj.md" "$dbj/signal-never" "$PAST" >/dev/null 2>&1 &
+pidbj=$!
+nbj=0
+while kill -0 "$pidbj" 2>/dev/null && [ "$nbj" -lt 150 ]; do sleep 0.1; nbj=$((nbj+1)); done
+if kill -0 "$pidbj" 2>/dev/null; then
+  hungbj=yes; kill -9 "$pidbj" 2>/dev/null
+else
+  hungbj=no
+fi
+pkill -9 -f "$dbj/bus" 2>/dev/null || true
+rcbj=0; wait "$pidbj" 2>/dev/null || rcbj=$?
+check "bjj SIGTERM-ignoring bind: headed-arm.sh returns within 15s" "$hungbj" "no"
+check "bjk SIGTERM-ignoring bind: launch exit 0 (fail-open)" "$rcbj" "0"
+contains "bjl SIGTERM-ignoring bind: timeout warned into the arm log" "$(cat "$dbj/log" 2>/dev/null)" "timed out after 2s"
 
 [ "$fails" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "$fails FAILED"; exit 1; }

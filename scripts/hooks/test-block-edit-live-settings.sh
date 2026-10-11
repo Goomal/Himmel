@@ -3012,6 +3012,111 @@ env --split-string='sh\_-c\_"echo x > ~/.claude/s*.json"'
 env -iS 'bash\t-c\t"echo x > ~/.claude/sett*s.json"'
 env -S 'bash -c ${X}'
 ROWS
+# 9500-9505 (HIMMEL-4521): env -S text with an escape or a plain ${NAME} is
+# decoded the way GNU env decodes it and the decoded words are judged, so a
+# harmless one allows; 9510-9522 are the controls that stay denied (the
+# decoded form writes a live settings path, an escape or expansion the
+# decoder does not model, an unterminated quote, a nested env).
+n=9500
+for c in "env -S 'printf a\\tb'" "env -S 'echo \${HOME}'" "env -S 'echo a\\_b'" \
+    "env -S 'echo \"a\\_b\" \\\\ \\\$'" "env -S 'printf \"%s\\n\" x\\ty'" "env -iS 'echo \${HOME}\\tx'"; do
+    assert_rc "$n/wt env -S decoded harmless allows: $c" 0 \
+        "$(bash_rc_of "$NESTED_WT" "$c" HOME="$FAKEHOME")"
+    n=$((n + 1))
+done
+n=9510
+for c in "env -S 'tee ~/.claude/sett\\x69ngs.json'" "env -S 'sh\\_-c\\_\"echo x > ~/.claude/settings.json\"'" \
+    "env -S 'bash -c \"echo x > ~/.cl\\\"\\\"aude/settings.json\"'" "env -S 'tee \${HOME}/.claude/settings.json'" \
+    "env -S 'tee \${H}OME/.claude/settings.json'" "env -S 'echo \"a\\tb'" "env -S 'echo a\\'" \
+    "env -S 'echo \${1X}'" "env -S 'echo \${X'" "env -S 'echo a\\cb'" \
+    "env -S 'env -S \"echo a\\tb\"'" "env -S 'bash -c \${X}'" "env -S '#x\\ty'"; do
+    assert_rc "$n/wt env -S decoded control denies: $c" 2 \
+        "$(bash_rc_of "$NESTED_WT" "$c" HOME="$FAKEHOME")"
+    n=$((n + 1))
+done
+# 9530-9547 (HIMMEL-4521, J2374 #1 + ruling c/b): env splices the decoded words back into
+# its own argv and getopt re-parses them, so a decoded first word that is an
+# env option (-S, -C, -i, -u, --split-string) or a NAME=VALUE assignment is
+# refused by shape; env's options are not modelled inside -S text.
+rows_both 9530 2 "env -S text whose decoded first word is an env option or an assignment denies" <<'ROWS'
+env -S '-S "tee \${HOME}/.claude/settings.json"'
+env -S '-C\_~/.claude\_tee\_settings.json'
+env -S '-i\_echo\_a\_b'
+env -S '--split-string=echo\_a\_b'
+env -S '-u\_X\_echo\_a\_b'
+env -S 'A=B\_echo\_a\_b'
+env -S '\-C\_~/.claude\_tee\_settings.json'
+env -S '\${HOME}=x\_echo\_a'
+env -S '-S\_"echo\_\${HOME}"'
+env -S '-C\_/tmp\_echo\_a\_b'
+env -S '-i echo a'
+env -S 'A=B echo a'
+env -S '-C /tmp echo a'
+env -S "'-i' echo a"
+env -a X -S '-i\_echo\_a\_b'
+env --argv0 X -S 'A=B\_echo\_a'
+env --argv0=X -S '-i\_echo\_a'
+env -a X -S '-i echo a'
+env -S '\_-C\_/x\_tee\_y'
+ROWS
+# 9600-9609 (HIMMEL-4521, J2374b): env takes any unique prefix of a long
+# option, so --argv/--a (argv0), --un (unset) and --ch (chdir) take an
+# argument like their full spelling and the -S text after them is reached
+rows_both 9600 2 "env long-option prefixes take an argument, -S text after them is judged" <<'ROWS'
+env --argv X -S 'sh\_-c\_"echo x > ~/.claude/settings.json"'
+env --a X -S 'sh\_-c\_"echo x > ~/.claude/settings.json"'
+env --un X -S 'sh\_-c\_"echo x > ~/.claude/settings.json"'
+env --ch /tmp -S 'sh\_-c\_"echo x > ~/.claude/settings.json"'
+env --argv X -S '-i\_echo\_a'
+env --a X -S 'A=B\_echo\_a'
+env --un X -S '-i\_echo\_a'
+env --ch /tmp -S '-i\_echo\_a'
+ROWS
+# the -S text followed by further operands is spliced with them: refused
+rows_both 9610 2 "env -S text followed by further operands denies" <<'ROWS'
+env -S 'sh -c' 'echo x > ~/.claude/settings.json'
+env -S 'sh -c' 'echo a'
+env --split-string='echo' a b
+env -S 'echo a' b
+env -S'echo a' b
+env --split-string 'echo' a
+env --i -S 'echo a' b
+ROWS
+# plain env -S 'cmd' with nothing after it allows; --arg is a unique prefix
+# of --argv0 (it takes X), and --i is ambiguous (--ignore-environment vs
+# --ignore-signal) so it takes no argument and X is the command word
+rows_both 9620 0 "plain env -S text without operands, an argv0 prefix, and an ambiguous prefix, allow" <<'ROWS'
+env -S 'echo a'
+env --arg X echo a
+env --i X echo a
+ROWS
+# env -a / --argv0 take an argument, so the -S text after them is reached;
+# a harmless one after them still allows
+assert_rc "9591/wt env -a X -S decoded harmless allows" 0 \
+    "$(bash_rc_of "$NESTED_WT" "env -a X -S 'echo a\\_b'" HOME="$FAKEHOME")"
+# 9570-9577 (HIMMEL-4521, J2374 #2): decoder coverage — the escapes v f #,
+# a literal quote, a second allowlisted first word, the --split-string= and
+# -vS spellings, /usr/bin/env and `command env` on the decoded path.
+rows_both 9570 0 "env -S decoded harmless text (escapes, spellings, wrappers) allows" <<'ROWS'
+env -S 'echo a\vb\fc\#d'
+env -S "echo a\\'b"
+env -S 'printf ${HOME}'
+env -S 'test -n ${HOME}'
+env --split-string='echo a\_b'
+env -vS 'echo a\_b'
+/usr/bin/env -S 'echo a\_b'
+command env -S 'echo a\_b'
+ROWS
+rows_both 9580 2 "env -S decoded tricky text (c in dquote, escape in squote, wrappers) denies" <<'ROWS'
+env -S 'echo "a\cb"'
+env -S "echo 'a\_b'"
+env --split-string='sh\_-c\_"echo x > ~/.claude/settings.json"'
+/usr/bin/env -S 'sh\_-c\_"echo x > ~/.claude/settings.json"'
+command env -vS 'sh\_-c\_"echo x > ~/.claude/settings.json"'
+ROWS
+# the escape r in text, written as a CR byte by rows_both's own unescaping
+assert_rc "9590/wt env -S \\r escape allows" 0 \
+    "$(bash_rc_of "$NESTED_WT" "env -S 'echo a\\rb'" HOME="$FAKEHOME")"
 # 9440-9448 (HIMMEL-4394, J1909 B1): an extglob leaf with two or more groups
 # (`@(settings).js@(on)`, `@(settings)@(.json)`) under a live .claude denies.
 rows_both 9440 2 "an extglob leaf with 2+ groups under a live .claude denies" <<'ROWS'

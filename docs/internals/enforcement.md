@@ -1732,6 +1732,22 @@ settings.json, a hook-wiring change (the "three places" rule in
 PR — the operator no longer hand-edits `.claude/settings.json` inside each
 leg's worktree for every hook-wiring change.
 
+**`env -S` text (HIMMEL-4521).** The Bash arm decodes GNU `env -S` escapes
+(`\c \f \n \r \t \v \# \$ \_ \\ \' \"`, `${NAME}`) and judges the decoded
+words. Anything it does not fully model stays denied: an unknown escape, `\c`,
+an unterminated quote, a `${...}` beyond a plain name, a nested `env`. Because
+env splices the decoded words back into its own argv and getopt re-parses
+them, a first word (decoded or plain) that is an env option (`-S`, `-C`, `-i`,
+`-u`, `--split-string`) or a `NAME=VALUE` assignment is also denied by shape,
+with no attempt to model env's options inside `-S` text. The `-S` text is
+reached after env's own `-a`/`--argv0`/`--unset`/`--chdir` argument as well,
+including any unique prefix of those long options (`--argv`, `--un`, `--ch`).
+`-S` text followed by further operands in the same command is denied too: env
+appends them to the split words, so the text alone is not the command. This
+over-denies the `PYTHONPATH=...` example in GNU's manual on purpose. A text
+decoder cannot close this class (HIMMEL-5233); the structural upgrade is
+HIMMEL-5236, denying live-settings writes by effect, not by command text.
+
 **The Bash/PowerShell arm is textual and blunt (HIMMEL-1525, HIMMEL-3468,
 HIMMEL-3499, HIMMEL-3555).** It does not parse commands. It fires when the
 command text names `settings.json`/`settings.local.json` (rule 1, any verb)
@@ -3698,12 +3714,17 @@ marker families — `worktree` (`.claude/worktrees`, `clean-garden.sh`,
 "open a/the PR", `gh pr edit`), `cr-gate` (`/pr-check`, "CR-clean",
 `clear-cr-marker`, "CodeRabbit"). A single-family match never denies — that
 conjunction is the false-positive budget keeping bounded read-only research
-frictionless. `subagent_type: Explore` always allows — the ONLY carve-out.
+frictionless. `subagent_type: Explore` and `console-judge-ro` (HIMMEL-5180:
+`.claude/agents/console-judge-ro.md` pins `tools: Read, Grep, Glob, Bash`, the
+same structural read-only lane) always allow — the
+ONLY carve-outs. `guard-implementor-dispatch.sh` exempts `console-judge-ro`
+the same way it exempts Explore.
 There is deliberately no prompt-text read-only declaration carve-out: three
 CR rounds each added one and each leaked it a different way (a partial-scope
 aside, an output-shaped phrase, a mode declaration governing a subordinate
 clause rather than the whole dispatch), so it was removed rather than
-patched a fourth time. A genuinely read-only dispatch uses `Explore`, or the
+patched a fourth time. A genuinely read-only dispatch uses `Explore` or
+`console-judge-ro`, or the
 audited `CONSOLE_DISPATCH_OK=1` override below.
 
 **Console detection (fail-open — unknown means NOT console):**
@@ -5439,6 +5460,8 @@ boundary an agent runs under.
 The Jira auto-transition is opt-in per merge (HIMMEL-3143): without `--jira-transition` `merge-on-green.sh` merges, then only records `jira-transition=would-transition key=<KEY> status=<target>` on the `MERGED` audit line — no Jira comment, no transition — so the caller decides (a leg reads its brief's `completes-ticket: yes|no` line, `docs/handover/leg-preface.md` § Shipping — HIMMEL-3271); with the flag it comments and transitions the ticket named by the PR title's `[PROJ-N]` tag (never an Epic/Story; any unreadable step degrades to a `skip=…` result, never a failed merge). It used to fire on every merge and closed a ticket whose sibling work was still owed, which no "no other open PR" heuristic can detect, so it stays opt-in rather than heuristic. A PR carrying two ticket tags transitions only the first.
 It also exits 17 (`policy-refused phase=console-go`) when `HIMMEL_CONSOLE_LEG` is set — exported by `console-kit/headed-arm-leg.sh` into every console-spawned leg — and `go_gate` (`scripts/lib/go-gate.sh`, shared with `block-unresolved-cr-merge.sh`'s Console-GO gate and with `go.sh`; see there) finds `<handover_root>/.locks/go/<pr>.<certified head sha>` missing or not carrying `head=<that sha>` (a broken/truncated `go-gate.sh` refuses too: `phase=console-go-lib-missing` / `console-go-symbol-missing`); the gate runs before the marker clear and before `--dry-run`, so a refused leg mutates nothing and a dry run reports the refusal, and the merge itself pins `--match-head-commit` to that same certified sha; only the console writes it, via `console-kit/go.sh` (which refuses under the marker), and `scripts/chokepoints.json` registers the marker so a per-call `HIMMEL_CONSOLE_LEG=` prefix is denied (HIMMEL-2919). A `--judge` leg (HIMMEL-3133) is the same `HIMMEL_CONSOLE_LEG=1` process, so it is blocked from writing its own `GO` by this exact same gate — Guard E needs no judge marker for that; "the judge is a leg" (design §3.2). HIMMEL-4564 later added a separate `HIMMEL_CONSOLE_JUDGE=1` marker for a different job, the write fence below.
 
+**Plugin-bump recheck (HIMMEL-5188, HIMMEL-5203, HIMMEL-5208).** `merge-on-green.sh` exits 23 when a PR touching `marketplace/plugins/` is no longer a version bump against the live base. It runs `scripts/check-plugin-drift.sh --bump-required` from a freshly fetched base-tip copy (with `scripts/lib/vm-mode.sh`); a checker blob that cannot be read OR is empty refuses (an empty script exits 0), and a checker that exits 0 without one of its fixed success lines (`every changed plugin bumped its version` / `no plugin files changed`, whole line) refuses too, so a newline-only or unrelated-output stub is no verdict. `scripts/check-plugin-drift.sh` is in `ci-trust-paths.txt` because the gate executes it (`vm-mode.sh` is covered by `^scripts/lib/`). Residual window: a sibling PR merging between the recheck and `gh pr merge` is not seen; closing it needs a server-side merge queue or required up-to-date branch, like the HIMMEL-1105 retarget window.
+
 **Judge write guard** (`scripts/hooks/guard-judge-writes.sh`, plugin copy `marketplace/plugins/himmel-ops/hooks/guard-judge-writes.sh`, HIMMEL-4564/4608/4614). With `HIMMEL_CONSOLE_JUDGE=1` (exported by `headed-arm-leg.sh --judge`) it denies a judge every push, PR write, merge, GO, inbox send, Jira write and non-qmd MCP call, and any Write/Edit outside: `~/.cache/himmel/verdicts/`, `/tmp/claude-<uid>/`, `<handover root>/**/verdicts/<qid>/` and the judge's own doc. The doc and qid come from `HIMMEL_CONSOLE_JUDGE_DOC` / `HIMMEL_CONSOLE_JUDGE_QID`, both set by the launcher (the qid is the `<qid>` of the judge's `resume_cwd` `~/.cache/himmel/verdicts/<qid>/scratch`); a missing or malformed value allows nothing under the handover root, so a judge cannot forge a sibling judge's verdict or doc. A symlink that does not resolve is denied. Bash file writes are not screened (residual, HIMMEL-4607). With the marker unset it is a silent no-op.
 It exits 21 (`REFUSED reason=trust-path`, HIMMEL-3895) for EVERY caller, leg or not, when the PR's diff touches a CI trust path and the GO does not carry a valid trust-reviewed mac. The pattern list (`scripts/ci/ci-trust-paths.txt`, one ERE per line) is read from the repo's default branch via the contents API, never the PR head or a worktree file, so a PR editing the list cannot shrink its own gate; the PR's files come from REST `pulls/<n>/files` (paginated, renames match on both names), the listed count must equal `changed_files`, and the head sha is re-read around the listing so a push mid-check refuses. A missing list, an empty one, an invalid ERE or any unreadable step refuses; the one exception is a 404 when the anchor checkout's `origin` URL positively names a different github.com repo, which is audited `TRUST not-adopted` and merges as before (an unreadable origin or an SSH host alias cannot prove that, so it refuses). A trust-path PR additionally refuses while the anchor checkout is behind `origin` (`git ls-remote origin HEAD` not an ancestor of the anchor's HEAD), so the gate code that runs is current. The GO passes only when `go_trust_gate` (`scripts/lib/go-gate.sh`) verifies the ordinary GO and a `trust-reviewed=<id>` line inside its mac — `go.sh --trust-reviewed <id>` signs `himmel-go-trust-v1|nwo|pr|sha|id`, a separate domain from the ordinary `himmel-go-v2` mac, so an ordinary GO cannot be relabelled and the id cannot be edited after signing; success is audited `TRUST reviewed … trust=<id>`. Residual risk: the key (`~/.config/himmel/go-hmac.key`) is readable by the same uid every leg runs as, so the mac proves the file came through `go.sh`, not that a human or judge ran it; and a raw `gh pr merge` bypasses merge-on-green entirely — binding the trust review to required CI on the base is HIMMEL-3897 (H1).
 That is why merge-on-green deliberately does NOT
@@ -5588,6 +5611,51 @@ cursor commits past the emitted records only. `record-hook-integrity.sh` also
 pins `marketplace/plugins/himmel-bus/lib/*.mjs`, and `bus-deliver-run.js` stays
 silent (fails closed) if one differs from its pin. `server/index.mjs` and
 `scripts/telegram/bus.ts` sit outside the pinned dirs (residual).
+
+### himmel-bus store guard — a speed bump, not a fence (HIMMEL-4829)
+
+`guard-bus-store.sh` is a PreToolUse hook on the Bash chain and on the
+`Edit|Write|MultiEdit|NotebookEdit` chain (HIMMEL-4818 threat model T3, T5, T6).
+Phase 1 runs every session and the store as one uid, so the guard only makes the
+tool-driven routes to forged or leaked bus state cost a denial; direct writes are
+*detected* by the hash chain, and *prevention* needs the phase-2 second uid.
+
+| Denied | Matched as |
+|---|---|
+| any Bash command that names the bus root (read or write) | `himmel/bus` followed by `/`, end of word or any char outside `[A-Za-z0-9_.-]` (so `himmel/bus.json` is not the root), and not preceded by `[A-Za-z0-9_-]`, in any spelling of the state home |
+| any Bash command whose `.cwd` is under the bus root, or is the himmel state dir (`$XDG_STATE_HOME/himmel` normalised after appending `/himmel`) while the command has a bounded `bus` token with or without a slash (`grep -r . bus`, `tar cf - bus`) | the payload `cwd` (text and `readlink -m`); `bus status` run from the state dir is over-denied on purpose |
+| a command that names the state dir (`state/himmel`, `$XDG_STATE_HOME/himmel`, `${XDG_STATE_HOME}/himmel`) and a bounded `bus` token anywhere | closes the in-command `cd ~/.local/state/himmel && cat bus/log/x` form |
+| a `bus` call split over lines with backslash-newline (`b\<nl>us`, `reg\<nl>ister`) | continuations are joined (the pair removed, as bash does) before the segment split |
+| a verb that can spell `register`/`bind`/`rebind` without writing it (`$'reg\x69ster'`, `$'\162egister'`, `reg$x`, `r?gister`, `reg[i]ster`, `re${x}ister`, `reg$(printf i)ster`) after a `bus`-able word in the segment | same normaliser as the `bus` side: ANSI-C escapes and expansions become `*`, the whole word is glob-matched against the three verbs, and a bare `$x` (no literal character) is not a verb, so `bus send c $BODY` stays allowed; a bare variable-held verb is a residual (HIMMEL-5206) |
+| a word that can spell `bus` without writing it: `b''us`, `b?s`, `b[u]s`, `b*s`, `b{u,x}s`, `b${x}us`, `$'\x62'us`, `b$(true)us`, ``b`true`us``, `b""us`; a glob or expansion right under `himmel/` | per path component, quotes and parens dropped, each expansion or command substitution replaced by `*`, then glob-matched against `bus`; the early exit lets any payload with a quote (a JSON-escaped `\"` included), backtick, `$`, glob character, backslash or brace through to these rules |
+| a substitution body (`$(bus register x)`, `echo "$(bus rebind z)"`, `cat <(bus bind y)`, backticks) | an opener left open by the word split (`$(`, `<(`, `>(`, backtick, `${`) ends its word and the text after it starts a segment of its own; an opener alone is never a `bus` or verb candidate, so `diff <(sort a) <(sort b)`, `gh pr create --title "$(git log -1) ..." --body "$(cat f)"` and `echo $((a + b)) $((c + d))` stay allowed; an opener glued to a word (`b$(printf u)s`) keeps the segment; a body is nested: the outer state is saved when it opens and OR-ed back at its `)` or closing backtick (a close never lowers it), so `bus $(true) register x`, `bus <(:) rebind x`, `( bus --summary ')' register x )` and ``echo `bus --summary \) bind x 1` `` still pair `bus` with the verb; a body inherits the outer state, a close never found keeps the rest of the segment outer (fail closed), and parens are counted without modelling quotes (HIMMEL-5238 is the structural answer) |
+| a path spelled with `//` or `/./` (`himmel//bus`, `himmel/./bus`) | repeated slashes and `/./` are collapsed before matching |
+| `bus register`, `bus bind`, `bus rebind` | a bounded `bus` word, then a bounded verb later in the same segment (split on `;` `&` `|` newline), so `bin/bus register`, `bus --role leg register x`, `bus 'register' x` and `"bus" register x` count; `bus send c /tmp/register.txt` does not |
+| assigning `HIMMEL_BUS_*` (`X=1 cmd`, `export`, `env`) | `HIMMEL_BUS_<name>=` (`+=` too) in the raw text and in the quote- and backslash-stripped text (`HIMMEL_BUS_"NAME"=x`, `HIMMEL_BUS_NA\ME=x`); a non-plain word holding `=` is run through the same normaliser, and its name part (before the first `=`) is denied when it glob-matches a `HIMMEL_BUS_*` variable the repo uses or the pattern `HIMMEL_BUS_*` (`HIMMEL_BUS_${x}=1`, `HIM${y}EL_BUS_NAME=x`, `$'HIMMEL_BUS_NAME=x'`); a name with no literal character (`env "$K=$V" cmd`) is a residual (HIMMEL-5206); reading one is not an assignment |
+| Write/Edit/MultiEdit/NotebookEdit on a path under the bus root | the path text, or its `readlink -m` resolution |
+
+`bus status|peers|wait|send|adopt` and everything else stay allowed, silently.
+**Fails closed only for its subject:** a payload it cannot parse (missing `jq`,
+bad JSON, a non-string command) is scanned as raw text and denied when it names
+the bus root; otherwise it is allowed, so a hook bug never locks a session out.
+Bypass: `BUS_STORE_GUARD_OK=1` in the launching shell (session-sticky) — needed
+to `bus register`/`bind` by hand; the launcher's own call runs inside a script
+and never appears in a tool call. Suite: `scripts/hooks/test-guard-bus-store.sh`.
+
+**Residual (text matching, not a shell parser):** an interpreter that assembles
+the path, a renamed copy of the CLI, `eval`, a script file that does the write, a
+`$(...)`-built path, a Bash command that goes through a symlink alias (only
+file-tool paths are resolved; a symlinked payload `cwd` is HIMMEL-5206), a
+payload with no `jq` where only the raw root text is scanned, a separator
+inside a quoted option value, the verb fed on stdin to `xargs`, the verb or
+path held in a shell variable (`v=register; bus $v x`), and the Read/Grep tools
+(not wired to this hook) all get past it. Conversely the guard over-denies, in
+the safe direction: a command that merely quotes the root (a `git grep`, a PR
+body), a verb word after a bus-able word in the same segment (`bus send ...
+--summary "rebind done"`; `bus send c b*`, a glob or expansion word that could
+expand to a verb), a glob or expansion under `himmel/`, and any word
+that can expand to `bus` (`*`, `b?s`, `$x`) once the cwd or command names the
+state dir. A same-uid process that re-chains the log is undetected until phase 2.
 
 ### Hook-integrity pin: monotonic re-pin + anchor-tamper fence (HIMMEL-2528)
 

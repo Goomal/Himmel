@@ -171,6 +171,16 @@
 #       commits or the red run's failed log cannot be read. No completed run at all is allowed (audited). The message
 #       names the run and the commit range it covered. After the trust-path
 #       gate, before any mutation, on --dry-run too.
+#   23  plugin-bump recheck (HIMMEL-5188): the PR changes a file under
+#       marketplace/plugins/ and `check-plugin-drift.sh --bump-required`, run
+#       from the freshly fetched base tip's own copy against the certified PR
+#       head, says it is not a version bump over the live base (a sibling PR
+#       bumped the same plugin first). Also when the file list, the base or head
+#       fetch, the checker blobs or the scratch repo cannot be read, a checker
+#       blob is empty (HIMMEL-5203), the checker exits 0 without its fixed
+#       success line (empty or unrelated output, HIMMEL-5208), or the fetched
+#       head is not the certified sha. After the main-red gate, before
+#       any mutation, on --dry-run too.
 #
 # Environment:
 #   ARMAUTOMERGE           Must be truthy (1/true/on/yes) to enable at all.
@@ -1026,6 +1036,103 @@ elif [ "$mr_conc" != success ]; then
     done <<< "$mr_msgs"
     [ -n "$mr_ok" ] || main_red_refuse "main's latest completed CI run $mr_run is $mr_conc, covering commits $mr_range, and PR #$pr_num does not declare itself the fix — $mr_how; merge the fix first, or wait for the next green sweep" "run=$mr_run conclusion=$mr_conc range=$mr_range"
     audit "MAIN-RED main-red-declared repo=$nwo pr=#$pr_num sha=$sha run=$mr_run conclusion=$mr_conc range=$mr_range via=$mr_ok"
+fi
+
+# PLUGIN-BUMP RECHECK GATE (HIMMEL-5188) — CI's plugin-version-bump job went
+# green against whatever the base was when it ran. A sibling PR that bumped the
+# same plugin to the same version and merged afterwards leaves this PR green
+# yet no longer a bump, and the job body itself is PR-editable. This is the one
+# place that sees the live base, so it re-runs `check-plugin-drift.sh
+# --bump-required` here: the checker comes from a freshly fetched base tip
+# (never the PR checkout's copy — the same blobs the CI job copies, HIMMEL-5195)
+# and runs in a throwaway repo whose HEAD is the PR head, which must equal the
+# certified sha. Only a PR whose file list touches marketplace/plugins/ pays for
+# it. Fail CLOSED (exit 23): an unreadable file list, an unfetchable base or
+# head, a head that is not the certified one, or a checker blob that cannot be
+# read all refuse. Fetch targets are private refs under refs/himmel-mog-bump/
+# in the anchor, deleted again. Placed after the main-red gate and before the
+# marker clear / DRY_RUN, so a refusal mutates nothing and a dry run reports it.
+# The base-tip checker is what this gate executes, so scripts/check-plugin-drift.sh
+# is in ci-trust-paths.txt (scripts/lib/vm-mode.sh is covered by ^scripts/lib/)
+# and an empty or missing checker blob refuses (HIMMEL-5203).
+# ponytail: the base tip is read once here, so a sibling PR that merges between
+# this recheck and `gh pr merge` is not seen (the base re-verification below
+# re-reads the base branch name, not its tip); upgrade path is a server-side
+# merge queue or required up-to-date branch, as for the HIMMEL-1105 window
+# (HIMMEL-5203; not narrowed, no cheap client-side seam exists).
+bp_ns="refs/himmel-mog-bump/$pr_num"
+bp_tmp=""
+bp_cleanup() {
+    git -C "$himmel_repo" update-ref -d "$bp_ns/base" >/dev/null 2>&1 || true
+    git -C "$himmel_repo" update-ref -d "$bp_ns/head" >/dev/null 2>&1 || true
+    [ -z "$bp_tmp" ] || rm -rf "$bp_tmp"
+    bp_tmp=""
+}
+bump_refuse() {
+    bp_cleanup
+    echo "merge-on-green: plugin-bump gate: $1 — not merging." >&2
+    audit "REFUSED reason=plugin-bump repo=$nwo pr=#$pr_num sha=$sha $2"
+    exit 23
+}
+bp_rc=0
+bp_files=$("$GH" api "repos/$nwo/pulls/$pr_num/files" --paginate \
+    --jq '.[] | .filename, (.previous_filename // empty)' 2>/dev/null) || bp_rc=$?
+[ "$bp_rc" -eq 0 ] || bump_refuse "cannot list PR #$pr_num's files (gh api exit $bp_rc), so it is unknown whether it changes a plugin" "phase=files rc=$bp_rc"
+# Match in-shell, never `| grep -q` / `| grep -m1` under pipefail: an early
+# exit SIGPIPEs the producer and a large list would read as "no plugin file".
+# The files endpoint stops at 3000 entries even paginated, so a list that
+# long may be truncated: run the check (it diffs the real range itself).
+bp_hit=""
+case $'\n'"$bp_files" in
+    *$'\n'marketplace/plugins/*) bp_hit=1 ;;
+esac
+bp_nlines=$(printf '%s\n' "$bp_files" | wc -l | tr -d ' ')
+if [ -n "$bp_hit" ] || [ "${bp_nlines:-0}" -ge 3000 ]; then
+    bp_tmp=$(mktemp -d "${TMPDIR:-/tmp}/mog-bump.XXXXXX" 2>/dev/null) || bp_tmp=""
+    [ -n "$bp_tmp" ] && [ -d "$bp_tmp" ] || bump_refuse "cannot create a scratch directory for the recheck" "phase=scratch"
+    bp_fetch_rc=0
+    git -C "$himmel_repo" fetch --no-tags --quiet origin \
+        "+refs/heads/$default_branch:$bp_ns/base" "+refs/pull/$pr_num/head:$bp_ns/head" >/dev/null 2>"$bp_tmp/fetch.err" || bp_fetch_rc=$?
+    [ "$bp_fetch_rc" -eq 0 ] || bump_refuse "cannot fetch $default_branch and PR #$pr_num's head from the anchor's origin (exit $bp_fetch_rc)" "phase=fetch rc=$bp_fetch_rc"
+    bp_base=$(git -C "$himmel_repo" rev-parse --verify --quiet "$bp_ns/base^{commit}" 2>/dev/null) || bp_base=""
+    bp_head=$(git -C "$himmel_repo" rev-parse --verify --quiet "$bp_ns/head^{commit}" 2>/dev/null) || bp_head=""
+    [ -n "$bp_base" ] && [ -n "$bp_head" ] || bump_refuse "the fetched base or PR head does not resolve to a commit" "phase=resolve"
+    [ "$bp_head" = "$sha" ] || bump_refuse "PR #$pr_num's head on origin is ${bp_head:0:12}, not the certified ${sha:0:12}, so the recheck would not judge the head being merged" "phase=head-moved fetched=$bp_head"
+    mkdir -p "$bp_tmp/checker/scripts/lib" "$bp_tmp/work" || bump_refuse "cannot lay out the scratch checker" "phase=scratch"
+    for bp_blob in scripts/check-plugin-drift.sh scripts/lib/vm-mode.sh; do
+        git -C "$himmel_repo" show "$bp_base:$bp_blob" > "$bp_tmp/checker/$bp_blob" 2>/dev/null \
+            || bump_refuse "cannot read $bp_blob at the base tip ${bp_base:0:12}" "phase=checker-blob blob=$bp_blob"
+        # HIMMEL-5203: an empty blob reads fine and an empty checker exits 0,
+        # which would pass the gate; an empty file is no checker at all.
+        [ -s "$bp_tmp/checker/$bp_blob" ] \
+            || bump_refuse "$bp_blob is empty at the base tip ${bp_base:0:12}, so the recheck has no checker to run" "phase=checker-blob blob=$bp_blob empty=1"
+    done
+    bp_gc=$(git -C "$himmel_repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || bp_gc=""
+    bp_ok=0
+    if [ -n "$bp_gc" ] && git -C "$bp_tmp/work" init -q >/dev/null 2>&1 \
+            && printf '%s\n' "$bp_gc/objects" > "$bp_tmp/work/.git/objects/info/alternates" \
+            && git -C "$bp_tmp/work" update-ref refs/heads/plugin-bump-base "$bp_base" \
+            && git -C "$bp_tmp/work" update-ref --no-deref HEAD "$bp_head"; then
+        bp_ok=1
+    fi
+    [ "$bp_ok" -eq 1 ] || bump_refuse "cannot build the scratch repo for the recheck" "phase=scratch-repo"
+    bp_out=""
+    bp_chk_rc=0
+    bp_out=$(cd "$bp_tmp/work" && env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+        bash "$bp_tmp/checker/scripts/check-plugin-drift.sh" --bump-required refs/heads/plugin-bump-base 2>&1) || bp_chk_rc=$?
+    if [ "$bp_chk_rc" -ne 0 ]; then
+        bump_refuse "PR #$pr_num is not a plugin version bump against the live $default_branch tip ${bp_base:0:12}: $bp_out" "phase=check rc=$bp_chk_rc base=$bp_base"
+    fi
+    # HIMMEL-5208: exit 0 alone is no verdict (a newline-only or shebang-only
+    # blob exits 0 too). Require one of the checker's fixed success lines,
+    # whole-line, in its output; empty or unrelated output fails closed.
+    bp_pfx="check-plugin-drift --bump-required: "
+    case $'\n'"$bp_out"$'\n' in
+        *$'\n'"${bp_pfx}every changed plugin bumped its version"$'\n'* | *$'\n'"${bp_pfx}no plugin files changed"$'\n'*) ;;
+        *) bump_refuse "the base-tip checker exited 0 without its success line, so it gave no verdict on PR #$pr_num" "phase=checker-blob no-success-line=1 base=$bp_base" ;;
+    esac
+    bp_cleanup
+    audit "PLUGIN-BUMP ok repo=$nwo pr=#$pr_num sha=$sha base=$bp_base"
 fi
 
 # MARKER CLEAR (HIMMEL-1346) — a merge used to leave the branch's cr-pending

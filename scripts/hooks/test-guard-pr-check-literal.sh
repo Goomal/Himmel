@@ -1163,7 +1163,9 @@ case "$item_rc" in
 esac'
 run "base pr-check.md 4.6/4.7 case-fence literal, clean tree -> still denied (HIMMEL-3707, guard unchanged)" 2 \
     "$(payload "$OLD_ITEM_FENCE" "$WT")" "$HR"
-need_in_err "deny names the unresolvable operand" "does not resolve to this root's"
+# HIMMEL-5102 (j2328c): a tokenizer failure is now unsafe on its own, so this
+# fence is refused by the generic git-option deny before the operand check.
+need_in_err "deny names the tokenizer failure as unsafe" "cannot be proven to be pathspec mentions"
 
 # The rewritten pr-check.md 4.6/4.7 literal (HIMMEL-3707 fix): one plain bash
 # call, no case statement left for the tokenizer to misread -> allow.
@@ -1755,7 +1757,324 @@ done
 # shellcheck disable=SC2016 # the $( is literal hook input
 run "HIMMEL-4953 accepted over-deny [wc + unrelated substitution] -> deny" 2 \
     "$(payload 'wc -l scripts/cr/pr-check-env.sh; echo $(date)' "$WT")" "$HR"
+# HIMMEL-5102: `git bisect run <prog>` and `git rebase -x|--exec <cmd>` run an
+# arbitrary program, so a guarded script named beside them is never a pathspec
+# mention. Every spelling (separate, joined, = form, bundled) is denied.
+for v in \
+    'git bisect run bash scripts/cr/pr-check-env.sh' \
+    'git bisect run scripts/cr/pr-check-env.sh' \
+    'git bisect run -- bash scripts/cr/pr-check-env.sh' \
+    'git bisect run bash -c x scripts/cr/' \
+    'git --no-pager bisect run bash -c x scripts/cr/' \
+    'git -C . bisect run bash scripts/cr/pr-check-env.sh' \
+    'git rebase -x bash scripts/cr/pr-check-env.sh' \
+    'git rebase -xbash scripts/cr/pr-check-env.sh' \
+    'git rebase -x "bash scripts/cr/pr-check-env.sh" main' \
+    'git rebase -i -x bash scripts/cr/pr-check-env.sh' \
+    'git rebase -ix bash scripts/cr/pr-check-env.sh' \
+    'git rebase --exec bash scripts/cr/pr-check-env.sh' \
+    'git rebase --exec=bash scripts/cr/pr-check-env.sh' \
+    'git rebase --exec "bash scripts/cr/pr-check-env.sh" main' \
+    'git rebase -x bash main -- scripts/cr/' \
+    'git rebase -x bash -- scripts/handover/' \
+    'git rebase --exec bash main scripts/cr/' \
+    'git rebase -i main -x bash scripts/cr/pr-check-env.sh'; do
+    run "HIMMEL-5102 bisect run / rebase exec [$v] -> deny" 2 "$(payload "$v" "$WT")" "$HR"
+done
+# Controls: the non-running bisect verbs and a plain or interactive rebase.
+for v in \
+    'git bisect start' \
+    'git bisect good' \
+    'git bisect bad' \
+    'git bisect reset' \
+    'git bisect log' \
+    'git rebase -i main' \
+    'git rebase main' \
+    'git rebase --continue' \
+    'git rebase --abort' \
+    'git log --oneline -3 -- scripts/cr/pr-check-env.sh' \
+    'git grep -e run -- scripts/cr/pr-check-env.sh'; do
+    run "HIMMEL-5102 control [$v] -> allow" 0 "$(payload "$v" "$WT")" "$HR"
+done
+# Round 2 (judge j2328a): an unknown global option before the subcommand, an
+# abbreviated --exec, a redirect before the run verb, a glob in the verb slot,
+# and the policy rows (fail closed whenever a program is run, no writer named).
+for v in \
+    'git -P rebase -x scripts/cr/pr-check-env.sh main' \
+    'git -p rebase -x scripts/cr/pr-check-env.sh main' \
+    'git --paginate rebase -x scripts/cr/pr-check-env.sh main' \
+    'git --bare rebase -x scripts/cr/pr-check-env.sh main' \
+    'git --literal-pathspecs rebase -x scripts/cr/pr-check-env.sh main' \
+    'git --no-replace-objects rebase -x scripts/cr/pr-check-env.sh main' \
+    'git --no-optional-locks rebase -x scripts/cr/pr-check-env.sh main' \
+    'git -P bisect run scripts/cr/pr-check-env.sh' \
+    'git -p bisect run scripts/cr/pr-check-env.sh' \
+    'git --paginate bisect run scripts/cr/pr-check-env.sh' \
+    'git --bare bisect run scripts/cr/pr-check-env.sh' \
+    'git rebase --ex scripts/cr/pr-check-env.sh' \
+    'git rebase --exe scripts/cr/pr-check-env.sh' \
+    'git rebase --ex=scripts/cr/pr-check-env.sh' \
+    'git rebase --exe=scripts/cr/pr-check-env.sh' \
+    'git bisect 2>&1 run scripts/cr/pr-check-env.sh' \
+    'git bisect >/dev/null run scripts/cr/pr-check-env.sh' \
+    'git bisect </dev/null run scripts/cr/pr-check-env.sh' \
+    'git bisect r[u]n scripts/cr/pr-check-env.sh' \
+    'git bisect "run" scripts/cr/pr-check-env.sh' \
+    'git rebase -kx scripts/cr/pr-check-env.sh' \
+    'git -c k=v rebase -x scripts/cr/pr-check-env.sh main' \
+    'git bisect start; git bisect run scripts/cr/pr-check-env.sh' \
+    'git bisect run make' \
+    'git rebase -x "npm test" main'; do
+    run "HIMMEL-5102 round2 [$v] -> deny" 2 "$(payload "$v" "$WT")" "$HR"
+done
+for v in \
+    'git rebase -s ort main' \
+    'git rebase -X theirs main' \
+    'git rebase -Xsubtree=x main' \
+    'git rebase -Sx main' \
+    'git rebase -C1 main' \
+    'git rebase -rx main'; do
+    run "HIMMEL-5102 round2 control [$v] -> allow" 0 "$(payload "$v" "$WT")" "$HR"
+done
+# Round 3 (judge j2328b): a valued global option after an unknown one takes its
+# value as the subcommand, and a command word the tokenizer cannot parse.
+# shellcheck disable=SC2016 # a literal ${x:-y} is the tokenizer-failure payload
+for v in \
+    'git -P --namespace bisect rebase -x scripts/cr/pr-check-env.sh main' \
+    'git -P --namespace rebase bisect run scripts/cr/pr-check-env.sh' \
+    'git "--namespace" bisect rebase -x scripts/cr/pr-check-env.sh main' \
+    'git --bare --namespace bisect rebase -x scripts/cr/pr-check-env.sh main' \
+    'git -P -C bisect rebase -x scripts/cr/pr-check-env.sh main' \
+    'git -P --git-dir bisect bisect run scripts/cr/pr-check-env.sh' \
+    'git -P --work-tree bisect rebase -x scripts/cr/pr-check-env.sh main' \
+    'g\it rebase -x scripts/cr/pr-check-env.sh main; : ${x:-y}' \
+    "g''it bisect run scripts/cr/pr-check-env.sh; : \${x:-y}"; do
+    run "HIMMEL-5102 round3 [$v] -> deny" 2 "$(payload "$v" "$WT")" "$HR"
+done
+for v in \
+    'git -P --namespace bisect log -- scripts/cr/pr-check-env.sh' \
+    'git -P --namespace rebase main'; do
+    run "HIMMEL-5102 round3 control [$v] -> allow" 0 "$(payload "$v" "$WT")" "$HR"
+done
+# Round 4 (codex-1): a later bisect/rebase operand word must not overwrite the
+# other builtin's armed state.
+for v in \
+    'git -P rebase bisect -x scripts/cr/pr-check-env.sh main' \
+    'git -P bisect rebase -x scripts/cr/pr-check-env.sh main' \
+    'git -P rebase bisect --exec scripts/cr/pr-check-env.sh main'; do
+    run "HIMMEL-5102 round4 [$v] -> deny" 2 "$(payload "$v" "$WT")" "$HR"
+done
+run "HIMMEL-5102 round4 control [git -P rebase bisect main] -> allow" 0 "$(payload 'git -P rebase bisect main' "$WT")" "$HR"
+# Round 5 (judge j2328c): a glob/brace word in the subcommand slot, and a
+# tokenizer failure on an obfuscated git word, fail closed.
+for v in \
+    'git re[b]ase -x scripts/cr/pr-check-env.sh main' \
+    'git rebase{,} -x scripts/cr/pr-check-env.sh main' \
+    'git re?ase -x scripts/cr/pr-check-env.sh main' \
+    'git bi[s]ect run scripts/cr/pr-check-env.sh' \
+    'git re[b]ase -x "npm test" main' \
+    $'g\\\nit rebase -x scripts/cr/pr-check-env.sh main ; : ${x:-y}' \
+    $'$\'\\x67\'it rebase -x scripts/cr/pr-check-env.sh main' \
+    $'$(printf \'\\147it\') rebase -x scripts/cr/pr-check-env.sh main'; do
+    run "HIMMEL-5102 round5 [$v] -> deny" 2 "$(payload "$v" "$WT")" "$HR"
+done
+for v in \
+    'git log -- docs/*.md' \
+    'git -P grep foo -- scripts/*'; do
+    run "HIMMEL-5102 round5 control [$v] -> allow" 0 "$(payload "$v" "$WT")" "$HR"
+done
+# Round 6 (judge j2328d): an unknown first word may be an alias for rebase or
+# bisect (`git rb -x CMD`); arm both, fail closed.
+for v in \
+    'git rb -x scripts/cr/pr-check-env.sh main' \
+    'git config alias.rb rebase; git rb -x scripts/cr/pr-check-env.sh main' \
+    'git bs run scripts/cr/pr-check-env.sh' \
+    'git rb -x "npm test" main'; do
+    run "HIMMEL-5102 round6 [$v] -> deny" 2 "$(payload "$v" "$WT")" "$HR"
+done
+# An alias behind an unknown global option stays armed too.
+for v in \
+    'git -P rb -x scripts/cr/pr-check-env.sh main' \
+    'git --bare rb -x scripts/cr/pr-check-env.sh main' \
+    'git -P bs run scripts/cr/pr-check-env.sh'; do
+    run "HIMMEL-5102 round6 [$v] -> deny" 2 "$(payload "$v" "$WT")" "$HR"
+done
+run "HIMMEL-5102 round6 control [git -P log --oneline] -> allow" 0 "$(payload 'git -P log --oneline' "$WT")" "$HR"
 g -C "$WT" checkout -q -- scripts/cr/pr-check-env.sh
+
+# HIMMEL-5170 (j2328a follow-up): git runs an editor or an alias program the
+# guard never reads. An editor env prefix, or a git config write of an editor
+# or alias key, that names a guarded writer is denied (the VAR= prefix only
+# sets `wrapped`, and the positional `git config <key> <value>` is a later
+# call). Fail closed on the hook key, not on each spelling.
+for v in \
+    'GIT_SEQUENCE_EDITOR=scripts/cr/write-verdicts.sh git rebase -i main' \
+    'GIT_SEQUENCE_EDITOR="scripts/cr/write-verdicts.sh" git rebase -i main' \
+    'GIT_EDITOR=scripts/cr/write-verdicts.sh git commit' \
+    'EDITOR=scripts/cr/write-verdicts.sh git commit' \
+    'VISUAL=scripts/cr/write-verdicts.sh git commit' \
+    'GIT_EDITOR=scripts/handover/merge-on-green.sh git commit' \
+    'git config sequence.editor scripts/cr/write-verdicts.sh' \
+    'git config core.editor scripts/cr/write-verdicts.sh' \
+    'git config --global core.editor scripts/cr/write-verdicts.sh' \
+    'git config --local sequence.editor "scripts/cr/write-verdicts.sh"' \
+    'git config alias.rb "!scripts/cr/write-verdicts.sh"' \
+    'git config alias.rb !scripts/cr/write-verdicts.sh' \
+    'git config alias.ci "commit -F scripts/cr/write-verdicts.sh"' \
+    'GIT_EDITOR+=scripts/cr/write-verdicts.sh git commit' \
+    'GIT_SEQUENCE_EDITOR+=scripts/cr/write-verdicts.sh git rebase -i main' \
+    'export EDITOR+=scripts/cr/write-verdicts.sh; git commit' \
+    'printf -v GIT_EDITOR %s scripts/cr/write-verdicts.sh; export GIT_EDITOR; git commit' \
+    'GIT_PAGER=scripts/cr/write-verdicts.sh git log' \
+    'PAGER=scripts/cr/write-verdicts.sh git log' \
+    'GIT_SSH_COMMAND=scripts/cr/write-verdicts.sh git fetch' \
+    'GIT_SSH=scripts/cr/write-verdicts.sh git fetch' \
+    'GIT_ASKPASS=scripts/cr/write-verdicts.sh git fetch' \
+    'GIT_PROXY_COMMAND=scripts/cr/write-verdicts.sh git fetch' \
+    'git config core.gitProxy scripts/cr/write-verdicts.sh' \
+    "git config credential.helper '!scripts/cr/write-verdicts.sh'" \
+    'git config merge.x.driver scripts/cr/write-verdicts.sh' \
+    'git config mergetool.x.path scripts/cr/write-verdicts.sh' \
+    'git config gpg.program scripts/cr/write-verdicts.sh' \
+    'git config uploadpack.packObjectsHook scripts/cr/write-verdicts.sh' \
+    'git config web.browser scripts/cr/write-verdicts.sh' \
+    'git send-email --to-cmd=scripts/cr/write-verdicts.sh x.patch' \
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=interactive.diffFilter GIT_CONFIG_VALUE_0=scripts/cr/write-verdicts.sh git add -p' \
+    'git config sendemail.sendmailCmd scripts/cr/write-verdicts.sh' \
+    "git config submodule.x.update '!scripts/cr/write-verdicts.sh'" \
+    'git config core.alternateRefsCommand scripts/cr/write-verdicts.sh' \
+    'git log --output=scripts/cr/write-verdicts.sh' \
+    'git fetch --upload-pack scripts/cr/write-verdicts.sh origin' \
+    'git grep -O scripts/cr/write-verdicts.sh x' \
+    'git difftool --extcmd=scripts/cr/write-verdicts.sh' \
+    'git commit --template=scripts/cr/write-verdicts.sh' \
+    'git instaweb --httpd=scripts/cr/write-verdicts.sh' \
+    'git GIT_EXTERNAL_DIFF=scripts/cr/write-verdicts.sh diff' \
+    'GIT_EXTERNAL_DIFF=scripts/cr/write-verdicts.sh git diff' \
+    'git config core.pager scripts/cr/write-verdicts.sh' \
+    'git config pager.log scripts/cr/write-verdicts.sh' \
+    'git config core.fsmonitor scripts/cr/write-verdicts.sh' \
+    'git config core.sshCommand scripts/cr/write-verdicts.sh' \
+    'git config diff.external scripts/cr/write-verdicts.sh' \
+    "git config core.pager 'scripts/c\\r/write-verdicts.sh'" \
+    "git config alias.x '!scripts/c\"\"r/write-verdicts.sh'" \
+    "GIT_EDITOR='scripts/c\\r/write-verdicts.sh' git commit"; do
+    run "HIMMEL-5170 editor/alias hook [$v] -> deny" 2 "$(payload "$v" "$WT")" "$HR"
+done
+# Already denied on base (HIMMEL-5102 one-call -c exec keys): controls, not RED.
+for v in \
+    'git -c sequence.editor=scripts/cr/write-verdicts.sh rebase -i main' \
+    'git -c core.editor=scripts/cr/write-verdicts.sh commit' \
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.editor GIT_CONFIG_VALUE_0=scripts/cr/write-verdicts.sh git commit'; do
+    run "HIMMEL-5170 already-denied control [$v] -> deny" 2 "$(payload "$v" "$WT")" "$HR"
+done
+# Controls: an ordinary config write and an editor that names no guarded writer.
+for v in \
+    'git config user.name x' \
+    'git config sequence.editor vim' \
+    'GIT_EDITOR=vim git commit' \
+    'GIT_SEQUENCE_EDITOR=true git rebase -i main' \
+    'git log --oneline -3 -- scripts/cr/write-verdicts.sh' \
+    'git commit -m "fix scripts/cr/write-verdicts.sh"' \
+    'git commit --message="fix scripts/cr/write-verdicts.sh"' \
+    'git add scripts/cr/write-verdicts.sh' \
+    'git diff -- scripts/cr/write-verdicts.sh'; do
+    run "HIMMEL-5170 control [$v] -> allow" 0 "$(payload "$v" "$WT")" "$HR"
+done
+# Judge j2353d: the word match uses flat's normalisation (continuations joined,
+# then unquoted), and an executed value carrying an sh expansion character is
+# denied whether or not a guarded script is named (a second shell builds the path).
+for v in \
+    $'git config core.pager \'scripts/c\\\nr/write-verdicts.sh\'' \
+    $'git config alias.x \'!scripts/c\\\nr/write-verdicts.sh\'' \
+    $'GIT_EDITOR=\'scripts/c\\\nr/write-verdicts.sh\' git commit' \
+    $'git config core.pager "scripts/c\\\nr/write-verdicts.sh"' \
+    "git config core.pager 'scripts/c?/write-verdicts.sh'" \
+    "git config core.pager 'scripts/c[r]/write-verdicts.sh'" \
+    "git config core.pager 'scripts/c\${X}r/write-verdicts.sh'" \
+    "git config core.pager '\$(printf %s scripts/cr/write-verdicts.sh)'" \
+    "GIT_PAGER='scripts/c?/write-verdicts.sh' git log" \
+    "GIT_EDITOR='scripts/c{r,}/write-verdicts.sh' git commit" \
+    "git -c core.pager='scripts/c*/write-verdicts.sh' log" \
+    "git fetch --upload-pack='scripts/c?/write-verdicts.sh' origin" \
+    "git grep -O'scripts/c?/write-verdicts.sh' x" \
+    "GIT_EDITOR='\$X' git commit" \
+    "git config alias.x '!\$(echo y)'"; do
+    run "HIMMEL-5170 j2353d [$v] -> deny" 2 "$(payload "$v" "$WT")" "$HR"
+done
+for v in \
+    "GIT_PAGER='less -R' git log" \
+    "GIT_EDITOR='code --wait' git commit" \
+    "git config core.pager 'less -FRX'" \
+    'git config core.editor vim' \
+    'git log --graph --oneline' \
+    "git log --grep='a.*b' --format='%h %s'" \
+    "git commit -m 'what? \$x *'" \
+    'git -c user.name=x commit -m y' \
+    "git config user.name 'a?b'" \
+    "git log --oneline -- 'scripts/*.sh'" \
+    "git diff --stat '*.md'" \
+    "git diff --stat 'docs/[a-c]*.md'" \
+    "git log --oneline 'scripts/*.sh'"; do
+    run "HIMMEL-5170 j2353d control [$v] -> allow" 0 "$(payload "$v" "$WT")" "$HR"
+done
+# Judge j2353e: line-level fail-closed rules on a line with a git word or a
+# GIT_*/EDITOR/VISUAL/PAGER assignment: a tokenizer failure plus any
+# metacharacter, a value slot that ends in a substitution, --config-env, and a
+# builtin that sets one of those names.
+# shellcheck disable=SC2016 # the rows carry a literal backtick and $f
+for v in \
+    ": \${HOME%/}; git config core.pager 'scripts/c?/write-verdicts.sh'" \
+    "GIT_EDITOR=\"\$(printf scripts/c%s/write-verdicts.sh r)\" git commit" \
+    "git config core.pager \"\$(printf scripts/c%s/write-verdicts.sh r)\"" \
+    'GIT_EDITOR=`printf scripts/c%s/write-verdicts.sh r` git commit' \
+    "git -c core.editor=\"\$(printf scripts/c%s/write-verdicts.sh r)\" commit" \
+    "git fetch --upload-pack=\"\$(printf scripts/c%s/write-verdicts.sh r)\" origin" \
+    "X='scripts/c?/write-verdicts.sh' git --config-env=core.editor=X commit" \
+    "X=vim git --config-env core.editor=X commit" \
+    "printf -v GIT_EDITOR %s 'scripts/c?/write-verdicts.sh'; export GIT_EDITOR; git commit" \
+    "read GIT_EDITOR <<< 'scripts/c?/write-verdicts.sh'; git commit" \
+    "for GIT_EDITOR in 'scripts/c?/write-verdicts.sh'; do git commit; done" \
+    "mapfile -t GIT_EDITOR <<< x; git commit" \
+    "declare GIT_EDITOR=x; git commit" \
+    "export GIT_SEQUENCE_EDITOR=x; git rebase -i HEAD~2"; do
+    run "HIMMEL-5170 j2353e [$v] -> deny" 2 "$(payload "$v" "$WT")" "$HR"
+done
+for v in \
+    'GIT_EDITOR=vim git commit' \
+    "git commit -m \"\$(date)\"" \
+    "git config user.name \"\$(whoami)\"" \
+    "git log --grep=\"\$(echo x)\"" \
+    'read x; git log --oneline' \
+    "for f in a b; do git add \"\$f\"; done" \
+    'git config core.editor vim'; do
+    run "HIMMEL-5170 j2353e control [$v] -> allow" 0 "$(payload "$v" "$WT")" "$HR"
+done
+# Judge j2353h: short options after a non-reader subcommand are value checks
+# (clone -u runs its value through sh -c), a git-<sub> binary by path is git,
+# and a shell-built command word with another metacharacter word is denied.
+for v in \
+    "git clone -u 'scripts/c?/write-verdicts.sh' src dst" \
+    "git clone -uscripts/c?/write-verdicts.sh src dst" \
+    "git clone -c credential.helper='scripts/c?/write-verdicts.sh' src dst" \
+    "git clone -c 'scripts/c?/write-verdicts.sh' src dst" \
+    "/usr/lib/git-core/git-config core.pager 'scripts/c?/write-verdicts.sh'" \
+    "git-config core.pager 'scripts/c?/write-verdicts.sh'" \
+    "git clone \"-uscripts/c?/x --term\" url" \
+    "git clone \"-uscripts/c?/x --term\" src dst" \
+    "G=gi; \${G}t config core.pager 'scripts/c?/write-verdicts.sh'"; do
+    run "HIMMEL-5170 j2353h [$v] -> deny" 2 "$(payload "$v" "$WT")" "$HR"
+done
+for v in \
+    'gh pr view 2353' \
+    'git diff' \
+    "git log --format='%H %s'" \
+    'git clone -q src dst' \
+    'git commit -am "fix: x"' \
+    'git commit -m "fix: scripts/c?/x"' \
+    'git push -u origin HEAD'; do
+    run "HIMMEL-5170 j2353h control [$v] -> allow" 0 "$(payload "$v" "$WT")" "$HR"
+done
 
 echo
 if [ "$FAILED" -eq 0 ]; then

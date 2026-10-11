@@ -31,8 +31,9 @@
 #       local-path origin stays case-exact and keeps its .git, a default port
 #       drops (HIMMEL-5144, HIMMEL-5145); an absolute local origin is
 #       lexically normalised, a file:// path is percent-decoded and its scheme
-#       is case-insensitive, file://host/... is never joined under the
-#       checkout (HIMMEL-5157)
+#       is case-insensitive, file://host/... drops the host like git
+#       (HIMMEL-5169); a decoded or literal trailing newline and %00 keep
+#       their own ids (HIMMEL-5161, HIMMEL-5169)
 #   F17 with no override, the row's repo is the shared lib's id for the
 #       runner's own checkout (HIMMEL-5147)
 #   F18 a runner that cannot read the id lib writes no ledger row, names the
@@ -417,7 +418,7 @@ else
 fi
 # HIMMEL-5157: an absolute local origin is lexically normalised like a relative
 # one, a file:// path is percent-decoded and its scheme is case-insensitive, and
-# file://host/path is a host form that is never joined under the checkout.
+# file://host/path drops the host like git (HIMMEL-5169).
 mk_url_repo "$sb/a1" "/srv/x/../r.git"
 mk_url_repo "$sb/a2" "/srv/./r.git"
 mk_url_repo "$sb/a3" "/srv//r.git"
@@ -455,17 +456,145 @@ mk_url_repo "$sb/h2" "file://HOST/r.git"
 mk_url_repo "$sb/h3" "host/r.git"
 mk_url_repo "$sb/h4" "file://localhost/srv/r.git"
 mk_url_repo "$sb/h5" "file://localhostx/srv/r.git"
+mk_url_repo "$sb/h6" "/r.git"
+mk_url_repo "$sb/h7" "file://host/srv/r"
+mk_url_repo "$sb/h8" "file://HOST.example:99/srv/r.git"
 h1=$(_flake_repo_id "$sb/h1" 2>&1); h2=$(_flake_repo_id "$sb/h2" 2>&1); h3=$(_flake_repo_id "$sb/h3" 2>&1)
-h4=$(_flake_repo_id "$sb/h4" 2>&1); h5=$(_flake_repo_id "$sb/h5" 2>&1)
-if [ -n "$h1" ] && [ "$h1" = "$h2" ] && [ "$h1" != "$h3" ] && [ "$h1" != "$p4" ]; then
-  pass "F16: file://host/r.git is a host form, not the checkout-relative host/r.git"
+h4=$(_flake_repo_id "$sb/h4" 2>&1); h5=$(_flake_repo_id "$sb/h5" 2>&1); h6=$(_flake_repo_id "$sb/h6" 2>&1)
+h7=$(_flake_repo_id "$sb/h7" 2>&1); h8=$(_flake_repo_id "$sb/h8" 2>&1)
+# HIMMEL-5169: git ignores the host of file://host/path, so the host never
+# enters the id; the path after it is the whole directory.
+if [ -n "$h1" ] && [ "$h1" = "$h2" ] && [ "$h1" = "$h6" ] && [ "$h1" != "$h3" ] && [ "$h1" != "$p4" ]; then
+  pass "F16: file://host/r.git is /r.git (host dropped like git), not the checkout-relative host/r.git"
 else
-  fail "F16: file://host ids: host [$h1] HOST [$h2] relative host/r.git [$h3] /srv/r.git [$p4]"
+  fail "F16: file://host ids: host [$h1] HOST [$h2] /r.git [$h6] relative host/r.git [$h3] /srv/r.git [$p4]"
 fi
-if [ "$h4" = "$p4" ] && [ "$h5" != "$p4" ]; then
-  pass "F16: file://localhost/... is the local path; localhostx is another host"
+if [ "$h7" = "$p3" ] && [ "$h8" = "$p4" ] && [ "$h4" = "$p4" ] && [ "$h5" = "$p4" ]; then
+  pass "F16: file://<any host>/srv/r is /srv/r; localhost and localhostx are hosts like any other"
 else
-  fail "F16: localhost: [$h4] want [$p4]; localhostx [$h5] must differ"
+  fail "F16: host dropped: host/srv/r [$h7] want [$p3]; HOST.example:99 [$h8], localhost [$h4], localhostx [$h5] want [$p4]"
+fi
+# HIMMEL-5161: a decoded trailing newline is part of the path, so
+# file:///srv/r%0A is a different directory from file:///srv/r (command
+# substitution would strip it); %00 stays escaped, so it is not /srv/r either;
+# file://LOCALHOST/... is the local path; file://host/r.git is not /host/r.git.
+mk_url_repo "$sb/nl1" "file:///srv/r%0A"
+mk_url_repo "$sb/nl2" "file:///srv/r%0A%0A"
+mk_url_repo "$sb/nl3" "file:///srv/r%00"
+mk_url_repo "$sb/nl4" "file://LOCALHOST/srv/r.git"
+mk_url_repo "$sb/nl5" "/host/r.git"
+nl1=$(_flake_repo_id "$sb/nl1" 2>&1); nl2=$(_flake_repo_id "$sb/nl2" 2>&1); nl3=$(_flake_repo_id "$sb/nl3" 2>&1)
+nl4=$(_flake_repo_id "$sb/nl4" 2>&1); nl5=$(_flake_repo_id "$sb/nl5" 2>&1)
+# an id is origin-<digits>: captured stderr from a failed lookup is not one
+_isid() { case "$1" in origin-*[!0-9]*|origin-) return 1 ;; origin-[0-9]*) return 0 ;; *) return 1 ;; esac; }
+if _isid "$nl1" && _isid "$nl2" && [ "$nl1" != "$f2" ] && [ "$nl1" != "$nl2" ] && [ "$nl2" != "$f2" ]; then
+  pass "F16: file:///srv/r%0A and %0A%0A are distinct from file:///srv/r and each other"
+else
+  fail "F16: trailing newline: %0A [$nl1] %0A%0A [$nl2] vs file:///srv/r [$f2]"
+fi
+if _isid "$nl3" && [ "$nl3" != "$f2" ]; then
+  pass "F16: file:///srv/r%00 stays escaped and is distinct from /srv/r"
+else
+  fail "F16: %00: [$nl3] vs file:///srv/r [$f2]"
+fi
+if _isid "$nl4" && _isid "$nl5" && [ "$nl4" = "$p4" ] && [ "$h1" != "$nl5" ]; then
+  pass "F16: file://LOCALHOST/... is the local path; file://host/r.git is not /host/r.git"
+else
+  fail "F16: LOCALHOST [$nl4] want [$p4]; host form [$h1] vs /host/r.git [$nl5] must differ"
+fi
+# the host is dropped whatever it holds, a decoded newline included
+mk_url_repo "$sb/nl6" "file://host%0A/r"
+mk_url_repo "$sb/nl7" "file://host/r"
+nl6=$(_flake_repo_id "$sb/nl6" 2>&1); nl7=$(_flake_repo_id "$sb/nl7" 2>&1)
+if _isid "$nl6" && _isid "$nl7" && [ "$nl6" = "$nl7" ]; then
+  pass "F16: file://host%0A/r and file://host/r both drop the host"
+else
+  fail "F16: host newline: %0A [$nl6] vs plain [$nl7] must match"
+fi
+# HIMMEL-5184: git rejects a path-less file:// origin (file://host, file://a,
+# file://), so no usable repo has one; they are pinned to the root id, the same
+# as file:/// and /, instead of left to drift.
+mk_url_repo "$sb/pl1" "file://host"
+mk_url_repo "$sb/pl2" "file://a"
+mk_url_repo "$sb/pl3" "file://"
+mk_url_repo "$sb/pl4" "file:///"
+mk_url_repo "$sb/pl5" "/"
+mk_url_repo "$sb/pl6" "file://[a]"
+pl1=$(_flake_repo_id "$sb/pl1" 2>&1); pl2=$(_flake_repo_id "$sb/pl2" 2>&1); pl3=$(_flake_repo_id "$sb/pl3" 2>&1)
+pl4=$(_flake_repo_id "$sb/pl4" 2>&1); pl5=$(_flake_repo_id "$sb/pl5" 2>&1); pl6=$(_flake_repo_id "$sb/pl6" 2>&1)
+if _isid "$pl1" && [ "$pl1" = "$pl5" ] && [ "$pl2" = "$pl5" ] && [ "$pl3" = "$pl5" ] && [ "$pl4" = "$pl5" ] && [ "$pl6" = "$pl5" ] && [ "$pl5" != "$p3" ]; then
+  pass "F16: path-less file:// origins (git rejects them) share the root id with file:/// and /"
+else
+  fail "F16: path-less: host [$pl1] a [$pl2] empty [$pl3] file:/// [$pl4] / [$pl5] [a] [$pl6] must match"
+fi
+# HIMMEL-5184: git's host_end skips a bracketed host, so the path is what
+# follows the ] (git ls-remote 'file://[a/b]/p' runs upload-pack on /p); the
+# first @[ anywhere in the URL starts the bracket, as in git; an unclosed [ is
+# not skipped.
+mk_url_repo "$sb/br1" "file://[a/b]/p"
+mk_url_repo "$sb/br2" "file://u@[a/b]/p"
+mk_url_repo "$sb/br3" "file://[a]/p"
+mk_url_repo "$sb/br4" "file://[a/b"
+mk_url_repo "$sb/br5" "file:///x@[y]/z"
+mk_url_repo "$sb/br6" "/p"
+mk_url_repo "$sb/br7" "/b"
+mk_url_repo "$sb/br8" "/z"
+br1=$(_flake_repo_id "$sb/br1" 2>&1); br2=$(_flake_repo_id "$sb/br2" 2>&1); br3=$(_flake_repo_id "$sb/br3" 2>&1)
+br4=$(_flake_repo_id "$sb/br4" 2>&1); br5=$(_flake_repo_id "$sb/br5" 2>&1); br6=$(_flake_repo_id "$sb/br6" 2>&1)
+br7=$(_flake_repo_id "$sb/br7" 2>&1); br8=$(_flake_repo_id "$sb/br8" 2>&1)
+if _isid "$br6" && [ "$br1" = "$br6" ] && [ "$br2" = "$br6" ] && [ "$br3" = "$br6" ]; then
+  pass "F16: file://[a/b]/p, u@[a/b]/p and [a]/p are /p (bracket host skipped like git)"
+else
+  fail "F16: bracket host: [a/b]/p [$br1] u@[a/b]/p [$br2] [a]/p [$br3] want /p [$br6]"
+fi
+if _isid "$br7" && [ "$br4" = "$br7" ] && [ "$br5" = "$br8" ] && [ "$br7" != "$br8" ]; then
+  pass "F16: an unclosed [ is not skipped (/b); an @[ in the path is the bracket start, as in git (/z)"
+else
+  fail "F16: bracket edges: [a/b [$br4] want /b [$br7]; /x@[y]/z [$br5] want /z [$br8]"
+fi
+# an @[ with no closing ] opens no bracket: git keeps /x@[y/z whole for
+# file:///x@[y/z, and reads x@[y as the host (path /z) for file://x@[y/z
+mk_url_repo "$sb/br9" "file:///x@[y/z"
+mk_url_repo "$sb/br10" "file://x@[y/z"
+mk_url_repo "$sb/br11" "/x@[y/z"
+br9=$(_flake_repo_id "$sb/br9" 2>&1); br10=$(_flake_repo_id "$sb/br10" 2>&1); br11=$(_flake_repo_id "$sb/br11" 2>&1)
+if _isid "$br11" && [ "$br9" = "$br11" ] && [ "$br10" = "$br8" ] && [ "$br11" != "$br8" ]; then
+  pass "F16: an unclosed @[ keeps the path whole (/x@[y/z) and is a host when before the path (/z)"
+else
+  fail "F16: unclosed @[: file:///x@[y/z [$br9] want /x@[y/z [$br11]; file://x@[y/z [$br10] want /z [$br8]"
+fi
+# once an @[ exists git never falls back to a leading [: file://[a/b]@[c/d is
+# host [a, path /b]@[c/d (never /d, the id of file:///d)
+mk_url_repo "$sb/br12" "file://[a/b]@[c/d"
+mk_url_repo "$sb/br13" "/b]@[c/d"
+mk_url_repo "$sb/br14" "file:///d"
+br12=$(_flake_repo_id "$sb/br12" 2>&1); br13=$(_flake_repo_id "$sb/br13" 2>&1); br14=$(_flake_repo_id "$sb/br14" 2>&1)
+if _isid "$br13" && [ "$br12" = "$br13" ] && [ "$br12" != "$br14" ]; then
+  pass "F16: an unclosed @[ blocks the leading-[ rule (file://[a/b]@[c/d is /b]@[c/d, not /d)"
+else
+  fail "F16: file://[a/b]@[c/d [$br12] want /b]@[c/d [$br13], never /d [$br14]"
+fi
+# HIMMEL-5169: the origin is read with a sentinel, so a literal trailing
+# newline in the config value (not a decoded one) stays part of the path
+mk_url_repo "$sb/ln1" "/srv/r"
+git -C "$sb/ln1" config remote.origin.url $'/srv/r\n'
+mk_url_repo "$sb/ln2" "/srv/r"
+git -C "$sb/ln2" config remote.origin.url $'/srv/r\n\n'
+ln1=$(_flake_repo_id "$sb/ln1" 2>&1); ln2=$(_flake_repo_id "$sb/ln2" 2>&1)
+if _isid "$ln1" && _isid "$ln2" && [ "$ln1" != "$p3" ] && [ "$ln1" != "$ln2" ] && [ "$ln2" != "$p3" ]; then
+  pass "F16: an origin with a literal trailing newline is not the same id as without it"
+else
+  fail "F16: literal newline: /srv/r\\n [$ln1] /srv/r\\n\\n [$ln2] vs /srv/r [$p3] must all differ"
+fi
+# HIMMEL-5169: the relative join keeps a trailing newline too (its own
+# sentinel); the origin below ends in a slash after the newline, so only the
+# join, not the config read, could drop it
+rl1=$(_flake_norm_url $'r\n/' /srv/co; printf x); rl1=${rl1%x}
+rl2=$(_flake_norm_url "r" /srv/co; printf x); rl2=${rl2%x}
+if [ "$rl1" = $'/srv/co/r\n' ] && [ "$rl2" = "/srv/co/r" ]; then
+  pass "F16: a relative origin whose name ends in a newline joins to a path that keeps it"
+else
+  fail "F16: relative join newline: r\\n/ [$rl1] want [/srv/co/r+newline]; r [$rl2] want [/srv/co/r]"
 fi
 mk_url_repo "$sb/ra/co" "../r.git"; mk_url_repo "$sb/rb/co" "../r.git"
 gq -C "$sb/ra/co" commit -q --allow-empty -m x

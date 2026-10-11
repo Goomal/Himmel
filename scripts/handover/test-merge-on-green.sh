@@ -744,6 +744,15 @@ run_mog() {
         fi
     fi
 
+    # HIMMEL-5188: MOG_ANCHOR_SETUP=<function> runs after the anchor repo is built
+    # and may add commits / origin refs; it sets MOG_SETUP_SHA, the PR head the
+    # stub then certifies as STUB_SHA.
+    MOG_SETUP_SHA=""
+    if [ -n "${MOG_ANCHOR_SETUP:-}" ]; then
+        "$MOG_ANCHOR_SETUP" "$tmp" >/dev/null 2>"$tmp/setup.err" \
+            || { LAST_TMP="$tmp"; fail "$name (setup: $MOG_ANCHOR_SETUP: $(head -c 400 "$tmp/setup.err"))"; return; }
+    fi
+
     local err rc
     # HIMMEL-3475: the anchor. Defaults to the fixture tree itself (MOG_HIMMEL_REPO
     # unset) — mog_build_fixture already lays out scripts/check-ci.sh,
@@ -771,7 +780,7 @@ run_mog() {
           TELEGRAM_ACCESS_PATH="$tmp/access.json" STUB_ALERT_FAIL="${STUB_ALERT_FAIL:-}" \
           CR_APP="${MOG_CR_APP:-}" \
           HIMMEL_REPO="$himmel_repo_dir" \
-          ${MOG_WRAP-} env ${MOG_UNSET_HIMMEL_REPO:+-u HIMMEL_REPO} \
+          ${MOG_WRAP-} env ${MOG_UNSET_HIMMEL_REPO:+-u HIMMEL_REPO} ${MOG_SETUP_SHA:+STUB_SHA=$MOG_SETUP_SHA} \
           bash -c 'cd "$1" || exit 1; shift; exec bash "$@"' _ "${MOG_CWD:-$tmp}" \
           "$tmp/scripts/handover/merge-on-green.sh" "$@" >/dev/null 2>"$tmp/err"
     rc=$?
@@ -4060,6 +4069,128 @@ STUB_RUN_LIST_JSON="$MOG_RUN_RED" STUB_RUN_LOG_FILE="$MOG_RUN_LOG4" \
     STUB_PR_COMMITS_JSON="$(mog5115_commits 'Fixes-main-red: suite=check-foo.sh')" \
     run_mog 0 "5135-b: a non-test- .sh named on an error line → merged"
 rm -f "$MOG_RUN_LOG4"
+
+# ── HIMMEL-5188: merge-time plugin version-bump recheck ──────────────────────
+# Two PRs that each bump a plugin to the same version both go green in CI; only
+# the merge gate sees the live base. The fixture manifest is copied from the
+# real himmel-ops plugin.json at this checkout, never invented.
+BP_REAL_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+BP_MAN="marketplace/plugins/himmel-ops/.claude-plugin/plugin.json"
+BP_BASE_VER="$(jq -r .version "$BP_REAL_ROOT/$BP_MAN")"
+bp_plus() { printf '%s.%s.%s' "$(printf '%s' "$1" | cut -d. -f1)" "$(printf '%s' "$1" | cut -d. -f2)" "$(( $(printf '%s' "$1" | cut -d. -f3) + $2 ))"; }
+BP_V1="$(bp_plus "$BP_BASE_VER" 1)"
+BP_V2="$(bp_plus "$BP_BASE_VER" 2)"
+# bp_setup <anchor> — base B0 (real checker + manifest) on origin main, the PR
+# head at refs/pull/77/head, then a sibling landing on main AFTER the PR
+# branched. MOG_BUMP_SIB / MOG_BUMP_PR set the two bumped versions;
+# MOG_BUMP_NOPULL=1 leaves the PR ref off origin; MOG_BUMP_EVIL=1 plants a
+# permissive checker in the PR head; MOG_BUMP_MOVED=1 advances the PR ref past
+# the certified head.
+bp_setup() {
+    local a="$1" b0
+    local g="git -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false -c core.hooksPath=/dev/null"
+    mkdir -p "$a/scripts/lib" "$a/marketplace/plugins/himmel-ops/.claude-plugin" || return 1
+    cp "$BP_REAL_ROOT/scripts/check-plugin-drift.sh" "$a/scripts/check-plugin-drift.sh" || return 1
+    cp "$BP_REAL_ROOT/scripts/lib/vm-mode.sh" "$a/scripts/lib/vm-mode.sh" || return 1
+    cp "$BP_REAL_ROOT/$BP_MAN" "$a/$BP_MAN" || return 1
+    printf 'base\n' > "$a/marketplace/plugins/himmel-ops/a.txt"
+    # HIMMEL-5203: MOG_BUMP_EMPTY=<blob> commits that checker blob EMPTY at the
+    # base tip; MOG_BUMP_MISSING=<blob> leaves it out of the base tip entirely.
+    local bp_b; local -a bp_add=()
+    for bp_b in scripts/check-plugin-drift.sh scripts/lib/vm-mode.sh; do
+        [ "${MOG_BUMP_EMPTY:-}" != "$bp_b" ] || : > "$a/$bp_b"
+        # HIMMEL-5208: MOG_BUMP_STUBCHK=silent|noise commits a non-empty base-tip
+        # checker that exits 0 with no output / with unrelated output.
+        if [ "$bp_b" = scripts/check-plugin-drift.sh ]; then
+            case "${MOG_BUMP_STUBCHK:-}" in
+                silent) printf '\n' > "$a/$bp_b" ;;
+                noise) printf '#!/usr/bin/env bash\necho "all good"\nexit 0\n' > "$a/$bp_b" ;;
+            esac
+        fi
+        if [ "${MOG_BUMP_MISSING:-}" = "$bp_b" ]; then rm -f "$a/$bp_b"; else bp_add+=("$bp_b"); fi
+    done
+    $g -C "$a" add "${bp_add[@]}" marketplace && $g -C "$a" commit -qm base && $g -C "$a" push -q origin HEAD:main || return 1
+    b0="$($g -C "$a" rev-parse HEAD)"
+    printf 'pr\n' > "$a/marketplace/plugins/himmel-ops/a.txt"
+    jq --arg v "${MOG_BUMP_PR:-$BP_V1}" '.version=$v' "$a/$BP_MAN" > "$a/m.tmp" && mv "$a/m.tmp" "$a/$BP_MAN" || return 1
+    if [ "${MOG_BUMP_EVIL:-0}" = 1 ]; then printf '#!/usr/bin/env bash\nexit 0\n' > "$a/scripts/check-plugin-drift.sh"; fi
+    # (the PR commit stages only the paths it changed; a blob left out of the
+    # base tip stays out because the PR never re-adds it)
+    $g -C "$a" add marketplace && { [ ! -f "$a/scripts/check-plugin-drift.sh" ] || $g -C "$a" add scripts/check-plugin-drift.sh; } \
+        && $g -C "$a" commit -qm pr || return 1
+    MOG_SETUP_SHA="$($g -C "$a" rev-parse HEAD)"
+    if [ "${MOG_BUMP_NOPULL:-0}" != 1 ]; then $g -C "$a" push -q origin HEAD:refs/pull/77/head || return 1; fi
+    if [ "${MOG_BUMP_MOVED:-0}" = 1 ]; then
+        $g -C "$a" commit -q --allow-empty -m moved && $g -C "$a" push -q -f origin HEAD:refs/pull/77/head || return 1
+    fi
+    $g -C "$a" checkout -q -b sibling "$b0" || return 1
+    printf 'sibling\n' > "$a/marketplace/plugins/himmel-ops/b.txt"
+    jq --arg v "${MOG_BUMP_SIB:-$BP_V1}" '.version=$v' "$a/$BP_MAN" > "$a/m.tmp" && mv "$a/m.tmp" "$a/$BP_MAN" || return 1
+    $g -C "$a" add marketplace && $g -C "$a" commit -qm sibling && $g -C "$a" push -q origin HEAD:main || return 1
+    return 0
+}
+BP_FILES='[{"filename":"marketplace/plugins/himmel-ops/a.txt"},{"filename":"marketplace/plugins/himmel-ops/.claude-plugin/plugin.json"}]'
+bp_run() {
+    MOG_ANCHOR_GIT=1 MOG_ANCHOR_SETUP=bp_setup STUB_PR_FILES_JSON="${STUB_PR_FILES_JSON-$BP_FILES}" run_mog "$@"
+}
+# 5188-a (RED) — the sibling merged the SAME version after this PR's CI went
+# green: no longer a bump against the live base → refused before any merge call.
+MOG_BUMP_SIB="$BP_V1" MOG_BUMP_PR="$BP_V1" \
+    bp_run 23 "5188-a: sibling bumped to the same version → exit 23"
+assert_audit_has "5188-a: audited as a plugin-bump refusal" "REFUSED reason=plugin-bump"
+assert_err_has "5188-a: stderr names the plugin" "himmel-ops"
+assert_clear_not_invoked "5188-a: nothing mutated before the refusal"
+no_merge_call "5188-a: no merge call"
+# 5188-b — the PR bumps past the sibling's version: merged.
+MOG_BUMP_SIB="$BP_V1" MOG_BUMP_PR="$BP_V2" \
+    bp_run 0 "5188-b: PR bumps past the sibling → merged"
+# 5188-c — the PR's own checker is permissive; the base tip's copy decides.
+MOG_BUMP_EVIL=1 MOG_BUMP_SIB="$BP_V1" MOG_BUMP_PR="$BP_V1" \
+    bp_run 23 "5188-c: a PR-side permissive checker does not decide → exit 23"
+# 5188-d — fail closed: the PR ref cannot be fetched.
+MOG_BUMP_NOPULL=1 bp_run 23 "5188-d: PR head unfetchable → exit 23"
+# 5188-e — fail closed: the fetched head is not the certified head.
+MOG_BUMP_MOVED=1 MOG_BUMP_SIB="$BP_V1" MOG_BUMP_PR="$BP_V2" \
+    bp_run 23 "5188-e: fetched PR head differs from the certified head → exit 23"
+# 5188-f — a PR that touches no plugin file never reaches git (unchanged).
+STUB_PR_FILES_JSON='[{"filename":"README.md"}]' MOG_BUMP_SIB="$BP_V1" MOG_BUMP_PR="$BP_V1" \
+    bp_run 0 "5188-f: no plugin file in the PR → merged, gate skipped"
+# 5188-g — the files endpoint stops at 3000 entries, so a list that long may
+# have dropped the plugin paths: the recheck runs anyway and refuses.
+BP_BIG=$(jq -nc '[range(3000) | {filename: ("docs/f\(.).md")}]')
+STUB_PR_FILES_JSON="$BP_BIG" MOG_BUMP_SIB="$BP_V1" MOG_BUMP_PR="$BP_V1" \
+    bp_run 23 "5188-g: a possibly truncated 3000-file list still runs the recheck → exit 23"
+# 5188-h — a plugin file FIRST in a long list must still be seen (an early-exit
+# grep under pipefail would SIGPIPE the producer and read as "no plugin file").
+BP_LONG=$(jq -nc '[{filename: "marketplace/plugins/himmel-ops/a.txt"}] + [range(2500) | {filename: ("docs/f\(.).md")}]')
+STUB_PR_FILES_JSON="$BP_LONG" MOG_BUMP_SIB="$BP_V1" MOG_BUMP_PR="$BP_V1" \
+    bp_run 23 "5188-h: plugin file first in a 2501-file list is still found → exit 23"
+# 5203-a (RED) — an EMPTY checker blob at the base tip runs as `exit 0`: the
+# gate must refuse it, not read the empty script's success as a bump.
+MOG_BUMP_EMPTY=scripts/check-plugin-drift.sh MOG_BUMP_SIB="$BP_V1" MOG_BUMP_PR="$BP_V1" \
+    bp_run 23 "5203-a: empty check-plugin-drift.sh at the base tip → exit 23"
+assert_audit_has "5203-a: audited as a checker-blob refusal" "phase=checker-blob"
+assert_err_has "5203-a: stderr says the blob is empty" "empty"
+no_merge_call "5203-a: no merge call"
+# 5203-b — the sourced helper empty at the base tip is refused the same way.
+MOG_BUMP_EMPTY=scripts/lib/vm-mode.sh MOG_BUMP_SIB="$BP_V1" MOG_BUMP_PR="$BP_V2" \
+    bp_run 23 "5203-b: empty vm-mode.sh at the base tip → exit 23"
+assert_audit_has "5203-b: audited as a checker-blob refusal" "phase=checker-blob"
+# 5203-c — a checker blob absent at the base tip is refused (already fail-closed).
+MOG_BUMP_MISSING=scripts/check-plugin-drift.sh MOG_BUMP_SIB="$BP_V1" MOG_BUMP_PR="$BP_V2" \
+    bp_run 23 "5203-c: check-plugin-drift.sh missing at the base tip → exit 23"
+assert_audit_has "5203-c: audited as a checker-blob refusal" "phase=checker-blob"
+# 5208-a (RED) — a non-empty checker that exits 0 with NO output is no verdict.
+MOG_BUMP_STUBCHK=silent MOG_BUMP_SIB="$BP_V1" MOG_BUMP_PR="$BP_V1" \
+    bp_run 23 "5208-a: silent exit-0 checker at the base tip → exit 23"
+assert_audit_has "5208-a: audited as a checker-blob refusal" "phase=checker-blob"
+assert_audit_has "5208-a: audited as no success line" "no-success-line=1"
+no_merge_call "5208-a: no merge call"
+# 5208-b — a checker that exits 0 with unrelated output is refused the same way.
+MOG_BUMP_STUBCHK=noise MOG_BUMP_SIB="$BP_V1" MOG_BUMP_PR="$BP_V1" \
+    bp_run 23 "5208-b: exit-0 checker with unrelated output → exit 23"
+assert_audit_has "5208-b: audited as a checker-blob refusal" "phase=checker-blob"
+no_merge_call "5208-b: no merge call"
 
 echo
 echo "merge-on-green: $PASS passed, $FAIL failed"

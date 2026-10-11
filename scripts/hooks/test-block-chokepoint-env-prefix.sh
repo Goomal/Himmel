@@ -2134,6 +2134,317 @@ for hex in '\0343\0200\0200:U+3000' '\0302\0240:U+00A0' '\0342\0200\0203:U+2003'
 done
 unset LC_ALL
 
+# --- HIMMEL-5181: strip_brace_exp joins a `$` chunk and a following `{` into a
+# fresh opener (HIMMEL-5154). `$` + a popped `${x}` + `{y}` deletes to nothing,
+# so a seam name split by it must still read as the registered name. A mutant
+# that drops the isd join leaves `$` and `{y}` in place and this row passes the
+# guard instead of denying.
+MOG_HEAD=${MOG_VAR:0:3}
+MOG_TAIL=${MOG_VAR:3}
+assert_deny "5181 seam name split by \$ + popped \${x} + {y}" "$(j "${MOG_HEAD}\$\${x}{y}${MOG_TAIL}=1 bash $MERGE_ON_GREEN")"
+
+# --- HIMMEL-4402 (1685 round 9): two shapes kept read-only relief beside an
+# obfuscated chokepoint path. (1) A substitution's continuation stage
+# inherited its parent's class without the executable-option check; (2) the
+# interpreter executing-builtin list lacked readpipe. The sweep rows are the
+# other interpreters' executing builtins; each must void relief.
+OBF="/r/w/scrip?s/$CK/g?.sh"
+for F in "git grep \"\$(printf needle)\" --open-files-in-pager='$OBF'" \
+         "git grep \"\$(printf needle)\" -O'$OBF'" \
+         "git grep \"\$(printf needle)\" --pager='$OBF'" \
+         "git log \$(printf x) --exec='$OBF'" \
+         "git grep \`printf needle\` --open-files-in-pager='$OBF'" \
+         "printf needle | git grep --future-exec-opt='$OBF' x" \
+         "printf needle | git grep -O '$OBF' x" \
+         "printf needle | git grep -e -- --open-files-in-pager='$OBF'" \
+         "git grep -e -- --open-files-in-pager='$OBF'" \
+         "git grep \"\$(printf needle)\" -e -- --open-files-in-pager='$OBF'" \
+         "perl -e 'readpipe(\"$OBF\")'" \
+         "perl -e 'open(F, \"$OBF|\")'" \
+         "ruby -e 'IO.popen(\"$OBF\")'" \
+         "ruby -e '%x($OBF)'" \
+         "ruby -e 'spawn(\"$OBF\")'" \
+         "ruby -e 'system(\"$OBF\")'" \
+         "awk 'BEGIN{system(\"$OBF\")}'" \
+         "php -r 'shell_exec(\"$OBF\");'" \
+         "php -r 'passthru(\"$OBF\");'" \
+         "php -r 'proc_open(\"$OBF\", [], \$p);'" \
+         "python3 -c 'import os; os.system(\"$OBF\")'" \
+         "python3 -c 'import subprocess; subprocess.run([\"$OBF\"])'" \
+         "node -e 'require(\"child_process\").execSync(\"$OBF\")'" \
+         "git grep -\"O\"'$OBF' needle" \
+         "git grep --\"open-files-in-pager\"='$OBF' needle" \
+         "printf needle | git grep -\"O\"'$OBF' x" \
+         "rg --p\"r\"e='$OBF' needle" \
+         "ruby -e 'open(\"|$OBF\")'" \
+         "perl -e 'syscall(1, \"$OBF\")'" \
+         "perl -e 'fork && exec(\"$OBF\")'"; do
+    assert_deny "4402 pobf relief voided: $F" "$(j "unset HIMMEL_CONSOLE_LEG; $F")"
+done
+# CR round on 2346: bash dequotes a backslash-escaped option name (--pr\e is
+# --pre), so an option word that still carries a backslash or a quote after
+# the readings voids relief for its stage.
+for F in "rg --pr\\e='$OBF' needle" \
+         "sort --compr\\ess-program='$OBF' needle" \
+         "rg --\"pr\"\\e='$OBF' needle" \
+         "printf needle | rg --pr\\e='$OBF' x"; do
+    assert_deny "4402 backslash option voided: $F" "$(j "unset HIMMEL_CONSOLE_LEG; $F")"
+done
+assert_allow "4402 control: rg --pretty with no escapes keeps relief" "$(j "unset HIMMEL_CONSOLE_LEG; rg --pretty needle -- '$OBF'")"
+# Console ruling on 2346: getopt_long and git parse-options accept any
+# unambiguous long-option prefix, so any prefix of a program-running option
+# voids relief (an ambiguous one is a usage error; fail closed on all).
+for F in "sort --compr='$OBF' needle" \
+         "git grep --open-files='$OBF' needle" \
+         "git diff --ext='$OBF' needle" \
+         "git log --ext='$OBF' needle" \
+         "sort -S 1 --co='$OBF' needle" \
+         "sort --c='$OBF' needle" \
+         "printf needle | sort --compr='$OBF' x"; do
+    assert_deny "4402 abbreviated long option voided: $F" "$(j "unset HIMMEL_CONSOLE_LEG; $F")"
+done
+assert_allow "4402 control: sort --check keeps relief" "$(j "unset HIMMEL_CONSOLE_LEG; sort --check needle -- '$OBF'")"
+# Controls: a read-only git stage with listed options keeps relief.
+assert_allow "4402 control: git grep with listed options keeps relief" "$(j "unset HIMMEL_CONSOLE_LEG; git grep -n --count needle -- '$OBF'")"
+assert_allow "4402 control: continuation with no option keeps relief"  "$(j "unset HIMMEL_CONSOLE_LEG; git grep \"\$(printf needle)\" -- '$OBF'")"
+
+# --- HIMMEL-5197 (follow-ups of 2346): (1) -x/-X/-O void relief only where the
+# short option runs a program (git -O, find -exec/-ok/-fprint/-fls), not for
+# readers where -x/-X are line-regexp / exclude-from; an unlisted command still
+# fails closed. (2) the option screen splits with globbing off, so a file in the
+# hook cwd cannot rewrite a glob-looking option word before it is read.
+for F in "grep -x needle -- '$OBF'" \
+         "grep -xn needle -- '$OBF'" \
+         "rg -x needle -- '$OBF'" \
+         "printf needle | rg -x x -- '$OBF'" \
+         "ls -x -- '$OBF'" \
+         "ls -X -- '$OBF'" \
+         "diff -x '*.o' a -- '$OBF'" \
+         "du -x -- '$OBF'" \
+         "grep -x \"\$(printf needle)\" -- '$OBF'" \
+         "git ls-files -x '*.o' -- '$OBF'"; do
+    assert_allow "5197 reader short option keeps relief: $F" "$(j "unset HIMMEL_CONSOLE_LEG; $F")"
+done
+for F in "git grep -O'$OBF' needle" \
+         "git grep -nO '$OBF' needle" \
+         "find . -exec '$OBF' {} +" \
+         "find . -execdir '$OBF' {} +" \
+         "find . -ok '$OBF' {} ;" \
+         "find . -fprint '$OBF'" \
+         "find . -name x \"\$(printf y)\" -exec '$OBF' {} +" \
+         "xargs -x '$OBF'" \
+         "perl -x '$OBF'" \
+         "unknowncmd -x '$OBF'"; do
+    assert_deny "5197 executing short option still voids relief: $F" "$(j "unset HIMMEL_CONSOLE_LEG; $F")"
+done
+# Item 2: every caller already holds set -f around pobf_relief, so the hook
+# cannot show it; pobf_xopt is exercised directly (extracted, globbing ON) with
+# a file named -O planted in cwd: `-?` globs to it. rc 1 = no void (the literal
+# word was screened); rc 0 would mean the glob was expanded first.
+XOPT_SRC=$(mktemp "${TMPDIR:-/tmp}/xopt-src.XXXXXX") || exit 1
+GLOBDIR=$(mktemp -d "${TMPDIR:-/tmp}/xopt-glob.XXXXXX") || exit 1
+awk '/^POBF_GIT_SAFE=/{p=1} p{print} /^pobf_xopt_scan\(\)/{q=1} q&&/^}/{exit}' "$HOOK" > "$XOPT_SRC"
+: > "$GLOBDIR/-O"
+xopt_probe() {  # xopt_probe <mode: on|off> <command> <stage text> -> "<rc> <f-flag-after>"
+    bash -c '
+        . "$1"; cd "$2" || exit 9
+        [ "$3" = off ] && set -f || set +f
+        pobf_xopt "$4" "$5"; rc=$?
+        case $- in *f*) f=off ;; *) f=on ;; esac
+        echo "$rc $f"' _ "$XOPT_SRC" "$GLOBDIR" "$1" "$2" "$3"
+}
+CASES=$((CASES + 1))
+R=$(xopt_probe on git "git grep -n needle -?")
+if [ "$R" = "1 on" ]; then echo "PASS 5197 pobf_xopt reads the literal -? with a -O file planted (globbing restored on)"
+else echo "FAIL 5197 pobf_xopt glob screen: got '$R', want '1 on'"; FAILED=$((FAILED + 1)); fi
+CASES=$((CASES + 1))
+R=$(xopt_probe on git "git grep -O needle")
+if [ "$R" = "0 on" ]; then echo "PASS 5197 pobf_xopt void return restores globbing"
+else echo "FAIL 5197 pobf_xopt void return: got '$R', want '0 on'"; FAILED=$((FAILED + 1)); fi
+CASES=$((CASES + 1))
+R=$(xopt_probe off git "git grep -n needle -?")
+if [ "$R" = "1 off" ]; then echo "PASS 5197 pobf_xopt leaves a caller's set -f in place"
+else echo "FAIL 5197 pobf_xopt caller set -f: got '$R', want '1 off'"; FAILED=$((FAILED + 1)); fi
+rm -rf "$GLOBDIR" "$XOPT_SRC"
+
+# --- HIMMEL-5210 (follow-ups of 5197, judge j2363a): (1) ripgrep 15.2.0 has two
+# options whose value is a COMMAND, --pre and --hostname-bin (`rg --help`;
+# ripgrep does not abbreviate long options), so both void relief in every
+# spelling. (2) a command word under /bin or /usr/bin is stripped to its base
+# name only when no further / follows, so /usr/bin/../../tmp/x/grep is not grep.
+# (3) a find -ok continuation inherits its stage's void.
+for F in "rg --hostname-bin='$OBF' --hyperlink-format=default x ." \
+         "rg --hostname-bin '$OBF' --hyperlink-format=default x ." \
+         "rg --hostname-bin=\"$OBF\" x ." \
+         "printf needle | rg --hostname-bin='$OBF' x ." \
+         "rg --host\"name\"-bin='$OBF' x ." \
+         "rg --pre '$OBF' x ." \
+         "rg --pre='$OBF' --pre-glob '*.gz' x ." \
+         "/usr/bin/../../tmp/x/grep needle -- '$OBF'" \
+         "/bin/../tmp/x/cat -- '$OBF'" \
+         "/usr/bin/sub/grep needle -- '$OBF'" \
+         "find . -name x \"\$(printf y)\" -ok '$OBF' {} ;"; do
+    assert_deny "5210 program-running option or path still voids relief: $F" "$(j "unset HIMMEL_CONSOLE_LEG; $F")"
+done
+for F in "rg -x needle -- '$OBF'" \
+         "rg --glob '*.sh' needle -- '$OBF'" \
+         "rg --hyperlink-format=default needle -- '$OBF'" \
+         "rg --pre-glob '*.gz' needle -- '$OBF'" \
+         "/usr/bin/grep needle -- '$OBF'" \
+         "/bin/cat -- '$OBF'"; do
+    assert_allow "5210 control keeps relief: $F" "$(j "unset HIMMEL_CONSOLE_LEG; $F")"
+done
+
+# 5210 round 2 (judge j2366a): an option word BUILT by brace or glob expansion
+# is invisible to the word screen, so a relieved stage carrying an unquoted
+# word that can expand into one voids relief. The glob rows run in a temp cwd
+# holding a file named --hostname-bin, the setup that makes them real.
+G5210=$(mktemp -d) || exit 1
+: > "$G5210/--hostname-bin"
+pushd "$G5210" >/dev/null || exit 1
+for F in "rg {--hostname-bin,$OBF} --color=always --hyperlink-format=default x ." \
+         "rg {--pre,$OBF} x README.md" \
+         "rg --hostname-bi[n]=$OBF --hyperlink-format=default x ." \
+         "rg --pr[e] $OBF x ." \
+         "rg [-]-pre $OBF x ." \
+         "rg --hostname-bi?=$OBF x ." \
+         "rg -{-pre,x} $OBF x ." \
+         "rg needle \"\$(printf y)\" --hostname-bin='$OBF' x ." \
+         "rg \\--hostname-bin='$OBF' x ."; do
+    assert_deny "5210 brace/glob-built option word voids relief: $F" "$(j "unset HIMMEL_CONSOLE_LEG; $F")"
+done
+for F in "rg --glob '*.md' needle -- '$OBF'" \
+         "rg --glob='*.md' needle -- '$OBF'" \
+         "rg \"-n\" needle -- '$OBF'" \
+         "grep -r x src/* -- '$OBF'" \
+         "rg -n needle -- '$OBF'" \
+         "rg --hyperlink-format default needle -- '$OBF'"; do
+    assert_allow "5210 control keeps relief: $F" "$(j "unset HIMMEL_CONSOLE_LEG; $F")"
+done
+# 5210 round 3 (judge j2366b, class shell-parsing): an rg word BUILT without a
+# literal -- (backslash, ANSI-C, unset variable plus quote, variable word,
+# tilde) keeps no relief. Words wholly inside single quotes stay literal.
+for F in "rg \\-\\-pre '$OBF' x ." \
+         "rg \$'\\x2d'-hostname-bin='$OBF' x ." \
+         "rg --pr\$u\"e\" '$OBF' x ." \
+         "o=--pre; rg \$o '$OBF' x ." \
+         "OLDPWD=--pre; rg ~- '$OBF' x ." \
+         "rg \"-\"{-pre,x} '$OBF' x ." \
+         "export RIPGREP_CONFIG_PATH=/nonexistent/cfg; rg needle -- '$OBF'" \
+         "RIPGREP_CONFIG_PATH=/nonexistent/cfg true; rg needle -- '$OBF'" \
+         "o=--pre; rg \"\$o\" '$OBF' x ." \
+         "rg '-'-hostname-bi[n] '$OBF' x ."; do
+    assert_deny "5210 rg shape: built or config-injected option voids relief: $F" "$(j "unset HIMMEL_CONSOLE_LEG; $F")"
+done
+for F in "rg \"-n\" needle -- '$OBF'" \
+         "rg --glob '*.md' needle -- '$OBF'"; do
+    assert_allow "5210 rg shape control keeps relief: $F" "$(j "unset HIMMEL_CONSOLE_LEG; $F")"
+done
+# 5210 round 5 (judge j2366c): a command substitution or backtick body is its
+# own stage, so the rg words after it must void relief as a continuation.
+for F in "rg \`printf %s --pre\` '$OBF' x ." \
+         "rg \"\$(printf %s --pre)\" '$OBF' x ." \
+         "rg \$(printf %s --pr)e '$OBF' x ."; do
+    assert_deny "5210 rg continuation of a substitution voids relief: $F" "$(j "unset HIMMEL_CONSOLE_LEG; $F")"
+done
+# Non-rg stages reach only pobf_xglob (no shape screen): one row per clause.
+for F in "grep {r,x} needle -- '$OBF'" \
+         "grep --e*=x needle -- '$OBF'" \
+         "grep \"-\"{-r,x} needle -- '$OBF'"; do
+    assert_deny "5210 xglob clause row: $F" "$(j "unset HIMMEL_CONSOLE_LEG; $F")"
+done
+popd >/dev/null || exit 1
+rm -rf "$G5210"
+
+# Mutation rows: the hostname-bin fix sits in three layers (the rg classifier,
+# the xopt case list, the brace/glob screen). Each mutant drops ONE layer; its
+# own row must stop being denied, so no layer is dead weight a row never reads.
+MUT5210=$(mktemp -d) || exit 1
+mkdir -p "$MUT5210/hooks"
+cp "$REGISTRY" "$MUT5210/chokepoints.json"
+mut_row() {  # mut_row <label> <sed expr> <command only this layer denies>
+    local label="$1" expr="$2" cmd="$3" saved="$HOOK"
+    CASES=$((CASES + 1))
+    if ! sed "$expr" "$HOOK" > "$MUT5210/hooks/mut.sh" || [ ! -s "$MUT5210/hooks/mut.sh" ]; then
+        echo "FAIL $label -- sed failed or produced an empty mutant"
+        FAILED=$((FAILED + 1))
+        return
+    fi
+    if cmp -s "$HOOK" "$MUT5210/hooks/mut.sh"; then
+        echo "FAIL $label -- mutation did not change the hook (vacuous)"
+        FAILED=$((FAILED + 1))
+        return
+    fi
+    HOOK="$MUT5210/hooks/mut.sh"
+    run "$(j "unset HIMMEL_CONSOLE_LEG; $cmd")"
+    local dec rc1="$RC" dec0 rc0
+    dec=$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null || true)
+    # Cross-check: a row no mutated layer owns must still be denied, so a
+    # mutant that fails open or crashes cannot pass for a row that went quiet.
+    run "$(j "unset HIMMEL_CONSOLE_LEG; /usr/bin/sub/grep needle -- '$OBF'")"
+    rc0="$RC"
+    dec0=$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null || true)
+    HOOK="$saved"
+    RC="$rc1"
+    if [ "$rc0" != "2" ] || [ "$dec0" != "deny" ]; then
+        echo "FAIL $label -- the mutant no longer denies the control row (rc=$rc0 decision='$dec0')"
+        FAILED=$((FAILED + 1))
+        return
+    fi
+    if [ "$RC" = "0" ] && [ "$dec" != "deny" ]; then
+        echo "PASS $label (row allowed without that layer)"
+    else
+        echo "FAIL $label -- expected rc=0 and no deny without the layer, got rc=$RC decision='$dec': $cmd"
+        FAILED=$((FAILED + 1))
+    fi
+}
+# The rg classifier regex has no mutant row: since the shape screen (round 3)
+# a backslash or brace spelled --hostname-bin is denied by pobf_rgshape and
+# pobf_xopt as well, so no command is owned by the classifier alone.
+# The xopt row is a non-rg reader: since round 5 every rg spelling is also
+# owned by the classifier, the shape screen or the continuation void.
+# shellcheck disable=SC2016 # the sed expressions are literal; $x and ${ST[j]} are hook text
+mut_row "5210 mutant: xopt --hostname-bin case dropped" \
+    's/|--hostname-bin|--hostname-bin=\*//' \
+    "grep --hostname-bin='$OBF' x ."
+# shellcheck disable=SC2016 # literal sed expressions, as above
+mut_row "5210 mutant: xglob screen dropped (non-rg brace row)" \
+    's/|| pobf_xglob "\${ST\[j\]}"//' \
+    "grep {-r,x} needle -- '$OBF'"
+# shellcheck disable=SC2016 # literal sed expression, as above
+mut_row "5210 mutant: xglob rule 1a (leading glob char) dropped" \
+    "/'{'\\*|'\\['\\*/s/rc=0; break/:/" \
+    "grep {r,x} needle -- '$OBF'"
+# shellcheck disable=SC2016 # literal sed expression, as above
+mut_row "5210 mutant: xglob rule 1b (option word with glob before =) dropped" \
+    '/\$n =~ \^-/s/rc=0; break/:/' \
+    "grep --e*=x needle -- '$OBF'"
+# shellcheck disable=SC2016 # literal sed expression, as above
+mut_row "5210 mutant: xglob rule 1c (brace alternative with -) dropped" \
+    '/\$w =~ \\{(-|/s/rc=0; break/:/' \
+    "grep \"-\"{-r,x} needle -- '$OBF'"
+# shellcheck disable=SC2016 # literal sed expression, as above
+mut_row "5210 mutant: rg shape screen dropped" \
+    's/ || pobf_rgshape "\${ST\[j\]}"//' \
+    "rg \\-\\-pre '$OBF' x ."
+# shellcheck disable=SC2016 # literal sed expression, as above
+mut_row "5210 mutant: RIPGREP_CONFIG_PATH void dropped" \
+    's/\*RIPGREP_CONFIG_PATH\*) rgcfg=1/*RIPGREP_CONFIG_PATH*) rgcfg=0/' \
+    "export RIPGREP_CONFIG_PATH=/nonexistent/cfg; rg needle -- '$OBF'"
+# shellcheck disable=SC2016 # literal sed expression, as above
+mut_row "5210 mutant: rg continuation void dropped" \
+    's/ || { \[ "${CO\[j\]-}" -ge 0 \] 2>\/dev\/null && \[ "${CO\[j\]}" -lt "$j" \]; }//' \
+    "rg \`printf %s --pre\` '$OBF' x ."
+# shellcheck disable=SC2016 # literal sed expression, as above
+mut_row "5210 mutant: rg shape double-quoted expansion clause dropped" \
+    '/^            D) case /s/return 0/:/' \
+    "o=--pre; rg \"\$o\" '$OBF' x ."
+# shellcheck disable=SC2016 # literal sed expression, as above
+mut_row "5210 mutant: rg shape glob clause dropped" \
+    "/'~'/s/rc=0; break/:/" \
+    "rg '-'-hostname-bi[n] '$OBF' x ."
+rm -rf "$MUT5210"
+
 CASES=$((CASES + 1))
 if grep -q "block-chokepoint-env-prefix.sh" "$REPO_ROOT/.claude/settings.json" 2>/dev/null; then
     echo "PASS settings.json wiring present"

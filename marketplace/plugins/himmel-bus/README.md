@@ -49,13 +49,23 @@ this change does not claim constant-time polling or a decompression-bomb limit.
 Cursor publication is atomic for process crashes, not fsynced for power loss.
 No bridge or transport wiring is installed by this package.
 
+## Receive path: `bus wait`
+
+`bus wait [--timeout <seconds>]` (default 300) blocks until the caller's own inbox
+has a pending message, prints it in the delivery hook's format and commits the
+cursor (at-least-once, like the hook). Exit 0 = printed, **3 = timed out**, any
+other nonzero = error (unbound identity, halted log, bad `--timeout`). It polls
+`pending` every 500 ms. Legs on the `leg-bus` profile get the MCP server through
+the registry `mcpCatalog` entry; its `npm run start` installs the locked deps on
+first use (`npm ci`) and then execs `server/index.mjs`.
+
 ## Identity and registration CLI
 
 `bin/bus register|bind|rebind|adopt|status|peers` (spec §8). Identity is
 `(name, pid, start time)`, written by the launcher under `peers/<name>.json`;
 `lib/identity.mjs` stamps a caller by its **nearest** claude ancestor whose bound
 `{pid, start}` matches (comm `claude`, `/proc` root injectable). A nested or
-pid-reused claude is `identity unbound`. Names are single-use; `bind` is once;
+pid-reused claude is `identity unbound`. Names are single-use once bound (re-registering a never-bound name with the same role, console, pair and predecessor is adopted, so a re-armed launch is not burned); `bind` is once;
 `rebind` only when the bound pid is gone; `adopt <new console>` (run as the leg)
 only when the old console is `gone` or its own record names the new one;
 `status <name>` prints `live|gone|unbound`; `peers` prints the caller's own edges.

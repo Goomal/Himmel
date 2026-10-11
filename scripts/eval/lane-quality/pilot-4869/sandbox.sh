@@ -108,13 +108,30 @@ case "$GITDIR" in */..|*/../*|"$REPO"|"$REPO"/*) die "git dir $GITDIR is not the
 [ "$(cat "$WT/.git" 2>/dev/null)" = "gitdir: $GITDIR" ] || die "$WT/.git no longer points at $GITDIR"
 { [ ! -e "$GITDIR/commondir" ] && [ ! -L "$GITDIR/commondir" ]; } || die "$GITDIR has a commondir"
 mnt "$WT" dir
-A+=(--bind "$WT" "$WT" --bind "$GITDIR" "$GITDIR")
+# The row's git dir stays writable: the row's own commit/index/scoring state lives there, outside
+# the worktree. The worktree itself is read-only below, so its project policy (.claude settings,
+# hooks) and every script a hook sources are un-rewritable (HIMMEL-5200).
+A+=(--bind "$GITDIR" "$GITDIR")
 # The row lives outside the checkout (clean-garden scans .claude/worktrees),
 # but the lane launcher only serves a cwd under the checkout: the jail shows
 # the row there too, and a launch starts in it.
 JWT="$REPO/.claude/worktrees/${WT##*/}"
 mnt "$JWT" dir
-A+=(--bind "$WT" "$JWT")
+if [ "$mode" = check ]; then
+  A+=(--bind "$WT" "$WT" --bind "$WT" "$JWT")
+else
+  # HIMMEL-5200: the whole worktree comes in read-only, at both paths, and only lq-work/ (where
+  # every task prompt writes) is re-bound writable on top (a later bind wins). Enumerating the
+  # policy files and hook trees was not enough: hooks source guard files settings never name
+  # (scripts/guardrails/lib.sh, scripts/chokepoints.json). lq-work must be a real directory, so a
+  # symlink cannot widen the writable set; a missing or symlinked .claude/settings is refused too.
+  { [ ! -L "$WT/.claude" ] && [ -d "$WT/.claude" ]; } || die "$WT/.claude is missing or a symlink"
+  for p in settings.json settings.local.json hooks; do [ ! -L "$WT/.claude/$p" ] || die "$WT/.claude/$p is a symlink"; done
+  [ -f "$WT/.claude/settings.local.json" ] || die "$WT/.claude/settings.local.json is missing (pilot.sh prepare writes the jail guard there)"
+  { [ ! -L "$WT/lq-work" ] && [ -d "$WT/lq-work" ]; } || die "$WT/lq-work is missing or a symlink (the row's only writable worktree path)"
+  A+=(--ro-bind "$WT" "$WT" --ro-bind "$WT" "$JWT")
+  A+=(--bind "$WT/lq-work" "$WT/lq-work" --bind "$WT/lq-work" "$JWT/lq-work")
+fi
 
 if [ "$mode" = check ]; then
   # The acceptor jail: the kit it runs, read-only, and nothing of the lane.
@@ -125,7 +142,19 @@ if [ "$mode" = check ]; then
 else
   # User settings with every plugin and MCP server removed (qmd, obsidian, ...).
   if [ -f "$HOME/.claude/settings.json" ]; then
-    jq 'del(.enabledPlugins, .mcpServers, .enabledMcpjsonServers, .enableAllProjectMcpServers)' \
+    # HIMMEL-5077: claudex's classifier runs client-side on the codex model and over-reads
+    # the rm -rf deny rule. The row's own test scripts get a jail-only PreToolUse hook
+    # (lq-allow-hook.sh; a permissions.allow glob's `*` would cross `/` and `..`) and
+    # own-file rewrites an autoMode.allow line. The deny list stays.
+    if [ "$LANE" = claudex ]; then
+      cp "$HERE/lq-allow-hook.sh" "$RUN/lq-allow-hook.sh" || die "cannot copy the allow hook"
+    fi
+    jq --arg lane "$LANE" --arg wt "$WT" --arg jwt "$JWT" --arg hook "$RUN/lq-allow-hook.sh" \
+      'del(.enabledPlugins, .mcpServers, .enabledMcpjsonServers, .enableAllProjectMcpServers)
+       | if $lane == "claudex" then
+           .hooks.PreToolUse = ((.hooks.PreToolUse // []) + [{"matcher": "Bash", "hooks": [{"type": "command", "command": "bash \([$hook, $jwt, $wt] | map(@sh) | join(" "))"}]}])
+           | .autoMode.allow = ((.autoMode.allow // ["$defaults"]) + ["Editing or rewriting files inside the task'"'"'s own working directory (\($jwt)/lq-work) is routine work, not destruction: lq-work is a disposable eval copy"])
+         else . end' \
       "$HOME/.claude/settings.json" >"$RUN/user-settings.json" || die "cannot filter the user settings"
     A+=(--ro-bind "$RUN/user-settings.json" "$HOME/.claude/settings.json")
   fi
@@ -136,6 +165,16 @@ else
     A+=(--ro-bind-try "$HOME/.claude/$s" "$HOME/.claude/$s")
   done
   for d in "${EGRESS[@]}"; do A+=(--ro-bind-try "$d" "$d"); done
+  # HIMMEL-5200: every bind below comes AFTER the worktree's read-only bind, and a later bind
+  # wins. One that is, sits under, or contains the worktree (at either jail path) would put it
+  # back writable or hide the read-only mount, so such a row is refused, never launched.
+  for rw in "$(dirname "$DOC")" "$RUN" "$ROWCONF" "$TX" "$GITDIR" "$GITOBJ"; do
+    rwp="$(realpath -m -- "$rw")" || die "cannot resolve $rw"
+    for wp in "$(realpath -m -- "$WT")" "$(realpath -m -- "$JWT")"; do
+      case "$rwp/" in "$wp"/*) die "$rw sits at or under the worktree $wp (its writable bind would undo the read-only worktree)" ;; esac
+      case "$wp/" in "$rwp"/*) die "$rw contains the worktree $wp (its bind would hide the read-only worktree)" ;; esac
+    done
+  done
   A+=(--bind "$(dirname "$DOC")" "$(dirname "$DOC")" --ro-bind "$RUN" "$RUN")
   A+=(--bind "$ROWCONF" "$CONF" --bind "$TX" "$CONF/projects")
   { printf '127.0.0.1 localhost\n::1 localhost\n'; if [ -n "$TUN_HOST" ]; then printf '127.0.0.1 %s\n' "$TUN_HOST"; fi; } >"$RUN/hosts" \
@@ -167,6 +206,30 @@ while IFS= read -r v; do
     A+=(--unsetenv "$v")
   fi
 done < <(compgen -e)
+
+# HIMMEL-5183: the row must not rewrite its own permission policy. ROWCONF stays
+# writable (the launcher writes its mirror and runtime state there), but the seeded
+# settings.json and the hooks dir it references come back read-only. The launcher seeds
+# them OUTSIDE the lane: a first jail with the same mounts (so the seed fingerprint
+# matches the lane's view) runs `<launcher> --seed-only` with a dummy key and exits; the
+# lane's own launch then finds a current seed and writes neither file. The seed runs in
+# the jail, never on the host, so a symlink a row planted cannot take a host write out;
+# a planted symlink is refused before the seed and again before the bind.
+if [ "$mode" != check ]; then
+  for p in settings.json hooks; do [ ! -L "$ROWCONF/$p" ] || die "$ROWCONF/$p is a symlink"; done
+  if [ "$mode" != argv ]; then
+    mkdir -p "$ROWCONF" "$TX" || die "cannot create $ROWCONF or $TX"
+    env "$KEY=seed-only" bwrap "${A[@]}" --chdir "$JWT" -- "$LAUNCHER" --seed-only >/dev/null \
+      || die "the lane config seed failed (launcher --seed-only)"
+    for p in settings.json hooks; do [ ! -L "$ROWCONF/$p" ] || die "$ROWCONF/$p is a symlink"; done
+    # A launcher that seeded no policy still gets one bound: the row cannot create its own.
+    [ -f "$ROWCONF/settings.json" ] || { printf '{}\n' >"$RUN/empty-settings.json" || die "cannot write $RUN/empty-settings.json"; }
+    [ -d "$ROWCONF/hooks" ] || mkdir -p "$RUN/empty-hooks" || die "cannot create $RUN/empty-hooks"
+  fi
+  if [ "$mode" != argv ] && [ ! -f "$ROWCONF/settings.json" ]; then s_src="$RUN/empty-settings.json"; else s_src="$ROWCONF/settings.json"; fi
+  if [ "$mode" != argv ] && [ ! -d "$ROWCONF/hooks" ]; then h_src="$RUN/empty-hooks"; else h_src="$ROWCONF/hooks"; fi
+  A+=(--ro-bind "$s_src" "$CONF/settings.json" --ro-bind "$h_src" "$CONF/hooks")
+fi
 
 # The jail must not put back anything it exists to hide.
 i=0

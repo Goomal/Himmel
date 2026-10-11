@@ -108,13 +108,30 @@ case "$GITDIR" in */..|*/../*|"$REPO"|"$REPO"/*) die "git dir $GITDIR is not the
 [ "$(cat "$WT/.git" 2>/dev/null)" = "gitdir: $GITDIR" ] || die "$WT/.git no longer points at $GITDIR"
 { [ ! -e "$GITDIR/commondir" ] && [ ! -L "$GITDIR/commondir" ]; } || die "$GITDIR has a commondir"
 mnt "$WT" dir
-A+=(--bind "$WT" "$WT" --bind "$GITDIR" "$GITDIR")
+# The row's git dir stays writable: the row's own commit/index/scoring state lives there, outside
+# the worktree. The worktree itself is read-only below, so its project policy (.claude settings,
+# hooks) and every script a hook sources are un-rewritable (HIMMEL-5200).
+A+=(--bind "$GITDIR" "$GITDIR")
 # The row lives outside the checkout (clean-garden scans .claude/worktrees),
 # but the lane launcher only serves a cwd under the checkout: the jail shows
 # the row there too, and a launch starts in it.
 JWT="$REPO/.claude/worktrees/${WT##*/}"
 mnt "$JWT" dir
-A+=(--bind "$WT" "$JWT")
+if [ "$mode" = check ]; then
+  A+=(--bind "$WT" "$WT" --bind "$WT" "$JWT")
+else
+  # HIMMEL-5200: the whole worktree comes in read-only, at both paths, and only lq-work/ (where
+  # every task prompt writes) is re-bound writable on top (a later bind wins). Enumerating the
+  # policy files and hook trees was not enough: hooks source guard files settings never name
+  # (scripts/guardrails/lib.sh, scripts/chokepoints.json). lq-work must be a real directory, so a
+  # symlink cannot widen the writable set; a missing or symlinked .claude/settings is refused too.
+  { [ ! -L "$WT/.claude" ] && [ -d "$WT/.claude" ]; } || die "$WT/.claude is missing or a symlink"
+  for p in settings.json settings.local.json hooks; do [ ! -L "$WT/.claude/$p" ] || die "$WT/.claude/$p is a symlink"; done
+  [ -f "$WT/.claude/settings.local.json" ] || die "$WT/.claude/settings.local.json is missing (pilot.sh prepare writes the jail guard there)"
+  { [ ! -L "$WT/lq-work" ] && [ -d "$WT/lq-work" ]; } || die "$WT/lq-work is missing or a symlink (the row's only writable worktree path)"
+  A+=(--ro-bind "$WT" "$WT" --ro-bind "$WT" "$JWT")
+  A+=(--bind "$WT/lq-work" "$WT/lq-work" --bind "$WT/lq-work" "$JWT/lq-work")
+fi
 
 if [ "$mode" = check ]; then
   # The acceptor jail: the kit it runs, read-only, and nothing of the lane.
@@ -148,6 +165,16 @@ else
     A+=(--ro-bind-try "$HOME/.claude/$s" "$HOME/.claude/$s")
   done
   for d in "${EGRESS[@]}"; do A+=(--ro-bind-try "$d" "$d"); done
+  # HIMMEL-5200: every bind below comes AFTER the worktree's read-only bind, and a later bind
+  # wins. One that is, sits under, or contains the worktree (at either jail path) would put it
+  # back writable or hide the read-only mount, so such a row is refused, never launched.
+  for rw in "$(dirname "$DOC")" "$RUN" "$ROWCONF" "$TX" "$GITDIR" "$GITOBJ"; do
+    rwp="$(realpath -m -- "$rw")" || die "cannot resolve $rw"
+    for wp in "$(realpath -m -- "$WT")" "$(realpath -m -- "$JWT")"; do
+      case "$rwp/" in "$wp"/*) die "$rw sits at or under the worktree $wp (its writable bind would undo the read-only worktree)" ;; esac
+      case "$wp/" in "$rwp"/*) die "$rw contains the worktree $wp (its bind would hide the read-only worktree)" ;; esac
+    done
+  done
   A+=(--bind "$(dirname "$DOC")" "$(dirname "$DOC")" --ro-bind "$RUN" "$RUN")
   A+=(--bind "$ROWCONF" "$CONF" --bind "$TX" "$CONF/projects")
   { printf '127.0.0.1 localhost\n::1 localhost\n'; if [ -n "$TUN_HOST" ]; then printf '127.0.0.1 %s\n' "$TUN_HOST"; fi; } >"$RUN/hosts" \

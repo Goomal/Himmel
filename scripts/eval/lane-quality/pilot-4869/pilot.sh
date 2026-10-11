@@ -100,6 +100,9 @@ load_env() { [ -r "$ROOT/pilot.env" ] || die "not initialised; run: pilot.sh ini
 
 materialize_row() { # $1 task, $2 worktree -> fixture sha
   local task="$1" wt="$2"
+  # HIMMEL-5200: the jail binds the worktree read-only and only lq-work/ writable, so the row
+  # cannot create it itself (the tasks with no fixture, like shell-red-green, start without one).
+  mkdir -p "$wt/lq-work" || die "cannot create $wt/lq-work"
   if [ "$task" = bench-t4 ]; then
     mkdir -p "$wt/lq-work"
     cp "$T4"/input/* "$wt/lq-work/" || die "cannot copy the T4 input"
@@ -347,8 +350,27 @@ cmd_finish() {
   timeout 120 "${jail[@]}" bash "$acc_sh" "$WT" "$FIX" >"$ROOT/private/$row.accept.log" 2>&1; acc_rc=$? # gnu-ok: the pilot is Linux-only (its rows run in a bwrap jail)
   acc="$(grep -E '^accept: [0-9]+/[0-9]+$' "$ROOT/private/$row.accept.log" | tail -1)"
   "${jail[@]}" git add -A -- . ':!.claude/settings.local.json'
+  # HIMMEL-5200: settings.local.json is gitignored and carries the jail guard, so it is
+  # not part of the judged diff, but a row that rewrote, replaced or removed it is
+  # scored out of scope: staged with -f here, or named when it is gone. The expected
+  # content is the guard prepare wrote (a native row has none).
+  # Only a regular file is read or staged: a symlink or FIFO put there is named, never opened.
+  lj="$WT/.claude/settings.local.json"; lj_bad=0
+  gd="$ROOT/private/$row.guard"; rm -rf "$gd"
+  if [ -L "$lj" ] || { [ -e "$lj" ] && [ ! -f "$lj" ]; }; then
+    lj_bad=1
+  elif [ "$LANE" = native ]; then
+    [ ! -e "$lj" ] || "${jail[@]}" git add -f -- .claude/settings.local.json || lj_bad=1
+  elif [ ! -f "$lj" ]; then
+    lj_bad=1
+  elif ! write_jail_guard "$gd" || ! cmp -s "$gd/.claude/settings.local.json" "$lj"; then
+    # a guard that cannot be staged is named below, never read as a clean scope
+    "${jail[@]}" git add -f -- .claude/settings.local.json || lj_bad=1
+  fi
+  rm -rf "$gd"
   # A diff that could not run is not a clean scope.
-  if "${jail[@]}" git diff --cached --name-only "$FIX" -- . ':!.claude/settings.local.json' >"$ROOT/private/$row.scope.txt"; then
+  if "${jail[@]}" git diff --cached --name-only "$FIX" -- . >"$ROOT/private/$row.scope.txt"; then
+    [ "$lj_bad" = 0 ] || printf '%s\n' .claude/settings.local.json >>"$ROOT/private/$row.scope.txt"
     scope="$(grep -v '^lq-work/' "$ROOT/private/$row.scope.txt" | jq -R . | jq -sc .)"
   else
     scope='["(scope diff failed)"]'

@@ -900,7 +900,59 @@ printf "111\n222\n333\n"
 exit 0
 ' > "$probe_dir/pgrep"; chmod +x "$probe_dir/pgrep"
 # shellcheck disable=SC2016
-assert "pgrep rc 0 with 3 matches -> 3"   "$(command -v bash)" -c 'PATH="$1:/usr/bin:/bin"; export PATH; . "$2/graphify-bin.sh"; out=$(_graphify_mcp_holders) && [ "$out" = "3" ]' _ "$probe_dir" "$SCRIPT_DIR"
+assert "pgrep rc 0 with 3 matches -> 3"   "$(command -v bash)" -c 'PATH="$1:/usr/bin:/bin"; export PATH; GRAPHIFY_PROC_ROOT="$3"; export GRAPHIFY_PROC_ROOT; . "$2/graphify-bin.sh"; out=$(_graphify_mcp_holders) && [ "$out" = "3" ]' _ "$probe_dir" "$SCRIPT_DIR" "$tmpdir/no-proc"
+
+# HIMMEL-5295: pgrep -f matches the WHOLE command line, so a process that only
+# MENTIONS graphify-mcp (the shell running the update) was counted as a holder
+# and skipped a safe upgrade. Real /proc, a fake pgrep that reports exactly the
+# pids under test via HOLDER_PIDS.
+echo "[test-graphify-bin] _graphify_mcp_holders: only REAL graphify-mcp processes are holders (HIMMEL-5295)"
+if [ -d /proc/self ]; then
+  # shellcheck disable=SC2016
+  printf '#!/bin/sh\nfor p in $HOLDER_PIDS; do echo "$p"; done\nexit 0\n' > "$probe_dir/pgrep"; chmod +x "$probe_dir/pgrep"
+  h5_pypi="$(bash -c '. "$1/graphify-bin.sh"; _graphify_pypi_name' _ "$SCRIPT_DIR")"
+  h5_stub="$tmpdir/h5/bin"; mkdir -p "$h5_stub" "$tmpdir/h5/uv/tools/$h5_pypi/bin"
+  # no `exec`: the shell must stay the process so its argv keeps the script path
+  printf '#!/bin/sh\nsleep 60\ntrue\n' > "$h5_stub/graphify-mcp"; chmod +x "$h5_stub/graphify-mcp"
+  # argv mention only: bash -c "<text naming graphify-mcp and the tool dir>"
+  bash -c ': graphify-mcp /x/uv/tools/'"$h5_pypi"'; sleep 60' & h5_mention=$!
+  # a real entry point run through an interpreter
+  bash "$h5_stub/graphify-mcp" & h5_real=$!
+  # argv[0] under the tool dir (a venv python)
+  ( exec -a "/home/u/.local/share/uv/tools/$h5_pypi/bin/python" sleep 60 ) & h5_venv=$!
+  # an interpreter option VALUE before the script (not the first non-dash arg)
+  bash --rcfile /dev/null "$h5_stub/graphify-mcp" & h5_optval=$!
+  # a pid that has gone since pgrep ran
+  true & h5_gone=$!; wait "$h5_gone" 2>/dev/null
+  sleep 0.3
+  h5_count() {
+    # shellcheck disable=SC2016
+    HOLDER_PIDS="$1" "$(command -v bash)" -c 'PATH="$1:/usr/bin:/bin"; export PATH; . "$2/graphify-bin.sh"; _graphify_mcp_holders' _ "$probe_dir" "$SCRIPT_DIR" 2>/dev/null
+  }
+  assert "argv mention only -> NOT a holder (0)"           test "$(h5_count "$h5_mention")" = "0"
+  assert "real entry point under an interpreter -> 1"      test "$(h5_count "$h5_real")" = "1"
+  assert "argv[0] under the uv tool dir -> 1"              test "$(h5_count "$h5_venv")" = "1"
+  assert "mention + real + venv -> 2, mention dropped"     test "$(h5_count "$h5_mention $h5_real $h5_venv")" = "2"
+  assert "option value before the script path -> 1"        test "$(h5_count "$h5_optval")" = "1"
+  assert "a pid gone since pgrep ran -> not a holder (0)"  test "$(h5_count "$h5_gone")" = "0"
+  # a pid whose /proc entry EXISTS but whose cmdline cannot be read is not
+  # "gone": it is kept (fail closed), only an absent entry is dropped
+  h5_fp="$tmpdir/h5/fakeproc"; mkdir -p "$h5_fp/self" "$h5_fp/4242"
+  # shellcheck disable=SC2016
+  assert "present pid dir, unreadable cmdline -> counted (1)" \
+    test "$(HOLDER_PIDS=4242 GRAPHIFY_PROC_ROOT="$h5_fp" "$(command -v bash)" -c 'PATH="$1:/usr/bin:/bin"; export PATH; . "$2/graphify-bin.sh"; _graphify_mcp_holders' _ "$probe_dir" "$SCRIPT_DIR" 2>/dev/null)" = "1"
+  # the update's OWN chain is never a holder even if its argv is the entry point
+  h5_self="$h5_stub/graphify-mcp-self"
+  printf '#!/bin/bash\nHOLDER_PIDS=$$ PATH="%s:/usr/bin:/bin"; export HOLDER_PIDS PATH\n. "%s/graphify-bin.sh"; _graphify_mcp_holders\n' "$probe_dir" "$SCRIPT_DIR" > "$h5_self"
+  mkdir -p "$tmpdir/h5/self"; cp "$h5_self" "$tmpdir/h5/self/graphify-mcp"
+  assert "own pid, argv is graphify-mcp -> excluded (0)"   test "$(bash "$tmpdir/h5/self/graphify-mcp" 2>/dev/null)" = "0"
+  # details name only the real holder
+  # shellcheck disable=SC2016
+  assert "details name the real holder, not the mention" \
+    "$(command -v bash)" -c 'PATH="$1:/usr/bin:/bin"; export PATH; HOLDER_PIDS="$3 $4"; export HOLDER_PIDS; . "$2/graphify-bin.sh"; out=$(_graphify_mcp_holder_details) || exit 1; case "$out" in *"pid $4"*) ;; *) exit 1;; esac; case "$out" in *"pid $3"*) exit 1;; esac' _ "$probe_dir" "$SCRIPT_DIR" "$h5_mention" "$h5_real"
+  kill "$h5_mention" "$h5_real" "$h5_venv" "$h5_optval" 2>/dev/null
+  wait "$h5_mention" "$h5_real" "$h5_venv" "$h5_optval" 2>/dev/null
+fi
 
 # Needle PARITY with the Windows branch (public-PR CR). Two needles are
 # documented above _graphify_mcp_holders — the entrypoint name AND the uv tool
@@ -1409,7 +1461,14 @@ if [ "$lf_posix" -eq 1 ]; then
     "$late_count" "$late_count" > "$late_bin/pgrep"
   chmod +x "$late_bin/pgrep"
   lf_extra_path="$late_bin"
-  out=$(lf_run env -u GRAPHIFY_MCP_HOLDERS -u GRAPHIFY_MCP_HOLDER_DETAILS)
+  # The fake pids must look live to the real-holder filter (HIMMEL-5295): a pid
+  # absent from /proc is dropped as vanished, and 101-103 need not exist here.
+  late_proc="$tmpdir/lf-held-late-proc"; mkdir -p "$late_proc/self"
+  for late_pid in 101 102 103; do
+    mkdir -p "$late_proc/$late_pid"
+    printf 'graphify-mcp\0' > "$late_proc/$late_pid/cmdline"
+  done
+  out=$(GRAPHIFY_PROC_ROOT="$late_proc" lf_run env -u GRAPHIFY_MCP_HOLDERS -u GRAPHIFY_MCP_HOLDER_DETAILS)
   assert "late holder: rc 0" grep -q '^RC=0$' <<<"$out"
   assert "late holder: the stage DID run (first probe was clear)" grep -q 'scoped=1' "$lf_log"
   # shellcheck disable=SC2016

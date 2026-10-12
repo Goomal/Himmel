@@ -110,6 +110,35 @@ STUBEOF
 chmod +x "$fx/scripts/cr/critic-panel.sh"
 SCRIPT="$fx/scripts/cr/panel-first-pass.sh"
 
+# HIMMEL-5268: review-round.sh verifies --base-sha against the remote through
+# `gh api repos/<o>/<r>/compare/<sha>...<branch>`. This fixture has no GitHub
+# remote, so a PATH-side gh stub answers that one call (review-round.sh keeps
+# calling the real gh from PATH; there is no env seam that skips the check).
+mkdir -p "$tmp/ghbin"
+cat > "$tmp/ghbin/gh" <<'GHEOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = api ]; then
+    case "${2:-}" in
+        repos/*/compare/*)
+            [ "${GH_COMPARE_RC:-0}" = 0 ] || exit "$GH_COMPARE_RC"
+            _br="${2##*...}"
+            if [ "$_br" = "${GH_REMOTE_DEFAULT:-main}" ]; then
+                printf '%s\n' "${GH_COMPARE_STATUS:-ahead}"
+            else
+                printf 'identical\n'
+            fi
+            exit 0 ;;
+        'repos/{owner}/{repo}')
+            printf '%s\n' "${GH_REMOTE_DEFAULT:-main}"
+            exit 0 ;;
+    esac
+fi
+printf 'unexpected gh invocation\n' >&2
+exit 1
+GHEOF
+chmod +x "$tmp/ghbin/gh"
+PATH="$tmp/ghbin:$PATH"; export PATH
+
 # --- fixture git repo: main + a real-diff branch + a no-diff branch --------
 repo="$tmp/repo"
 mkdir -p "$repo"
@@ -487,6 +516,21 @@ if [ "$r3_rev" = "$r3_tracking_main" ]; then
 else
     bad "T14 resolved ref rev-parsed to $r3_rev, want the tracking commit $r3_tracking_main (got shadow $r3_shadow_main?)"
 fi
+
+# T15 (HIMMEL-5268): the base verification refuses end to end. The stub says the
+# captured base is not on the remote default branch, so review-round.sh exits 8
+# at intake and the panel is never invoked; the passing rows above prove the
+# same fixture reaches the panel when the stub answers "ahead".
+rm -rf "$repo/.git/cr-review-rounds"
+rm -f "$CALL_LOG" "$tmp/err"
+out="$( (cd "$repo" && GH_COMPARE_STATUS=diverged FAKE_RC=0 FAKE_OUT='MUST-NOT-REVIEW' \
+    bash "$SCRIPT" --head "$feature_sha" --branch feature) 2>"$tmp/err" )"; rc=$?
+err="$(cat "$tmp/err")"
+if [ "$rc" -ne 0 ]; then ok "T15 a base the remote does not vouch for aborts the run (rc=$rc)"; else bad "T15 diverged base was accepted"; fi
+assert_has "$err" "gh compare says 'diverged'" "T15 refusal names the remote verdict"
+assert_lacks "$out" "MUST-NOT-REVIEW" "T15 no findings from a refused run"
+if [ -f "$CALL_LOG" ]; then bad "T15 panel invoked past a refused base"; else ok "T15 panel never invoked"; fi
+rm -rf "$repo/.git/cr-review-rounds"
 
 # --- no writes outside the mktemp fixture -----------------------------------
 # panel-first-pass.sh's only persistent writes are mktemp -t cr-panel-avail.*

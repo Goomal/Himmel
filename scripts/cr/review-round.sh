@@ -29,6 +29,10 @@
 # reviewed head has a COMPLETED check-run with conclusion failure (read through
 # gh api, none still running), the delta since it is at most 40 diff lines, and
 # the PR has not had this unlock before (.cired). Recorded in the ledger.
+# HIMMEL-5268: a non-empty --base-sha is verified once at intake against the
+# REMOTE only (gh api: default branch name, then compare <sha>...<default> must
+# be identical or ahead); no local ref names or vouches for it. Offline, no gh
+# or an unreadable answer therefore refuses every --base-sha round (exit 8).
 # Bash 3.2-safe.
 # Platform guard: requires POSIX Bash 3.2+; on Windows, run under Git Bash.
 set -uo pipefail
@@ -146,6 +150,48 @@ current_branch="$(git branch --show-current 2>/dev/null)" || current_branch=""
 if [ -z "$current_branch" ] || [ "$current_branch" != "$branch" ]; then
     echo "review-round: --branch '$branch' is not the branch checked out in this directory ('${current_branch:-detached HEAD}') - run it from that branch's worktree" >&2
     exit 2
+fi
+
+# HIMMEL-5268: --base-sha is caller input and every merge-forward and CI-red
+# measure below trusts it, so it is verified once, here, before any consumer
+# reads it. No local ref names or vouches for the base: the default branch name
+# is read from the remote (gh api repos/{owner}/{repo}) and the remote compare
+# <sha>...<default> must report identical or ahead. The value must be a full
+# 40-hex sha and, once verified, base_sha is reassigned to the resolved commit so
+# no consumer re-resolves the caller string. Offline, no gh, an unreadable
+# answer or any other status refuses EVERY --base-sha round (exit 8, fail closed).
+if [ -n "$base_sha" ]; then
+    # shellcheck source=scripts/lib/timeout-bin.sh
+    # shellcheck disable=SC1091
+    . "$HIMMEL_ROOT/scripts/lib/timeout-bin.sh" 2>/dev/null || _TIMEOUT_BIN=""
+    # Only a full sha is a stable name: a ref or short sha would be re-resolved
+    # by every consumer below, and a racing update-ref could retarget them after
+    # this check passed (j2415c).
+    case "$base_sha" in
+        *[!0-9a-f]*|'')
+            echo "review-round: --base-sha '$base_sha' must be exactly 40 lowercase hex chars - refused (HIMMEL-5268)" >&2
+            exit 8 ;;
+    esac
+    if [ "${#base_sha}" -ne 40 ]; then
+        echo "review-round: --base-sha '$base_sha' must be exactly 40 lowercase hex chars - refused (HIMMEL-5268)" >&2
+        exit 8
+    fi
+    _vb_got="$(git rev-parse --verify --quiet "$base_sha^{commit}" 2>/dev/null)" || _vb_got=""
+    _vb_def="$(${_TIMEOUT_BIN:+"$_TIMEOUT_BIN" -k 5 30} gh api "repos/{owner}/{repo}" --jq .default_branch 2>/dev/null)" || _vb_def=""
+    case "$_vb_def" in
+        ''|*[!A-Za-z0-9._/-]*) _vb_def="" ;;
+    esac
+    if [ -z "$_vb_got" ] || [ -z "$_vb_def" ] || ! git check-ref-format --branch "$_vb_def" >/dev/null 2>&1; then
+        echo "review-round: --base-sha '$base_sha' cannot be verified (unresolvable commit or unreadable remote default branch) - refused (HIMMEL-5268)" >&2
+        exit 8
+    fi
+    _vb_status="$(${_TIMEOUT_BIN:+"$_TIMEOUT_BIN" -k 5 30} gh api "repos/{owner}/{repo}/compare/$_vb_got...$_vb_def" --jq .status 2>/dev/null)" || _vb_status=""
+    case "$_vb_status" in
+        identical|ahead) base_sha="$_vb_got" ;;
+        *)
+            echo "review-round: --base-sha $_vb_got is not on the remote $_vb_def history (gh compare says '${_vb_status:-unreadable}') - refused (HIMMEL-5268)" >&2
+            exit 8 ;;
+    esac
 fi
 
 git_dir="$(git rev-parse --git-common-dir 2>/dev/null)" || git_dir=""
@@ -578,7 +624,7 @@ merge_forward_shape() {
 # own_diff <base> <head>: the PR's own diff as text, minus the index and
 # hunk-header lines a moved base shifts.
 own_diff() {
-    _od_raw="$(git diff --no-ext-diff --no-color --no-renames "$1" "$2" 2>/dev/null)" || return 1
+    _od_raw="$(git diff --no-ext-diff --no-textconv --no-color --no-renames "$1" "$2" 2>/dev/null)" || return 1
     printf '%s\n' "$_od_raw" | sed -e '/^index /d' -e 's/^@@ [^@]* @@.*$/@@/'
 }
 # clean_merge_forward <from> <to> succeeds only for a CLEAN merge-forward:
@@ -732,7 +778,8 @@ EOF
 # own diff changed from <from> to <to>; the base side of a merge-forward is not
 # counted (own_diff compares each head with its own base point). A changed line
 # counts twice (old and new). Without a captured base every line counts.
-# Fails (rc 1) when it cannot be measured.
+# Fails (rc 1) when it cannot be measured or when either own diff has a binary
+# change (HIMMEL-5268).
 ci_red_delta_lines() {
     if [ -z "$base_sha" ]; then
         _cl_num="$(git diff --numstat --no-renames "$1" "$2" 2>/dev/null)" || return 1
@@ -742,10 +789,12 @@ ci_red_delta_lines() {
             END { if (bad) n = 999999; print n + 0 }'
         return 0
     fi
+    # HIMMEL-5268: base_sha was verified at argument intake (top of this file).
     _cl_ob="$(git merge-base "$1" "$base_sha" 2>/dev/null)" || return 1
     _cl_nb="$(git merge-base "$2" "$base_sha" 2>/dev/null)" || return 1
     _cl_tmp="$(mktemp -d "${TMPDIR:-/tmp}/review-round.XXXXXX")" || return 1
-    if own_diff "$_cl_ob" "$1" > "$_cl_tmp/a" && own_diff "$_cl_nb" "$2" > "$_cl_tmp/b"; then
+    if own_diff "$_cl_ob" "$1" > "$_cl_tmp/a" && own_diff "$_cl_nb" "$2" > "$_cl_tmp/b" \
+        && ! grep -qE '^(Binary files |GIT binary patch)' "$_cl_tmp/a" "$_cl_tmp/b"; then
         _cl_rc=0
         diff "$_cl_tmp/a" "$_cl_tmp/b" > "$_cl_tmp/d" 2>/dev/null || _cl_rc=$?
         if [ "$_cl_rc" -le 1 ]; then

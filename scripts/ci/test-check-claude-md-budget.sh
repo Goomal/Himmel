@@ -116,32 +116,71 @@ else
     fail "repo CLAUDE.md -> expected 0 got $rc"
 fi
 
-# Case H (venv-gated): the REAL installer over the committed file is a no-op —
-# the section is verbatim stock, so a reinstall/upgrade rewrites nothing and
-# the gate stays green with our counted bytes unchanged.
+# Case H (venv-gated): the REAL installer over the committed file is a no-op
+# modulo ONE carve-out (HIMMEL-5303): the installer text recommends
+# `graphify path`, which CLAUDE.md bans, so himmel strips that single clause.
+# The strip is defined once, in scripts/lint/check-graphify-path-advice.sh
+# --strip; the installer's output is passed through it before the compare, so
+# the section is "upstream-verbatim except the banned clause" and any OTHER
+# drift still fails (Case H2 proves it).
 echo "== Case H: real claude_install is idempotent over the repo file =="
+STRIP="$REPO_ROOT/scripts/lint/check-graphify-path-advice.sh"
 py=""
 tool_dir="$(uv tool dir 2>/dev/null | tr -d '\r')"
 for cand in "$tool_dir/graphifyy/Scripts/python.exe" "$tool_dir/graphifyy/bin/python"; do
   [ -n "$tool_dir" ] && [ -x "$cand" ] && { py="$cand"; break; }
 done
-if [ -n "$py" ] && "$py" -c 'import graphify.install' 2>/dev/null; then
-    mkdir -p "$tmp/proj"
-    cp "$REPO_ROOT/CLAUDE.md" "$tmp/proj/CLAUDE.md"
-    "$py" - "$tmp/proj" <<'PY' >/dev/null
+# install_strip <src> <dir>: run the real installer over a copy of <src> in
+# <dir>/CLAUDE.md, then strip the carve-out clause into <dir>/stripped.md.
+install_strip() {
+    mkdir -p "$2"
+    cp "$1" "$2/CLAUDE.md"
+    # a crashed installer must not read as "unchanged"
+    if ! "$py" - "$2" <<'PY' >/dev/null
 import sys, pathlib
 from graphify import install
 install.claude_install(project_dir=pathlib.Path(sys.argv[1]))
 PY
-    if cmp -s "$REPO_ROOT/CLAUDE.md" "$tmp/proj/CLAUDE.md"; then
-        pass "claude_install over the committed file -> byte-identical (no change)"
+    then
+        return 1
+    fi
+    bash "$STRIP" --strip "$2/CLAUDE.md" > "$2/stripped.md"
+}
+if [ -n "$py" ] && "$py" -c 'import graphify.install' 2>/dev/null; then
+    if ! install_strip "$REPO_ROOT/CLAUDE.md" "$tmp/proj"; then
+        fail "Case H: the real installer (or the strip) failed — idempotence unproven"
+    elif cmp -s "$REPO_ROOT/CLAUDE.md" "$tmp/proj/stripped.md"; then
+        pass "claude_install over the committed file -> byte-identical after the banned-clause strip"
     else
-        fail "claude_install CHANGED the committed file ($(wc -c < "$tmp/proj/CLAUDE.md" | tr -d ' ') B) — the section is not verbatim stock for this graphify version"
+        fail "claude_install CHANGED the committed file ($(wc -c < "$tmp/proj/stripped.md" | tr -d ' ') B) — the section is not verbatim stock (modulo the banned clause) for this graphify version"
     fi
     n=$(grep -c '^## graphify$' "$tmp/proj/CLAUDE.md")
     if [ "$n" -eq 1 ]; then pass "still exactly one section"; else fail "$n sections after install"; fi
     bash "$GUARD" "$tmp/proj/CLAUDE.md" >/dev/null 2>&1; rc=$?
     if [ "$rc" -eq 0 ]; then pass "gate green after install"; else fail "gate -> expected 0 got $rc"; fi
+
+    # Case H2: the carve-out must not hide any OTHER drift. Mutate one word of
+    # the committed graphify section; the installer restores stock text, so the
+    # stripped output must now differ from the mutated file.
+    echo "== Case H2: other drift in the section still fails the compare =="
+    sed 's/AST-only/AST-ONLY-DRIFT/' "$REPO_ROOT/CLAUDE.md" > "$tmp/drifted.md"
+    if cmp -s "$REPO_ROOT/CLAUDE.md" "$tmp/drifted.md"; then
+        fail "H2 fixture did not mutate the section (marker text moved?)"
+    else
+        # cmp: 0 equal, 1 differ, 2 trouble — only 1 proves the drift was seen,
+        # and only when the installer + strip themselves succeeded.
+        cmp_rc=2
+        if install_strip "$tmp/drifted.md" "$tmp/proj2"; then
+            cmp -s "$tmp/drifted.md" "$tmp/proj2/stripped.md"; cmp_rc=$?
+        fi
+        if [ "$cmp_rc" -eq 0 ]; then
+            fail "H2: drifted section compared equal — the carve-out hides real drift"
+        elif [ "$cmp_rc" -eq 1 ]; then
+            pass "H2: drifted section is detected (carve-out is only the one clause)"
+        else
+            fail "H2: cmp could not compare (rc=$cmp_rc) — drift detection unproven"
+        fi
+    fi
 else
     echo "  SKIP  no uv-managed graphifyy venv — real-installer idempotence not exercised here"
 fi

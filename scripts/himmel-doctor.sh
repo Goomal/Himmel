@@ -3830,12 +3830,23 @@ check_c51_firecrawl_parked() {
 }
 
 # --- C52: graphify [ollama] extra (HIMMEL-4513 / HIMMEL-4512 item 7) -----------
-# graph-cadence's semantic step runs `graphify --backend ollama`, which needs the
-# extra's openai client inside the uv graphifyy venv. Never runs graphify itself
+# graph-cadence's semantic step runs `graphify --backend ollama` only when
+# GRAPH_CADENCE_SEMANTIC_BACKEND=ollama (HIMMEL-5367; default claude-cli), which
+# needs the extra's openai client inside the uv graphifyy venv. Any other
+# backend skips the check. Never runs graphify itself
 # (a graphify invocation auto-refreshes the user's skill dirs) -- only the venv
 # python. Seams: HIMMEL_DOCTOR_GRAPHIFY_VENV (venv dir), HIMMEL_DOCTOR_UV.
 check_c52_graphify_ollama() {
     local uv_bin="${HIMMEL_DOCTOR_UV:-uv}" venv tooldir="" py="" c
+    case "${GRAPH_CADENCE_SEMANTIC_BACKEND:-claude-cli}" in
+        ollama) ;;
+        claude-cli)
+            emit OK C52-graphify-ollama "graph-cadence semantic backend is claude-cli -- [ollama] extra check skipped"
+            return 0 ;;
+        *)
+            emit WARN C52-graphify-ollama "GRAPH_CADENCE_SEMANTIC_BACKEND='${GRAPH_CADENCE_SEMANTIC_BACKEND}' is not accepted -- graph-cadence will refuse it" "set GRAPH_CADENCE_SEMANTIC_BACKEND to claude-cli or ollama"
+            return 0 ;;
+    esac
     if [ -n "${HIMMEL_DOCTOR_GRAPHIFY_VENV:-}" ]; then
         venv="$HIMMEL_DOCTOR_GRAPHIFY_VENV"
     else

@@ -502,7 +502,7 @@ if [ "$rc" -eq 1 ] && grepq "$out" -E '^SWEEP-ERROR feat/himmel-9250-nohead .*no
 rm -rf "$t"
 
 echo "== --health: stale remote ref of a merged, deleted branch -> head fetched by sha, no alarm (#2453) =="
-t="$(mktemp -d)" || exit 1; make_repo "$t/repo"
+t="$(mktemp -d "${TMPDIR:-/tmp}/unlanded-9260.XXXXXX")" || exit 1; make_repo "$t/repo"
 git init -q --bare "$t/origin.git"
 git -C "$t/origin.git" config uploadpack.allowReachableSHA1InWant true
 git -C "$t/repo" remote add origin "$t/origin.git"

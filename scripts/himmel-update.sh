@@ -123,10 +123,35 @@ report_plugin_gap() {
             # from the marketplace source is an update the re-sync has not landed.
             if [ -n "${VER_FILE:-}" ]; then
                 iv=$(jq -r --arg k "$name@$mp_name" '.plugins[$k][0].version // empty' "$installed_json" 2>/dev/null | tr -d '\r' || true)
-                sv=$(jq -r '.version // empty' "$ROOT/marketplace/plugins/$name/.claude-plugin/plugin.json" 2>/dev/null | tr -d '\r' || true)
-                # An unreadable iv or sv means the comparison was never made —
+                # Source version read order (HIMMEL-5485): the local plugin.json,
+                # then the marketplace entry's .version (an external plugin has no
+                # local dir). With neither, nothing declares a source, so there is
+                # no drift to count: the installed version (or its commit sha) is
+                # reported as current.
+                lp="$ROOT/marketplace/plugins/$name/.claude-plugin/plugin.json"
+                sv=$(jq -r '.version // empty' "$lp" 2>/dev/null | tr -d '\r' || true)
+                # A local manifest that exists but does not parse is an unread
+                # source, not an undeclared one: it stays unknown below.
+                bad_src=0
+                if [ -f "$lp" ] && ! jq -e . "$lp" >/dev/null 2>&1; then
+                    bad_src=1
+                fi
+                if [ -z "$sv" ] && [ "$bad_src" = 0 ]; then
+                    sv=$(jq -r --arg n "$name" '[.plugins[] | select(.name == $n) | .version // empty][0] // empty' "$market_json" 2>/dev/null | tr -d '\r' || true)
+                fi
+                if [ "$bad_src" = 1 ]; then
+                    unknown_ver="$unknown_ver $name"
+                elif [ -z "$sv" ]; then
+                    if [ -z "$iv" ]; then
+                        iv=$(jq -r --arg k "$name@$mp_name" '.plugins[$k][0].gitCommitSha // empty' "$installed_json" 2>/dev/null | tr -d '\r' | cut -c1-7 || true)
+                    fi
+                    # No declared source: a readable installed version/sha is current.
+                    if [ -z "$iv" ]; then
+                        unknown_ver="$unknown_ver $name"
+                    fi
+                # An unreadable iv means the comparison was never made —
                 # report unknown for this plugin, not "current" (HIMMEL-3416).
-                if [ -z "$iv" ] || [ -z "$sv" ]; then
+                elif [ -z "$iv" ]; then
                     unknown_ver="$unknown_ver $name"
                 elif [ "$iv" != "$sv" ]; then
                     drifted="$drifted $name($iv->$sv)"

@@ -1936,6 +1936,25 @@ print or grep the contents of a secret file (`.env`, `.env.*`,
 `.envrc`, `id_rsa`, `id_ed25519`, `*.pem`, `*.key`, `*.p12`, `*.pfx`,
 `credentials.json`, `secrets.y[a]ml`). Bypass: `READ_SECRETS_OK=1`.
 
+**Environment dumps and transcript reads (HIMMEL-5412).** Two GitHub tokens
+reached 33 and 29 transcripts through shapes this guard did not know. It now
+also denies a python/node/bun/deno command that prints the whole environment
+(`print(os.environ)`, `dict(os.environ)`, `os.environb`,
+`console.log(process.env)`, `Bun.env`, `Deno.env.toObject()`) or reads
+`/proc/<pid>/environ`, and a `Read` or `Grep` of a session transcript
+(`~/.claude/projects/**/*.jsonl`, subagent transcripts included; a `Grep`
+rooted at `~/.claude/projects` or a project directory below it too, except the
+`memory/` subtree): a transcript holds every earlier tool result verbatim. A
+single named key stays allowed (`os.environ.get("PATH")`, `os.environ["HOME"]`,
+`process.env.HOME`, `Bun.env.HOME`, `Deno.env.get("HOME")`), as do
+`printenv HOME` and `echo $PATH`. Not yet matched (HIMMEL-5418): a Bash reader
+of a transcript (`cat`, `grep -r`, `jq`), a `Grep` rooted above
+`~/.claude/projects`, an interpreter shell-out to `env`, `process['env']` and a
+destructured `{env} = process`. The filtered shell dumps
+(`env | grep`, `printenv | grep`, `export -p | grep`, `set | grep`) and shell
+`/proc/*/environ` reads were denied before (HIMMEL-5277/5292) and keep
+regression rows. The detection half is `detect-token-in-output.sh` below.
+
 **Intentionally NOT blocked:**
 - Interactive editors (`vim`, `nano`, `vi`, `nvim`, `emacs`, `view`) —
   they never surface file content to Claude as a tool result.
@@ -4549,6 +4568,28 @@ worktree; check whether a dispatched worker was handed an absolute primary
 path; HIMMEL-2526).
 
 Spec: `scripts/hooks/test-detect-dirty-primary.sh`.
+
+### `detect-token-in-output.sh` — GitHub token in a tool call or result (HIMMEL-5412)
+
+PostToolUse and PostToolUseFailure on every tool (`*` here; PostToolUse `.*`
+in `.codex/hooks.json`, which has no failure event), so a failed call's
+error text is scanned too. The
+DETECTION half of the HIMMEL-5412 pair; `block-read-secrets.sh` is the
+PREVENTION half. It scans the whole hook input as text for the gitleaks GitHub
+shapes (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_` + 36 alphanumerics, `github_pat_` +
+82), so a token in `tool_input` (a Write body) counts as much as one in the
+result. On a hit it emits `systemMessage` plus `additionalContext` and sends
+one Telegram DM through `merge-block-alert.sh`'s sender, naming the tool, the
+token kind and the variable it was assigned to when the text shows one, never
+the value. One DM per (session, token); the sentinel under
+`~/.himmel/state/token-in-output` is a sha256 prefix, never the token, and a
+failed send removes it so a later call retries; a sent DM writes `sent` into
+it, and an empty one older than 2 minutes (a hook killed mid-send) is
+reclaimed. Fail-open, always exits 0; the
+clean path is a bash regex on stdin and forks nothing.
+
+Spec: `scripts/hooks/test-detect-token-in-output.sh` (fixture tokens are built
+at run time, so the file holds no token-shaped literal).
 
 ## Detached end-of-session work — the bounded Stop queue (HIMMEL-2004)
 

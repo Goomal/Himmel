@@ -220,6 +220,54 @@ with evidence for $0.078. Budget opus judge calls at $0.25 or more.
 Not converted: headed judge SESSIONS (`headed-arm-leg.sh --judge`) keep their own worktree and lifecycle.
 Routine routing of judge calls onto the lane waits on a measured quality and cost per ruling.
 
+## Bulk-call bridge (HIMMEL-4988)
+
+`scripts/api-lane/bulk-call.sh` runs ONE mechanical bulk class on the lane instead of a native Haiku
+child: **class-sweep site enumeration** (the child gets a defect-class description plus absolute file
+paths and returns every site as JSON). It is a trusted-dispatch caller of `claude-api.sh`; it adds no
+launch path.
+
+```bash
+bash scripts/api-lane/bulk-call.sh --task-id <id> --class-file <f> --paths-file <f> \
+  --model haiku|claude-haiku-* --max-budget-usd <=0.05 [--effort low] [--timeout 300]
+bash scripts/api-lane/bulk-call.sh --cancel <id>
+```
+
+stdout is the artifact path; exit 0 only on `OK`.
+
+| Rule | Where |
+|---|---|
+| Trusted dispatch only: refuses (exit 4) under `HIMMEL_CONSOLE_LEG` or `HIMMEL_CONSOLE_RELAY`, so a leg or relay cannot launch it on its own authority | `bulk-call.sh` |
+| Read-only minimal grant: `HIMMEL_API_TOOLS=Read,Glob,Grep`, `--permission-mode dontAsk`, `HIMMEL_API_KIND=bulk`; no Bash, no Task, so no nested spawning; `--strict-mcp-config` stays unconditional in `claude-api.sh` | `bulk-call.sh` |
+| Haiku only, budget above 0 and at most $0.05; at most 40 absolute regular non-symlink paths (no `.` or `..`); class file at most 8 KiB; a refusal happens before any call | `bulk-call.sh` |
+| Isolated ownership: the `/tmp/claude-<uid>` root must be a real directory (not a symlink) owned by the caller or the call is refused; work dir `/tmp/claude-<uid>/bulk-<id>` (mode 700) with a pid file and an empty `cwd`; the run holds an exclusive `flock` on `bulk-<id>.lock` for its whole life, so a duplicate id is refused atomically (Linux; `flock` is not on stock macOS) | `bulk-call.sh` |
+| Cancellation: `--cancel <id>` is trusted-dispatch only (a console leg or relay gets exit 4) and signals only the process that holds the lock (fd 9 resolves to the lock file); a stale pid file with a free lock is "no running task", a pid that is not the holder is refused, and a failed signal exits 3; TERM/INT sends TERM to the whole child tree and KILL after 2 s, status `CANCELLED`; the deadline runs through `qmd_bounded` | `bulk-call.sh` |
+| Structured result: `{"sites":[{"file","line","why"}]}`, optional json fence accepted; a site file outside the asked set, a non-positive line, or over 200 sites is `INVALID`; any `permission_denials` is `DENIED`; an error result is `ERROR` | `bulk-result.mjs` |
+| Bounded parent artifact (mode 600): status, reason, sites, model, budget, cost. Statuses `OK` `DENIED` `ERROR` `INVALID` `REFUSED` `TIMEOUT` `CANCELLED` | `bulk-result.mjs` |
+| The bridge never touches the ledger; `claude-api.sh` settles it. No bank fallback | `claude-api.sh` |
+
+Residual: `Read` is not repo-confined (HIMMEL-5664); the asked-set check bounds what a result may
+report, not what the child may read.
+
+### Native vs API comparison
+
+Task: 4 files (383 lines), class "`rm -rf`/`rm -fr` with a shell variable first argument"; ground truth
+from `git grep` is 23 sites, with a comment mentioning `rm -rf` (`host-caps.sh:45`) as the trap.
+
+| | Native Haiku child (Explore) | API process (`bulk-call.sh`) |
+|---|---|---|
+| Correctness | 23 of 23, 0 false positives, 0 misses | 23 of 23, 0 extra, in all 3 runs |
+| Calls | 5 tool uses | 3 runs, one `claude-api.sh` call each |
+| Context floor | 23,513 subagent tokens (Explore carries a broader tool set than `Read,Glob,Grep`) | about 27.1k tokens per run summed over cache_creation, cache_read and input (3 runs: 38,661 / 42,587 / 12) |
+| Cache band / TTL | subscription prompt cache, not controllable | 5m default, `cache-report.mjs` picks the TTL by gap: gaps 34 s and 36 s, hit rate 0.524, recommended 5m |
+| Dollars | $0 marginal (subscription budget) | $0.004421, $0.002791, $0.004102 (total $0.011314 on the API credit) |
+
+The API half was measured by an operator run on the pilot key (3 paid calls, each at most $0.05, all
+`claude-haiku-5-5`, reconciled by the ledger). Result: equivalent on correctness, and each run moves about
+23.5k tokens of work off the subscription budget onto the API credit at under half a cent. "Cheaper"
+therefore means subscription budget freed, not dollars saved: the native child costs $0 marginal. The STOP
+rule is not triggered. One class and one file set were measured, so this is evidence for this class only.
+
 ## Proposed CLAUDE.md line (for the operator or supervisor session to apply)
 
 > API credit lane: `scripts/api-lane/claude-api.sh` is the only API-key launch

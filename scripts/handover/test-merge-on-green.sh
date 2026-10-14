@@ -1984,7 +1984,7 @@ SHEOF
         start_suite_holder() {
             local hcwd="$1" hscript="$2"; shift 2
             HOLDER_READY="$SUITE_HOLDER_DIR/ready.$$.$RANDOM"
-            rm -f "$HOLDER_READY"
+            rm -f "$HOLDER_READY" "$HOLDER_READY.idle"
             mkfifo "$HOLDER_READY.idle" || return 1
             bash -c 'cd "$1" || exit 1; s="$2"; shift 2; exec bash "$s" "$@"' \
                 _ "$hcwd" "$hscript" "$HOLDER_READY" "$@" &
@@ -2000,7 +2000,33 @@ SHEOF
             rm -f "$HOLDER_READY"
             kill "$HOLDER_PID" 2>/dev/null
             wait "$HOLDER_PID" 2>/dev/null
+            rm -f "$HOLDER_READY.idle"
         }
+
+        # 11k0 (HIMMEL-5599). A .idle FIFO left behind at the path a later
+        # holder draws (same $$, same $RANDOM) must not fail its mkfifo, and a
+        # stopped holder must leave no .idle behind. RANDOM is reseeded so the
+        # collision is deterministic; the stale path is the one CI hit
+        # ("mkfifo: cannot make fifo '.../ready.<pid>.<n>.idle': File exists").
+        RANDOM=5599
+        stale_ready="$SUITE_HOLDER_DIR/ready.$$.$RANDOM"
+        if ! mkfifo "$stale_ready.idle"; then
+            fail "11k0: could not create the stale fixture $stale_ready.idle"
+        else
+            RANDOM=5599
+            if start_suite_holder "$SUITE_HOLDER_DIR" "$SUITE_HOLDER_DIR/sleeper.sh"; then
+                pass
+            else
+                fail "11k0: start_suite_holder failed on a stale $stale_ready.idle left by an earlier holder"
+            fi
+            stop_suite_holder
+            if [ -e "$stale_ready.idle" ]; then
+                fail "11k0: stop_suite_holder left $stale_ready.idle behind"
+                rm -f "$stale_ready.idle"
+            else
+                pass
+            fi
+        fi
 
         # run_mog_as_descendant <ancestor_cwd> <mog_cwd> <mog_script> [argv...]
         # HIMMEL-2602 (11k14, RC-1) — runs <mog_script> exactly the way
@@ -3414,6 +3440,19 @@ STUB_JIRA_BUILD=1 STUB_JIRA_ISSUE_TYPE=Epic STUB_PR_TITLE="feat(jira): [HIMMEL-3
 assert_audit_has "jira: Epic case records the never-touch skip" "jira-transition=skip=never-touch-type key=HIMMEL-374 type=Epic"
 assert_jira_log_lacks "jira: Epic case makes no jira comment call" "comment"
 assert_jira_log_lacks "jira: Epic case makes no jira transition call" "transition"
+
+# A Story is NOT skipped (HIMMEL-5540): a merged PR that completes a Story must
+# close it, so it transitions like a Task when --jira-transition is passed.
+STUB_JIRA_BUILD=1 STUB_JIRA_ISSUE_TYPE=Story STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" \
+    run_mog 0 "jira: Story ticket is transitioned on --jira-transition" -- --jira-transition
+assert_audit_has "jira: Story case records success" "jira-transition=ok key=HIMMEL-374 status=Done"
+assert_jira_log_has "jira: Story case comments" "comment HIMMEL-374"
+assert_jira_log_has "jira: Story case transitions" "transition HIMMEL-374 Done"
+
+STUB_JIRA_BUILD=1 STUB_JIRA_ISSUE_TYPE=Story STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" \
+    run_mog 0 "jira: Story without --jira-transition only reports would-transition"
+assert_audit_has "jira: Story bare merge records would-transition" "jira-transition=would-transition key=HIMMEL-374 status=Done"
+assert_jira_log_lacks "jira: Story bare merge makes no transition call" "transition"
 
 # A comment that fails to post leaves no evidence breadcrumb — skip the
 # transition rather than close the ticket silently. Requires opt-in to reach

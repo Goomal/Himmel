@@ -206,6 +206,9 @@ export CODEX_BANK_CACHE="$FAKEROOT/no-such-codex-bank.json"
 export DOCTOR_HERMES_CHECKOUT="$FAKEROOT/no-such-hermes-checkout"
 export DOCTOR_CODEX_BIN="$FAKEROOT/no-such-codex"
 unset DOCTOR_CODEX_LATEST
+# Same for C64-vm-runner (HIMMEL-5037): never run the real vm-runner.sh doctor
+# (it would probe the operator's VirtualBox and GitHub); absent seam = INFO skip.
+export DOCTOR_VM_RUNNER="$FAKEROOT/no-such-vm-runner.sh"
 # C63 (HIMMEL-5501): never run the operator's real claude; absent seam = INFO.
 export DOCTOR_CLAUDE_BIN="$FAKEROOT/no-such-claude"
 
@@ -923,7 +926,7 @@ out="$(RESOLVE_NODE_PROBE_DIRS="$FAKENODE" PIPELINE_BAT_DIR="$t/pipeline-empty" 
     SWEEP_BAT_DIR="$t/sweep" GRAPHMAP_BAT_DIR="$t/graphmap-empty" \
     DOCTOR_MCP_PLUGINS_GLOB="$t/none/*.mcp.json" CLAUDE_DIR="$t/claude" HOME="$t/home" \
     CADENCE_RUNNER_PLATFORM_OS=windows \
-    bash "$DOC" --no-color 2>&1)"
+    bash "$DOC" --root "$REPO_ROOT" --no-color 2>&1)"
 if grepq "$out" 'WARN C8-cadence: codex-sweep-cadence runners are stale' \
     && grepq "$out" 'bash scripts/cleanup/codex-sweep-cadence.sh arm --force'; then
     pass "C8 -> WARN (stale codex-sweep runner)"
@@ -938,7 +941,7 @@ printf '#!/bin/sh\n# himmel-cadence-runner-format: %s\necho old graphmap\n' "$ST
 out="$(RESOLVE_NODE_PROBE_DIRS="$FAKENODE" PIPELINE_BAT_DIR="$t/pipeline-empty" \
     SWEEP_BAT_DIR="$t/sweep-empty" GRAPHMAP_BAT_DIR="$t/graphmap" \
     DOCTOR_MCP_PLUGINS_GLOB="$t/none/*.mcp.json" CLAUDE_DIR="$t/claude" HOME="$t/home" \
-    bash "$DOC" --no-color 2>&1)"
+    bash "$DOC" --root "$REPO_ROOT" --no-color 2>&1)"
 if grepq "$out" 'WARN C8-cadence: graphmap-cadence runners are stale' \
     && grepq "$out" 'bash scripts/luna/graphmap-cadence.sh arm --force'; then
     pass "C8 -> WARN (stale graphmap runner)"
@@ -954,10 +957,26 @@ out="$(RESOLVE_NODE_PROBE_DIRS="$FAKENODE" PIPELINE_BAT_DIR="$t/pipeline-empty" 
     SWEEP_BAT_DIR="$t/sweep-empty" GRAPHMAP_BAT_DIR="$t/graphmap-empty" \
     QMD_CADENCE_BAT_DIR="$t/qmd" \
     DOCTOR_MCP_PLUGINS_GLOB="$t/none/*.mcp.json" CLAUDE_DIR="$t/claude" HOME="$t/home" \
-    bash "$DOC" --no-color 2>&1)"
+    bash "$DOC" --root "$REPO_ROOT" --no-color 2>&1)"
 if grepq "$out" 'WARN C8-cadence: qmd-cadence runners are stale' \
     && grepq "$out" 'bash scripts/luna/qmd-cadence.sh arm --force'; then
     pass "C8 -> WARN (stale qmd runner)"
+else
+    fail "C8 -> $(printf '%s' "$out" | grep C8)"
+fi
+rm -rf "$t"
+
+echo "== C8: stale upstream-watch runner -> WARN + upstream-watch re-arm hint =="
+t="$(mktemp -d)" || exit 1; mkdir -p "$t/claude" "$t/uw"; write_settings "$t/claude" "$WRAPPER"
+printf '#!/bin/sh\n# himmel-cadence-runner-format: %s\necho old upstream-watch\n' "$STALE_CADENCE_VER" > "$t/uw/upstream-watch.sh"
+out="$(RESOLVE_NODE_PROBE_DIRS="$FAKENODE" PIPELINE_BAT_DIR="$t/pipeline-empty" \
+    SWEEP_BAT_DIR="$t/sweep-empty" GRAPHMAP_BAT_DIR="$t/graphmap-empty" \
+    QMD_CADENCE_BAT_DIR="$t/qmd-empty" UPSTREAMWATCH_BAT_DIR="$t/uw" \
+    DOCTOR_MCP_PLUGINS_GLOB="$t/none/*.mcp.json" CLAUDE_DIR="$t/claude" HOME="$t/home" \
+    bash "$DOC" --root "$REPO_ROOT" --no-color 2>&1)"
+if grepq "$out" 'WARN C8-cadence: upstream-watch-cadence runners are stale' \
+    && grepq "$out" 'bash scripts/upstreams/upstream-watch-cadence.sh arm --force'; then
+    pass "C8 -> WARN (stale upstream-watch runner)"
 else
     fail "C8 -> $(printf '%s' "$out" | grep C8)"
 fi
@@ -6446,6 +6465,25 @@ echo "== C63-claude-cli: absent -> INFO, not a WARN =="
 out="$(c62_run "$c60_t/none")"
 if grepq "$out" -F 'INFO C63-claude-cli' && ! grepq "$out" -F 'WARN C63-claude-cli'; then pass "C63 absent -> INFO"; else fail "C63 absent -> $(printf '%s' "$out" | grep -A1 C63)"; fi
 rm -rf "$c60_t"
+
+# --- C64-vm-runner (HIMMEL-5037): rows come from vm-runner.sh doctor ---
+c64_t="$(mktemp -d)" || exit 1
+printf '%s\n' '#!/usr/bin/env bash' 'printf "OK\tC64-vm-runner\tsnapshot ci-runner-v1 present\n"' 'printf "FAIL\tC64-vm-runner\trunner DEAD: variable on, no unit up\n"' > "$c64_t/runner-fail.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "OK\tC64-vm-runner\tfork-approval policy all_external_contributors\n"' > "$c64_t/runner-ok.sh"
+c64_run() { DOCTOR_VM_RUNNER="$1" CLAUDE_DIR="$c64_t/claude" HOME="$c64_t/home" bash "$DOC" --no-color 2>&1; }
+
+echo "== C64-vm-runner: a FAIL row from vm-runner.sh doctor surfaces as FAIL =="
+out="$(c64_run "$c64_t/runner-fail.sh")"
+if grepq "$out" -F 'FAIL C64-vm-runner: runner DEAD' && grepq "$out" -F 'OK   C64-vm-runner: snapshot ci-runner-v1 present'; then pass "C64 FAIL row -> FAIL"; else fail "C64 FAIL row -> $(printf '%s' "$out" | grep C64)"; fi
+
+echo "== C64-vm-runner: healthy rows -> OK, no FAIL =="
+out="$(c64_run "$c64_t/runner-ok.sh")"
+if grepq "$out" -F 'OK   C64-vm-runner: fork-approval' && ! grepq "$out" -F 'FAIL C64-vm-runner'; then pass "C64 ok -> OK"; else fail "C64 ok -> $(printf '%s' "$out" | grep C64)"; fi
+
+echo "== C64-vm-runner: runner script absent -> INFO =="
+out="$(c64_run "$c64_t/none.sh")"
+if grepq "$out" -F 'INFO C64-vm-runner' && ! grepq "$out" -F 'FAIL C64-vm-runner'; then pass "C64 absent -> INFO"; else fail "C64 absent -> $(printf '%s' "$out" | grep C64)"; fi
+rm -rf "$c64_t"
 
 # --- C62-oxlint-runner (HIMMEL-5529): can the oxlint commit gates run? ---
 c62_t="$(mktemp -d "${TMPDIR:-/tmp}/himmel-doctor-c62.XXXXXX")" || { echo "mktemp failed" >&2; exit 1; }

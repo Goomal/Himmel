@@ -1534,14 +1534,11 @@ report_session_restart_required() {
     local after changed
     after=$(git rev-parse HEAD 2>/dev/null) || return 0
     [ "$PULL_HEAD_BEFORE" != "$after" ] || return 0
-    local channel default_name anchor
-    channel=$(_resolve_update_channel 2>/dev/null) || channel=''
-    if [ -z "$channel" ]; then
-        default_name=$(default_branch "$ROOT" 2>/dev/null) || default_name=''
-        anchor=''
-        [ -z "$default_name" ] || anchor=$(git rev-parse --verify --quiet "refs/remotes/origin/$default_name" 2>/dev/null) || anchor=''
-        [ -z "$anchor" ] || [ "$after" != "$anchor" ] || return 0
-    fi
+    local default_name anchor
+    default_name=$(default_branch "$ROOT" 2>/dev/null) || default_name=''
+    anchor=''
+    [ -z "$default_name" ] || anchor=$(git rev-parse --verify --quiet "refs/remotes/origin/$default_name" 2>/dev/null) || anchor=''
+    [ -z "$anchor" ] || [ "$after" != "$anchor" ] || return 0
     # shellcheck disable=SC2086  # fixed literal path list, split intentionally
     changed=$(git diff --name-only "$PULL_HEAD_BEFORE" "$after" -- $HOOK_PIN_PATHS 2>/dev/null) || return 0
     # Same file filter as the recorder: *.sh, plus himmel-bus/lib/*.mjs one level deep.

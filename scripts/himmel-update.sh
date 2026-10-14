@@ -1521,7 +1521,9 @@ report_qmd_daemon_restart() {
 
 # Advisory (#2591): hook-integrity pins these paths at SessionStart and refuses
 # a re-pin unless HEAD is the anchor tip, so a pull that changes any of them
-# leaves the Claude session that ran this update unable to run Bash or Edit.
+# AND leaves HEAD off the default branch's remote tip (a channel or detached-tag
+# checkout) leaves the Claude session that ran this update unable to run Bash
+# or Edit. A default-branch fast-forward lands on the tip and re-pins cleanly.
 # Keep in step with record-hook-integrity.sh's pinned directory list. Printed
 # LAST, so it is the line the calling agent reads. PULL_HEAD_BEFORE is set just
 # before update_pull runs; unset means no pull was attempted.
@@ -1532,6 +1534,14 @@ report_session_restart_required() {
     local after changed
     after=$(git rev-parse HEAD 2>/dev/null) || return 0
     [ "$PULL_HEAD_BEFORE" != "$after" ] || return 0
+    local channel default_name anchor
+    channel=$(_resolve_update_channel 2>/dev/null) || channel=''
+    if [ -z "$channel" ]; then
+        default_name=$(default_branch "$ROOT" 2>/dev/null) || default_name=''
+        anchor=''
+        [ -z "$default_name" ] || anchor=$(git rev-parse --verify --quiet "refs/remotes/origin/$default_name" 2>/dev/null) || anchor=''
+        [ -z "$anchor" ] || [ "$after" != "$anchor" ] || return 0
+    fi
     # shellcheck disable=SC2086  # fixed literal path list, split intentionally
     changed=$(git diff --name-only "$PULL_HEAD_BEFORE" "$after" -- $HOOK_PIN_PATHS 2>/dev/null) || return 0
     # Same file filter as the recorder: *.sh, plus himmel-bus/lib/*.mjs one level deep.

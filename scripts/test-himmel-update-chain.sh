@@ -332,7 +332,8 @@ assert_eq "state dirs: pre-existing himmel keeps its own mode" "750" "$(mode_of 
 
 # ─── Test 7: in-session restart warning (#2591) ──────────────────────────────
 # A pull that changes a hook-pinned path leaves the calling Claude session
-# unable to run Bash/Edit (hook-integrity re-pin refused), so an apply run with
+# unable to run Bash/Edit (hook-integrity re-pin refused) when HEAD is off the
+# anchor tip (channel/detached tag), so an apply run with
 # CLAUDECODE set must close on a restart warning. A pull touching only
 # unpinned paths, or a run outside Claude, must not print it.
 echo "Test 7: pull changing a hook-pinned path inside Claude -> closing restart warning (#2591)"
@@ -358,11 +359,9 @@ update_7() {   # <CLAUDECODE value>
 }
 push_change_7 scripts/hooks/new-guard.sh
 rc=0; out=$(update_7 1) || rc=$?
-assert_eq "restart warning: rc 0" "0" "$rc"
-assert_contains "restart warning: pull updated" "pull  *updated" "$out"
-assert_contains "restart warning: printed" "RESTART CLAUDE NOW" "$out"
-assert_contains "restart warning: names the changed pinned file" "(e.g. scripts/hooks/new-guard.sh)" "$out"
-assert_eq "restart warning: is the closing line" "    (re-pin refused: not the anchor tip). Exit claude and start a new session." "$(printf '%s\n' "$out" | tail -n 1)"
+assert_eq "no restart warning: default-branch ff pull of a pinned .sh: rc 0" "0" "$rc"
+assert_contains "no restart warning: default-branch ff pull of a pinned .sh updated" "pull  *updated" "$out"
+assert_not_contains "no restart warning: default-branch ff pull lands on the anchor tip" "RESTART CLAUDE NOW" "$out"
 push_change_7 docs/unpinned.md
 rc=0; out=$(update_7 1) || rc=$?
 assert_contains "no restart warning: unpinned-only pull still updated" "pull  *updated" "$out"
@@ -377,6 +376,19 @@ push_change_7 scripts/lib/new-lib.sh
 rc=0; out=$(update_7 '') || rc=$?
 assert_contains "no restart warning: outside Claude still updated" "pull  *updated" "$out"
 assert_not_contains "no restart warning: outside Claude (CLAUDECODE unset)" "RESTART CLAUDE NOW" "$out"
+
+# A channel (tag-following) update detaches HEAD off the anchor tip: a pinned
+# change reached that way must warn, even though the tag is newer than HEAD.
+push_change_7 scripts/hooks/channel-guard.sh
+git -C "$pusher7" tag v9.9.9
+git -C "$pusher7" push --quiet origin v9.9.9
+push_change_7 docs/after-tag.md
+rc=0; out=$(HIMMEL_UPDATE_CHANNEL=stable update_7 1) || rc=$?
+assert_eq "restart warning: channel pull of a pinned .sh: rc 0" "0" "$rc"
+assert_contains "restart warning: channel pull updated" "pull  *updated" "$out"
+assert_contains "restart warning: channel pull printed" "RESTART CLAUDE NOW" "$out"
+assert_contains "restart warning: names the changed pinned file" "(e.g. scripts/hooks/channel-guard.sh)" "$out"
+assert_eq "restart warning: is the closing line" "    (re-pin refused: not the anchor tip). Exit claude and start a new session." "$(printf '%s\n' "$out" | tail -n 1)"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo

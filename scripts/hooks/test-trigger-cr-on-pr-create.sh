@@ -378,6 +378,76 @@ else
     fail "expected rc=0 and 0 posts, got rc=$rc posted=$(posted_count)" "out: $out"
 fi
 
+# Test 5q: quoted separators are not command positions (HIMMEL-1373) ---------
+# shellcheck disable=SC2016  # literal $( in the command under test
+for q in 'echo "; gh pr create docs"' "echo '; gh pr create docs'" "echo '\$(gh pr create docs)'" 'echo "x | gh pr create"' 'echo "a && gh pr create"' "gh'x' pr create" 'gh pr create"x"'; do
+    echo "TEST: quoted separator ($q) -> no post"
+    reset_state
+    run_hook "$q" "https://github.com/acme/widget/pull/7"
+    if [ "$rc" -eq 0 ] && [ "$(posted_count)" -eq 0 ]; then
+        pass "did not post for a separator inside quotes: $q"
+    else
+        fail "expected rc=0 and 0 posts, got rc=$rc posted=$(posted_count)" "cmd: $q out: $out"
+    fi
+done
+# shellcheck disable=SC2016  # literal $( in the command under test
+for q in 'echo "x"; gh pr create -t t' 'echo "$(gh pr create -t t)"' 'echo "`gh pr create -t t`"' "echo 'x' && gh pr create" 'echo "it'"'"'s"; gh pr create' 'echo \"; gh pr create' 'echo "unterminated; gh pr create' 'echo "$(printf "%s" x; gh pr create)"' 'gh pr create"" -t t' 'gh pr "create" -t t' "gh '' pr create -t t"; do
+    echo "TEST: real invocation beside quotes ($q) -> POSTS"
+    reset_state
+    run_hook "$q" "https://github.com/acme/widget/pull/7"
+    if [ "$rc" -eq 0 ] && [ "$(posted_count)" -eq 1 ]; then
+        pass "posted for a real invocation: $q"
+    else
+        fail "expected rc=0 and 1 post, got rc=$rc posted=$(posted_count)" "cmd: $q out: $out"
+    fi
+done
+# Balanced-quote misparses: apostrophes in a comment, an ANSI-C `$'\''` and a
+# heredoc body pair across the real invocation, so the scan must fail closed.
+# shellcheck disable=SC2016  # literal $' and quotes in the commands under test
+for q in "# don't skip this
+gh pr create -t t
+# that's all" "echo \$'\\'' ; gh pr create -t t ; echo \\'" "cat <<EOF
+don't
+EOF
+gh pr create -t t
+cat <<EOF
+it's
+EOF"; do
+    echo "TEST: balanced-quote misparse ($q) -> POSTS"
+    reset_state
+    run_hook "$q" "https://github.com/acme/widget/pull/7"
+    if [ "$rc" -eq 0 ] && [ "$(posted_count)" -eq 1 ]; then
+        pass "posted despite a balanced quote misparse: $q"
+    else
+        fail "expected rc=0 and 1 post, got rc=$rc posted=$(posted_count)" "cmd: $q out: $out"
+    fi
+done
+# A quoted option or a tab separator must not hide the nested-shell signal.
+# shellcheck disable=SC2016  # literal quotes in the commands under test
+for q in "bash \"-c\" 'true; gh pr create -t t'" "bash	-c 'true; gh pr create -t t'" "eval	\"true; gh pr create -t t\"" 'bash -c"cd x && gh pr create -t t"' "sh -c'true; gh pr create -t t'" 'e\val '"'true; gh pr create -t t'" 'bash -\c '"'true; gh pr create -t t'"; do
+    echo "TEST: disguised nested-shell body ($q) -> POSTS"
+    reset_state
+    run_hook "$q" "https://github.com/acme/widget/pull/7"
+    if [ "$rc" -eq 0 ] && [ "$(posted_count)" -eq 1 ]; then
+        pass "posted for a disguised nested-shell body: $q"
+    else
+        fail "expected rc=0 and 1 post, got rc=$rc posted=$(posted_count)" "cmd: $q out: $out"
+    fi
+done
+# Nested-shell bodies run their quoted text as code, so a masked span there
+# would ungate a real invocation: `bash -c`, `eval` and wrappers around them.
+# shellcheck disable=SC2016  # literal quotes in the commands under test
+for q in "bash -c 'cd x && gh pr create -t t'" 'eval "true; gh pr create -t t"' 'timeout 60 bash -c "true && gh pr create -t t"' "sh -c '(gh pr create -t t)'" "bash -euc 'true; gh pr create -t t'" 'sh -ec "cd x && gh pr create -t t"'; do
+    echo "TEST: nested-shell body ($q) -> POSTS"
+    reset_state
+    run_hook "$q" "https://github.com/acme/widget/pull/7"
+    if [ "$rc" -eq 0 ] && [ "$(posted_count)" -eq 1 ]; then
+        pass "posted for a nested-shell body: $q"
+    else
+        fail "expected rc=0 and 1 post, got rc=$rc posted=$(posted_count)" "cmd: $q out: $out"
+    fi
+done
+
 # Test 6: post-failure stays non-blocking ------------------------------------
 echo "TEST: comment post fails -> hook stays non-blocking (rc 0), records warning"
 reset_state

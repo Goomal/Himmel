@@ -633,6 +633,71 @@ else
     fail "expected exit 0 (no marker means nothing pending), got rc=$rc" "out: $out"
 fi
 
+# HIMMEL-1373: a separator inside a quoted string is not a command position ---
+write_marker "feat/X"
+# Every row carries `--head feat/X --base main` inside the quote so a missed
+# match WOULD resolve the marked branch and block: a negative that stops at
+# the head token would pass vacuously on a mangled branch name.
+# shellcheck disable=SC2016  # literal $( in the command under test
+for q in 'echo \"; gh pr create --head feat/X --base main\"' "echo '; gh pr create --head feat/X --base main'" "echo '\$(gh pr create --head feat/X --base main)'" 'echo \"x | gh pr create --head feat/X --base main\"' "gh'x' pr create --head feat/X --base main"; do
+    echo "TEST: quoted separator ($q), marker present -> allow"
+    run_hook "$q"
+    if [ "$rc" -eq 0 ]; then
+        pass "not blocked for a separator inside quotes: $q"
+    else
+        fail "expected exit 0, got rc=$rc" "cmd: $q out: $out"
+    fi
+done
+# shellcheck disable=SC2016  # literal $( in the command under test
+for q in 'echo x; gh pr create --head feat/X --base main' 'echo \"$(gh pr create --head feat/X --base main)\"' "echo 'x' && gh pr create --head feat/X --base main" 'echo \"unterminated; gh pr create --head feat/X --base main' 'echo \"$(printf \"%s\" x; gh pr create --head feat/X --base main)\"' 'gh pr create\"\" --head feat/X --base main' 'gh pr \"create\" --head feat/X --base main' "gh '' pr create --head feat/X --base main"; do
+    echo "TEST: real invocation beside quotes ($q), marker present -> BLOCK"
+    run_hook "$q"
+    if [ "$rc" -eq 2 ]; then
+        pass "blocked for a real invocation: $q"
+    else
+        fail "expected exit 2, got rc=$rc" "cmd: $q out: $out"
+    fi
+done
+# Balanced-quote misparses: apostrophes in a comment, an ANSI-C `$'\''` and a
+# heredoc body pair across the real invocation, so the scan must fail closed.
+# Payload is interpolated raw into JSON: newline is `\n`, backslash is `\\`.
+# shellcheck disable=SC2016  # literal $' and quotes in the commands under test
+for q in "# don't skip this\ngh pr create --head feat/X --base main\n# that's all" "echo \$'\\\\'' ; gh pr create --head feat/X --base main ; echo \\\\'" "cat <<EOF\ndon't\nEOF\ngh pr create --head feat/X --base main\ncat <<EOF\nit's\nEOF"; do
+    echo "TEST: balanced-quote misparse ($q), marker present -> BLOCK"
+    run_hook "$q"
+    if [ "$rc" -eq 2 ]; then
+        pass "blocked despite a balanced quote misparse: $q"
+    else
+        fail "expected exit 2, got rc=$rc" "cmd: $q out: $out"
+    fi
+done
+
+# Nested-shell bodies run their quoted text as code, so a masked span there
+# would ungate a real invocation: `bash -c`, `eval` and wrappers around them.
+# shellcheck disable=SC2016  # literal quotes in the commands under test
+for q in "bash -c 'cd x && gh pr create --head feat/X --base main'" 'eval \"true; gh pr create --head feat/X --base main\"' 'timeout 60 bash -c \"true && gh pr create --head feat/X --base main\"' "sh -c '(gh pr create --head feat/X --base main)'" "bash -euc 'true; gh pr create --head feat/X --base main'" 'sh -ec \"cd x && gh pr create --head feat/X --base main\"'; do
+    echo "TEST: nested-shell body ($q), marker present -> BLOCK"
+    run_hook "$q"
+    if [ "$rc" -eq 2 ]; then
+        pass "blocked for a nested-shell body: $q"
+    else
+        fail "expected exit 2, got rc=$rc" "cmd: $q out: $out"
+    fi
+done
+
+# A quoted option or a tab separator must not hide the nested-shell signal.
+# Payload is interpolated raw into JSON: tab is `\t`, a double quote is `\"`.
+# shellcheck disable=SC2016  # literal quotes in the commands under test
+for q in "bash \\\"-c\\\" 'true; gh pr create --head feat/X --base main'" "bash\\t-c 'true; gh pr create --head feat/X --base main'" "eval\\t\\\"true; gh pr create --head feat/X --base main\\\"" 'bash -c\"cd x && gh pr create --head feat/X --base main\"' "sh -c'true; gh pr create --head feat/X --base main'" "e\\\\val 'true; gh pr create --head feat/X --base main'" "bash -\\\\c 'true; gh pr create --head feat/X --base main'"; do
+    echo "TEST: disguised nested-shell body ($q), marker present -> BLOCK"
+    run_hook "$q"
+    if [ "$rc" -eq 2 ]; then
+        pass "blocked for a disguised nested-shell body: $q"
+    else
+        fail "expected exit 2, got rc=$rc" "cmd: $q out: $out"
+    fi
+done
+
 # Summary ------------------------------------------------------------
 echo
 echo "===================================="

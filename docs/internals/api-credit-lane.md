@@ -159,7 +159,7 @@ earlier run had a hit rate to read back.
 **Prefix rules (one run kind = one row of the same prefix):**
 
 1. The launcher fixes everything above the prompt: `--tools`, `--strict-mcp-config`
-   on a tool-free call, the model and effort are the caller's and must be the same
+   (on every call: no caller can be granted an `mcp__` tool, and hooks are off), the model and effort are the caller's and must be the same
    for every run of a kind (each model has its own cache).
 2. `--exclude-dynamic-system-prompt-sections` is always passed: the working
    directory, platform, memory paths and git status ride in the first user
@@ -185,6 +185,40 @@ gaps between runs of a kind fall between 5 and 60 minutes. The 48 recorded runs
 `cache-report.mjs` once a kind has runs with usage: it prices the observed gaps on
 both tiers and prints `recommended_ttl`. Set `HIMMEL_API_CACHE_TTL=1h` for that kind
 only when it says so; a burst finishing inside 5 minutes never earns the premium.
+
+## Judge-call bridge (HIMMEL-4987)
+
+`scripts/api-lane/judge-call.sh` sends ONE verdict-grade question to the lane instead of a
+native subagent and hands the parent a bounded artifact. It is a console-side caller of
+`claude-api.sh`; it adds no launch path of its own.
+
+```bash
+bash scripts/api-lane/judge-call.sh --qid <qid> --pr <n> --head <40-hex> --question-file <f> \
+  --model claude-opus-5-5 --max-budget-usd 0.50 [--effort high] [--timeout 600] [--judge <name>]
+```
+
+stdout is the artifact path; exit 0 only when the verdict was recorded.
+
+| Rule | Where |
+|---|---|
+| Read-only: `HIMMEL_API_TOOLS=Read,Glob,Grep`, `--permission-mode dontAsk`, `HIMMEL_API_KIND=judge`; a caller's own `HIMMEL_API_TOOLS` is overwritten | `judge-call.sh` |
+| Explicit judgment-tier model (`claude-opus-*` or `claude-sonnet-*`, never haiku or fable) and a budget above 0 and at most $2.00; a refusal happens before any call | `judge-call.sh` |
+| Fixed instruction first, head, PR and question last, run from an empty scratch cwd, so the prefix caches across judge calls; the question names every file by ABSOLUTE path, since a repo-relative name resolves nowhere in that cwd | `judge-call.sh` |
+| Verdict semantics are the in-process judge's: the first line is `**GO**` / `**NO-GO**` `for head <sha>`, evidence follows, and a valid verdict is recorded by `write-verdict.sh` (mac-signed, NO-GO needs its `class:` line) | `judge-result.mjs`, `write-verdict.sh` |
+| Status instead of a ruling: `STALE` (names another head), `MISSING` (no verdict first line, no head, or no evidence), `DENIED` (any `permission_denials`, whatever the rc), `ERROR` (error result, or evidence over 32 KiB, which is never recorded cut), `UNRECORDED` (the writer refused), `REFUSED` (the launcher refused), `TIMEOUT` | `judge-result.mjs`, `judge-call.sh` |
+| Bounded parent artifact (`<judge dir>/judge-call-<qid>.json`, mode 600): status, reason, verdict, heads, model, budget, cost, verdict path and an excerpt of the evidence cut at 8 KiB; the full evidence is in the verdict record | `judge-result.mjs` |
+| Deadline through `qmd_bounded` (process group killed); the bridge never touches the ledger, so a timed-out or errored call keeps its full reservation (`claude-api.sh` settles on a verified cost or keeps it unknown) | `judge-call.sh` |
+| No bank fallback: a refusal is final and the native subscription is never consulted | `claude-api.sh` |
+
+Run it from a console, not a leg: `write-verdict.sh` refuses a console-spawned leg (`HIMMEL_CONSOLE_LEG`), so
+a leg's call ends `UNRECORDED` with the ruling in the artifact excerpt.
+
+Measured cost of a real call (one 60-line file, `--effort low`): `claude-opus-5-5` spent $0.107 and hit a
+$0.10 cap before answering (status `ERROR`, cost kept in the artifact); `claude-sonnet-5-5` answered a GO
+with evidence for $0.078. Budget opus judge calls at $0.25 or more.
+
+Not converted: headed judge SESSIONS (`headed-arm-leg.sh --judge`) keep their own worktree and lifecycle.
+Routine routing of judge calls onto the lane waits on a measured quality and cost per ruling.
 
 ## Proposed CLAUDE.md line (for the operator or supervisor session to apply)
 

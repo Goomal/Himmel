@@ -95,6 +95,16 @@ bump merges while the host still runs the old build.
   not do. The step prints the exact operator commands instead; it never kills
   anything.
 
+**Run it as the LAST step of a Claude session (#2591).** Inside a Claude
+session, a pull that changes a hook-pinned path (`scripts/hooks`,
+`scripts/guardrails`, `scripts/lib`, `scripts/handover`,
+`marketplace/plugins/himmel-bus/lib`) leaves THIS session unable to work:
+hook-integrity pinned those files at SessionStart and refuses to re-pin a
+checkout that is not the anchor tip, so every later Bash and Edit call is
+denied. Finish and commit other work first and tell the operator a restart
+follows; the script then closes with a `RESTART CLAUDE NOW` line when it
+happened. Only a new claude session recovers.
+
 This command can run from **any directory** (HIMMEL-459), so first resolve the
 himmel checkout using the same checkout-resolution order as
 `marketplace/plugins/himmel-ops/scripts/legs.sh` (here it fails closed with an

@@ -1518,6 +1518,29 @@ report_qmd_daemon_restart() {
     echo "     bash marketplace/plugins/qmd/scripts/ensure-qmd-daemon.sh)"
 }
 
+# Advisory (#2591): hook-integrity pins these paths at SessionStart and refuses
+# a re-pin unless HEAD is the anchor tip, so a pull that changes any of them
+# leaves the Claude session that ran this update unable to run Bash or Edit.
+# Keep in step with record-hook-integrity.sh's pinned directory list. Printed
+# LAST, so it is the line the calling agent reads. PULL_HEAD_BEFORE is set just
+# before update_pull runs; unset means no pull was attempted.
+HOOK_PIN_PATHS="scripts/hooks scripts/guardrails scripts/lib scripts/handover marketplace/plugins/himmel-bus/lib"
+report_session_restart_required() {
+    [ -n "${CLAUDECODE:-}" ] || return 0
+    [ -n "${PULL_HEAD_BEFORE:-}" ] || return 0
+    local after changed
+    after=$(git rev-parse HEAD 2>/dev/null) || return 0
+    [ "$PULL_HEAD_BEFORE" != "$after" ] || return 0
+    # shellcheck disable=SC2086  # fixed literal path list, split intentionally
+    changed=$(git diff --name-only "$PULL_HEAD_BEFORE" "$after" -- $HOOK_PIN_PATHS 2>/dev/null) || return 0
+    [ -n "$changed" ] || return 0
+    echo ""
+    echo "==> RESTART CLAUDE NOW — this session can no longer run Bash or Edit (#2591)"
+    echo "    The pull changed hook-pinned files (e.g. ${changed%%$'\n'*})."
+    echo "    hook-integrity now DENIES every Bash and Edit call in this Claude session"
+    echo "    (re-pin refused: not the anchor tip). Exit claude and start a new session."
+}
+
 # Advisory (HIMMEL-3068): the ONE update_qmd_fork skip reason that means qmd is
 # PERMANENTLY disabled on this machine until fixed, not a one-off/transient
 # miss. STATUS_qmd_fork reads "skipped" in the status table either way — the
@@ -3212,6 +3235,7 @@ if [ "${1:-}" = "--only" ]; then
                     exit 1
                 fi
             fi
+            PULL_HEAD_BEFORE=$(git rev-parse HEAD 2>/dev/null || echo "")
             update_pull || only_rc=1 ;;
         marketplace)   update_marketplace apply || only_rc=1 ;;
         jira_cli)      update_jira_cli apply    || only_rc=1 ;;
@@ -3240,6 +3264,7 @@ if [ "${1:-}" = "--only" ]; then
     report_qmd_daemon_restart
     report_qmd_bun_missing
     print_status_table
+    report_session_restart_required
     exit "$only_rc"
 fi
 
@@ -3372,6 +3397,7 @@ fi
 chain_rc=0
 
 echo "==> [1/6] git pull --ff-only (branch: $branch)"
+PULL_HEAD_BEFORE=$(git rev-parse HEAD 2>/dev/null || echo "")
 if ! update_pull; then
     chain_rc=1
 fi
@@ -3533,7 +3559,10 @@ report_drift apply
 
 print_status_table
 
-[ "$chain_rc" -eq 0 ] || exit 1
+if [ "$chain_rc" -ne 0 ]; then
+    report_session_restart_required
+    exit 1
+fi
 
 cat <<'EOF'
 
@@ -3564,3 +3593,4 @@ case "$STATUS_luna_template" in
         echo "      template (journal/notes/clips are never touched)."
         ;;
 esac
+report_session_restart_required

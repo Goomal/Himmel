@@ -367,6 +367,11 @@ push_change_7 docs/unpinned.md
 rc=0; out=$(update_7 1) || rc=$?
 assert_contains "no restart warning: unpinned-only pull still updated" "pull  *updated" "$out"
 assert_not_contains "no restart warning: unpinned-only pull" "RESTART CLAUDE NOW" "$out"
+# A non-.sh file inside a pinned dir is not in the recorder's pin set.
+push_change_7 scripts/lib/data.json
+rc=0; out=$(update_7 1) || rc=$?
+assert_contains "no restart warning: non-.sh file in a pinned dir still updated" "pull  *updated" "$out"
+assert_not_contains "no restart warning: non-.sh file in a pinned dir" "RESTART CLAUDE NOW" "$out"
 push_change_7 scripts/lib/new-lib.sh
 rc=0; out=$(update_7 '') || rc=$?
 assert_contains "no restart warning: outside Claude still updated" "pull  *updated" "$out"

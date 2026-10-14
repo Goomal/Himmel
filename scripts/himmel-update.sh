@@ -1533,6 +1533,8 @@ report_session_restart_required() {
     [ "$PULL_HEAD_BEFORE" != "$after" ] || return 0
     # shellcheck disable=SC2086  # fixed literal path list, split intentionally
     changed=$(git diff --name-only "$PULL_HEAD_BEFORE" "$after" -- $HOOK_PIN_PATHS 2>/dev/null) || return 0
+    # Same file filter as the recorder: *.sh, plus himmel-bus/lib/*.mjs one level deep.
+    changed=$(printf '%s\n' "$changed" | grep -E '\.sh$|^marketplace/plugins/himmel-bus/lib/[^/]+\.mjs$')
     [ -n "$changed" ] || return 0
     echo ""
     echo "==> RESTART CLAUDE NOW — this session can no longer run Bash or Edit (#2591)"

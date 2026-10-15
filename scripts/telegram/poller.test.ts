@@ -3468,3 +3468,81 @@ test("a replayed update_id after enqueue-before-commit neither enqueues nor spaw
   expect(inboxes.join("").trim().split("\n")).toHaveLength(1);
   expect(ran).toHaveLength(1);
 });
+
+test("a replayed update_id after the inbox was consumed and truncated neither enqueues nor spawns twice (HIMMEL-5795)", async () => {
+  const r = ackRoot();
+  const ran: string[] = [];
+  const msg = { from: 1, chat_id: 7, text: "hello", update_id: 88 };
+  await handleInbound(r, msg, async (s: string) => { ran.push(s); });
+  const [session] = readdirSync(join(r, "sessions"));
+  const inbox = join(r, "sessions", session, "inbox.jsonl");
+  writeFileSync(inbox, "");                       // a run consumed and truncated it
+  await handleInbound(r, msg, async (s: string) => { ran.push(s); });
+  expect(readFileSync(inbox, "utf8")).toBe("");
+  expect(ran).toHaveLength(1);
+});
+
+test("the handled high-water mark skips any id at or below it and lets a higher id through (HIMMEL-5795)", async () => {
+  const r = ackRoot();
+  const ran: string[] = [];
+  const run = async (s: string) => { ran.push(s); };
+  await handleInbound(r, { from: 1, chat_id: 7, text: "b", update_id: 20 }, run);
+  await handleInbound(r, { from: 1, chat_id: 7, text: "a", update_id: 10 }, run);   // below the mark
+  const [session] = readdirSync(join(r, "sessions"));
+  const inbox = join(r, "sessions", session, "inbox.jsonl");
+  expect(readFileSync(inbox, "utf8").trim().split("\n")).toHaveLength(1);
+  writeFileSync(inbox, "");
+  await handleInbound(r, { from: 1, chat_id: 7, text: "c", update_id: 21 }, run);
+  expect(readFileSync(inbox, "utf8").trim().split("\n")).toHaveLength(1);
+});
+
+test("a corrupt or missing high-water marker fails open to the inbox check (HIMMEL-5795)", async () => {
+  const r = ackRoot();
+  const ran: string[] = [];
+  const run = async (s: string) => { ran.push(s); };
+  const msg = { from: 1, chat_id: 7, text: "hello", update_id: 55 };
+  await handleInbound(r, msg, run);
+  const [session] = readdirSync(join(r, "sessions"));
+  const inbox = join(r, "sessions", session, "inbox.jsonl");
+  writeFileSync(join(r, "handled-update.hw"), "not-a-number");
+  await handleInbound(r, msg, run);               // still in the inbox: inbox check catches it
+  expect(readFileSync(inbox, "utf8").trim().split("\n")).toHaveLength(1);
+  writeFileSync(inbox, "");
+  await handleInbound(r, { ...msg, update_id: 56, text: "next" }, run);   // fail open: enqueues, and rewrites the marker
+  expect(readFileSync(inbox, "utf8").trim().split("\n")).toHaveLength(1);
+  expect(readFileSync(join(r, "handled-update.hw"), "utf8")).toMatch(/^56 \d+$/);
+});
+
+test("a failed marker write drops the stale marker so the replay still hits the inbox check (HIMMEL-5795)", async () => {
+  const r = ackRoot();
+  const run = async (_s: string) => {};
+  await handleInbound(r, { from: 1, chat_id: 7, text: "a", update_id: 20 }, run);
+  mkdirSync(join(r, "handled-update.hw.tmp"));    // the next atomic write cannot create its temp file
+  const msg = { from: 1, chat_id: 7, text: "b", update_id: 21 };
+  await handleInbound(r, msg, run);
+  await handleInbound(r, msg, run);               // replay: marker still at 20 would let it through
+  const [session] = readdirSync(join(r, "sessions"));
+  expect(readFileSync(join(r, "sessions", session, "inbox.jsonl"), "utf8").trim().split("\n")).toHaveLength(2);
+});
+
+test("an unmarked enqueue (crash before the marker write) is still caught by the inbox tail (HIMMEL-5795)", async () => {
+  const r = ackRoot();
+  const run = async (_s: string) => {};
+  await handleInbound(r, { from: 1, chat_id: 7, text: "a", update_id: 20 }, run);
+  const msg = { from: 1, chat_id: 7, text: "b", update_id: 21 };
+  await handleInbound(r, msg, run);
+  writeFileSync(join(r, "handled-update.hw"), "20 " + Date.now());   // the marker write for 21 never happened
+  await handleInbound(r, msg, run);
+  const [session] = readdirSync(join(r, "sessions"));
+  expect(readFileSync(join(r, "sessions", session, "inbox.jsonl"), "utf8").trim().split("\n")).toHaveLength(2);
+});
+
+test("a marker older than a day is ignored so a reset Telegram update_id is not dropped (HIMMEL-5795)", async () => {
+  const r = ackRoot();
+  const run = async (_s: string) => {};
+  await handleInbound(r, { from: 1, chat_id: 7, text: "a", update_id: 9000 }, run);
+  writeFileSync(join(r, "handled-update.hw"), "9000 " + (Date.now() - 2 * 24 * 3600 * 1000));
+  await handleInbound(r, { from: 1, chat_id: 7, text: "b", update_id: 5 }, run);
+  const [session] = readdirSync(join(r, "sessions"));
+  expect(readFileSync(join(r, "sessions", session, "inbox.jsonl"), "utf8").trim().split("\n")).toHaveLength(2);
+});

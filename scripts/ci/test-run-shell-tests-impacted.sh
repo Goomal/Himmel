@@ -155,4 +155,74 @@ fi
 out=$(bash "$IMPRUN" --scan-repo-of-script --impacted 2>&1); rc=$?
 if [ "$rc" -eq 2 ]; then pass "24g: --impacted with no value -> rc 2"; else fail "24g: rc=$rc output: $out"; fi
 
+# --- 24h-24l. --only-list: the macOS POC suite filter ------------------------
+printf '# only the unrelated suite\nscripts/test-unrelated.sh  # why\n\n' > "$SB/only-unrelated.txt"
+printf 'scripts/test-uninstall.sh\nscripts/test-unrelated.sh\n' > "$SB/only-both.txt"
+printf '# nothing but comments\n\n' > "$SB/only-empty.txt"
+
+: > "$IMP_LOG"
+out=$(bash "$IMPRUN" --scan-repo-of-script --only-list "$SB/only-unrelated.txt" 2>&1); rc=$?
+ran=$(cat "$IMP_LOG")
+if [ "$rc" -eq 0 ] && [ "$ran" = "unrelated" ] && grepq "$out" '\[SKIP\].*test-uninstall\.sh.*--only-list'; then
+  pass "24h: --only-list runs the listed suite only; the rest is [SKIP]ped 'not in --only-list'"
+else
+  fail "24h: rc=$rc ran='$ran' output: $out"
+fi
+
+: > "$IMP_LOG"
+out=$(bash "$IMPRUN" --scan-repo-of-script --only-list "$SB/only-unrelated.txt" --impacted "$CODE_RANGE" 2>&1); rc=$?
+ran=$(cat "$IMP_LOG")
+if [ "$rc" -eq 0 ] && [ -z "$ran" ] && grepq "$out" '0 impacted suites in --only-list'; then
+  pass "24i: impacted suites all outside the list -> rc 0, stated zero, nothing ran"
+else
+  fail "24i: rc=$rc ran='$ran' output: $out"
+fi
+
+: > "$IMP_LOG"
+out=$(bash "$IMPRUN" --scan-repo-of-script --only-list "$SB/only-both.txt" --impacted "$CODE_RANGE" 2>&1); rc=$?
+ran=$(cat "$IMP_LOG")
+if [ "$rc" -eq 0 ] && [ "$ran" = "uninstall" ]; then
+  pass "24j: --impacted with --only-list runs the intersection only"
+else
+  fail "24j: rc=$rc ran='$ran' output: $out"
+fi
+
+: > "$IMP_LOG"
+out=$(bash "$IMPRUN" --scan-repo-of-script --only-list "$SB/nope.txt" 2>&1); rc=$?
+out2=$(bash "$IMPRUN" --scan-repo-of-script --only-list "$SB/only-empty.txt" 2>&1); rc2=$?
+ran=$(cat "$IMP_LOG")
+if [ "$rc" -eq 2 ] && [ "$rc2" -eq 2 ] && [ -z "$ran" ]; then
+  pass "24k: a missing or empty --only-list is refused rc 2, nothing ran"
+else
+  fail "24k: rc=$rc rc2=$rc2 ran='$ran' output: $out / $out2"
+fi
+
+out=$(bash "$IMPRUN" --scan-repo-of-script --only-list 2>&1); rc=$?
+if [ "$rc" -eq 2 ]; then pass "24l: --only-list with no value -> rc 2"; else fail "24l: rc=$rc output: $out"; fi
+
+# 24m: a grep that ERRORS (rc 2) in the --only-list intersection is a refusal, never "0 impacted suites".
+REAL_GREP=$(command -v grep)
+mkdir -p "$SB/fakebin"
+printf '#!/bin/sh\ncase "$*" in *-Fxf*) exit 2;; esac\nexec %s "$@"\n' "$REAL_GREP" > "$SB/fakebin/grep"
+chmod +x "$SB/fakebin/grep"
+: > "$IMP_LOG"
+out=$(PATH="$SB/fakebin:$PATH" bash "$IMPRUN" --scan-repo-of-script --only-list "$SB/only-both.txt" --impacted "$CODE_RANGE" 2>&1); rc=$?
+ran=$(cat "$IMP_LOG")
+if [ "$rc" -eq 2 ] && [ -z "$ran" ] && ! grepq "$out" '0 impacted suites in --only-list'; then
+  pass "24m: a failing grep in the intersection -> rc 2, not a vacuous green"
+else
+  fail "24m: rc=$rc ran='$ran' output: $out"
+fi
+
+# 24n: a CRLF list names the same suites as an LF one.
+printf 'scripts/test-uninstall.sh\r\nscripts/test-unrelated.sh\r\n' > "$SB/only-crlf.txt"
+: > "$IMP_LOG"
+out=$(bash "$IMPRUN" --scan-repo-of-script --only-list "$SB/only-crlf.txt" --impacted "$CODE_RANGE" 2>&1); rc=$?
+ran=$(cat "$IMP_LOG")
+if [ "$rc" -eq 0 ] && [ "$ran" = "uninstall" ]; then
+  pass "24n: a CRLF --only-list selects the same suite as an LF one"
+else
+  fail "24n: rc=$rc ran='$ran' output: $out"
+fi
+
 rst_tally

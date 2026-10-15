@@ -1175,6 +1175,43 @@ assert_rc "5484 ctl setopt extendedglob"        0 "$(run_case "$(j_bash 'setopt 
 assert_rc "5484 ctl unsetopt -f"                0 "$(run_case "$(j_bash 'unsetopt -f')")"
 assert_rc "5484 ctl echo {a,b}"                 0 "$(run_case "$(j_bash 'echo {a,b}')")"
 
+# The tracing word as DATA (doc name, message text) is not a trace
+# switch; a position that sets the option still denies.
+APR='bash scripts/handover/console-kit/append-results.sh'
+QLK='bash scripts/handover/queue-lock.sh'
+XDOC='/h/yotamleo/himmel/HIMMEL-1-secrets-guard-xtrace-word-2026-10-15.md'
+assert_rc "5659 append-results doc named with the word"   0 "$(run_case "$(j_bash "$APR $XDOC 'LIVE — started'")")"
+assert_rc "5659 append-results word in the text"          0 "$(run_case "$(j_bash "$APR $XDOC 'FINDING — the xtrace word is denied'")")"
+assert_rc "5659 append-results abs script path"           0 "$(run_case "$(j_bash "bash /r/scripts/handover/console-kit/append-results.sh $XDOC 'LIVE'")")"
+assert_rc "5659 queue-lock release doc named with word"   0 "$(run_case "$(j_bash "$QLK release $XDOC tok-1")")"
+assert_rc "5659 queue-lock acquire doc named with word"   0 "$(run_case "$(j_bash "$QLK acquire $XDOC")")"
+assert_rc "5659 git commit -m message names the word"     0 "$(run_case "$(j_bash "git commit -m 'fix: the xtrace word in a data position'")")"
+assert_rc "5659 git commit --message= names the word"     0 "$(run_case "$(j_bash "git commit --message='xtrace word is data'")")"
+assert_rc "5659 gh pr create --body names the word"       0 "$(run_case "$(j_bash "gh pr create --title t --body 'xtrace is denied here'")")"
+assert_rc "5659 echo piped to a shell still denies"       2 "$(run_case "$(j_bash "echo 'set -o xtrace' | bash")")"
+assert_rc "5659 set -o xtrace still denies"               2 "$(run_case "$(j_bash 'set -o xtrace')")"
+assert_rc "5659 bash -x still denies"                     2 "$(run_case "$(j_bash 'bash -x script.sh')")"
+assert_rc "5659 SHELLOPTS=xtrace bash still denies"       2 "$(run_case "$(j_bash 'SHELLOPTS=xtrace bash s.sh')")"
+assert_rc "5659 bash -x on the data script denies"        2 "$(run_case "$(j_bash "bash -x scripts/handover/queue-lock.sh release $XDOC t")")"
+assert_rc "5659 bash -o word on the data script denies"   2 "$(run_case "$(j_bash "bash -o xtrace scripts/handover/queue-lock.sh release $XDOC t")")"
+assert_rc "5659 data script then set -o in next clause"   2 "$(run_case "$(j_bash "$QLK release $XDOC t; set -o xtrace")")"
+assert_rc "5659 data script then bare word cmd"           2 "$(run_case "$(j_bash "$QLK release $XDOC t && shopt -os xtrace")")"
+assert_rc "5659 same basename elsewhere is not exempt"    2 "$(run_case "$(j_bash "bash /tmp/queue-lock.sh $XDOC")")"
+assert_rc "5659 git -c alias carrying the word denies"    2 "$(run_case "$(j_bash "git -c 'alias.x=!set -o xtrace' x")")"
+assert_rc "5659 git commit -m then shopt in next clause"  2 "$(run_case "$(j_bash "git commit -m 'm'; shopt -os xtrace")")"
+assert_rc "5659 eval of the word denies"                  2 "$(run_case "$(j_bash 'eval "set -o xtrace"')")"
+assert_rc "5659 bash -c positional carrying the word"      2 "$(run_case "$(j_bash "bash -c 'set -o \"\$1\"; : /scripts/handover/queue-lock.sh' _ xtrace")")"
+assert_rc "5659 bash -s with the script as a positional"   2 "$(run_case "$(j_bash "printf x | bash -s scripts/handover/queue-lock.sh xtrace")")"
+assert_rc "5659 git alias run with -m carrying the word"   2 "$(run_case "$(j_bash "git -c 'alias.x=!set -o \"\$2\"; :' x -m xtrace")")"
+assert_rc "5659 git alias named commit with -m word"       2 "$(run_case "$(j_bash "git -c 'alias.commit=!set -o \"\$2\"; :' commit -m xtrace")")"
+assert_rc "5659 git -c mixed-case Alias key then commit -m" 2 "$(run_case "$(j_bash "git -c 'Alias.x=!set -o \"\$3\"; :' x commit -m xtrace")")"
+assert_rc "5659 GIT_CONFIG_* alias then commit -m word"    2 "$(run_case "$(j_bash "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0='!set -o \"\$1\"' git x commit -m xtrace")")"
+assert_rc "5659 git subcommand must be positional"         2 "$(run_case "$(j_bash "git x commit -m xtrace")")"
+assert_rc "5659 git --config-env then commit -m word"      2 "$(run_case "$(j_bash "git --config-env=alias.x=AL x commit -m xtrace")")"
+assert_rc "5659 gh alias with -b carrying the word"        2 "$(run_case "$(j_bash "gh x -b xtrace")")"
+assert_rc "5659 gh pr create --body word still allows"     0 "$(run_case "$(j_bash "gh pr create -t T -b xtrace")")"
+assert_rc "5659 git -C dir commit -m word still allows"    0 "$(run_case "$(j_bash "git -C /tmp/some-dir commit -m xtrace")")"
+
 echo ""
 if [ "$FAILED" -eq 0 ]; then
     echo "All cases passed."

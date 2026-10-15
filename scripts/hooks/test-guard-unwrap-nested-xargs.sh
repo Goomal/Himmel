@@ -15,7 +15,7 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-HOOK="$HERE/block-git-stash.sh"
+REAL_HOOK="$HERE/block-git-stash.sh"
 LIB="$HERE/lib/guard-unwrap.sh"
 
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/guard-unwrap-nested-xargs.XXXXXX") || exit 1
@@ -57,6 +57,24 @@ nest() {
     printf 'printf a | %s' "$body"
 }
 
+# A stand-in for a lib consumer: denies a command-position `git stash` by text
+# scan, then unwraps through the lib. block-git-stash.sh no longer unwraps, so
+# the lib's deny properties are driven through this instead.
+HOOK="$SCRATCH/stash-hook.sh"
+cat >"$HOOK" <<EOF
+#!/usr/bin/env bash
+set -uo pipefail
+cmd=\$(jq -r '.tool_input.command // empty') || exit 3
+[ -n "\$cmd" ] || exit 3
+if printf '%s' "\$cmd" | grep -Eq '(^|[|;&(\`])[[:space:]]*git[[:space:]]+stash'; then
+    echo "stand-in: git stash" >&2
+    exit 2
+fi
+. "$LIB" || exit 2
+guard_unwrap "\${BASH_SOURCE[0]}" "\$cmd" || exit 2
+exit 0
+EOF
+
 j_bash() { jq -cn --arg c "$1" '{tool_name:"Bash",tool_input:{command:$c}}'; }
 
 run_hook() {
@@ -90,12 +108,21 @@ count_renders() {
     wc -l <"$RENDER_LOG" | tr -d ' '
 }
 
+# block-git-stash itself no longer unwraps: a wrapped stash is an accepted miss
+run_real() {
+    j_bash "$1" >"$SCRATCH/real.json"
+    bash "$REAL_HOOK" <"$SCRATCH/real.json" >/dev/null 2>&1
+    echo "$?"
+}
+assert_rc "block-git-stash: direct git stash" 2 "$(run_real 'git stash')"
+assert_rc "block-git-stash: 2-deep xargs sh -c 'git stash' (accepted miss)" 0 "$(run_real "$(nest 2 'git stash')")"
+
 # --- benign nested xargs: must stay rc 0 at every depth the cap allows ---
 for d in 1 2 3 4; do
     assert_rc "benign ${d}-deep xargs sh -c" 0 "$(run_hook "$(nest "$d" 'echo hi')")"
 done
 
-# --- the HIMMEL-4576 deny ladder: a stash at any depth is still denied ---
+# --- the deny ladder: a stash at any depth is still denied by a lib consumer ---
 for d in 1 2 3 4; do
     assert_rc "${d}-deep xargs sh -c 'git stash'" 2 "$(run_hook "$(nest "$d" 'git stash')")"
 done

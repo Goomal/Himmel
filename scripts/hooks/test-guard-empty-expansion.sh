@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# test-guard-empty-expansion.sh — block-bare-qmd-query.sh, block-git-stash.sh and
-# block-read-secrets.sh deny their protected command behind a variable expansion
-# that expands to nothing (HIMMEL-5328, HIMMEL-5330, HIMMEL-5331), and keep
-# allowing read-only look-alikes that name no protected target.
+# test-guard-empty-expansion.sh — block-bare-qmd-query.sh and block-read-secrets.sh
+# deny their protected command behind a variable expansion that expands to
+# nothing, and keep allowing read-only
+# look-alikes that name no protected target. block-git-stash.sh no longer calls
+# the expansion lib; its literal rows stay below.
 #
 # Nothing is executed: each command is only piped to a hook as JSON, with a
 # scratch HOME. Platform guard: bash 3.2-safe; needs jq (SKIP without).
@@ -81,9 +82,10 @@ deny_shapes() {  # <hook> <program words before the arguments> <arguments>
   }
 }
 
-deny_shapes block-git-stash.sh 'git' 'stash'
-check deny block-git-stash.sh 'git ${V:-} stash'
-check deny block-git-stash.sh 'git $V stash drop'
+# block-git-stash.sh keeps only its literal core: an empty expansion in front of
+# or inside the command is an accepted miss. The expansion lib is
+# still covered through block-bare-qmd-query.sh and block-read-secrets.sh.
+check deny block-git-stash.sh 'git stash'
 deny_shapes block-bare-qmd-query.sh 'qmd' 'query hello'
 check deny block-bare-qmd-query.sh 'qmd ${V:-} query hello'
 check deny block-bare-qmd-query.sh 'qmd $V search hello'
@@ -93,23 +95,22 @@ check deny block-read-secrets.sh 'cat ${V:-} .env'
 # a default word is what the command runs when the variable is unset or empty:
 # the protected program can ride in it (HIMMEL-5525)
 for op in ':-' '-' ':=' '=' ':+' '+'; do
-  check deny block-git-stash.sh "\${V${op}git} stash drop"
   check deny block-bare-qmd-query.sh "\${V${op}qmd} query hello"
   check deny block-read-secrets.sh "\${V${op}cat} .env"
 done
-check deny block-git-stash.sh 'git ${V:-stash} drop'
-check deny block-git-stash.sh '${V:-${Z:-git}} stash drop'
 # each default expansion is set or unset on its own: A unset, B empty
-check deny block-git-stash.sh '${A:-git} ${B:-x} stash drop'
-check deny block-git-stash.sh '${A:-git} ${B:-x} ${C:-y} stash drop'
-check deny block-git-stash.sh '${B:-x} ${A:-git} stash drop'
-check allow block-git-stash.sh '${A:-git} ${B:-x} stash list'
+check deny block-read-secrets.sh '${A:-cat} ${B:-x} .env'
+check deny block-read-secrets.sh '${A:-cat} ${B:-x} ${C:-y} .env'
+check deny block-read-secrets.sh '${B:-x} ${A:-cat} .env'
+check allow block-read-secrets.sh '${A:-cat} ${B:-x} README.md'
 # past the combination cap only the all-words form is read; a huge count must
 # neither skip the check nor loop (63 and 64 expansions overflowed a bash shift)
 for n in 6 63 64 70; do
   tail=$(i=0; while [ "$i" -lt "$n" ]; do printf ' ${Z:-}'; i=$((i+1)); done)
-  check deny block-git-stash.sh '${V:-git} stash drop'"$tail"
+  check deny block-read-secrets.sh '${V:-cat} .env'"$tail"
 done
+check deny block-read-secrets.sh '${V:-${Z:-cat}} .env'
+check allow block-git-stash.sh '${A:-git} ${B:-x} stash list'
 check allow block-git-stash.sh '${V} stash drop'
 check allow block-git-stash.sh '${V:-git} stash list'
 check allow block-git-stash.sh '${V:-echo} stash drop'

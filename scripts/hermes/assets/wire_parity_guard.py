@@ -35,7 +35,7 @@ Idempotent. Exit 0 on success/skip, non-zero only on bad input.
 
 import sys
 
-# Every tool reaches the guard (HIMMEL-2637). hermes fullmatches this against the
+# Every tool reaches the guard. hermes fullmatches this against the
 # tool name and pre_tool_call is its ONLY blocking event, so any tool the pattern
 # missed was never judged at all — the old hand-listed pattern left execute_code,
 # delegate_task, browser_*, skill_manage, process_manage, cronjob_manage and
@@ -48,7 +48,7 @@ import sys
 MATCHER = ".*"
 
 # The one matcher every earlier release wired (parity_guard's first commit through
-# HIMMEL-2637). A profile already on parity_guard keeps whatever matcher it was
+# the all-tools matcher). A profile already on parity_guard keeps whatever matcher it was
 # wired with, so `ensure` rewrites exactly this value to MATCHER — nothing else:
 # a matcher an operator chose is theirs.
 LEGACY_MATCHER = ("write_file|patch|read_file|search_files|terminal|"
@@ -76,7 +76,7 @@ def _list_item(interp: str, guard: str) -> str:
 
 # The end-side members that make sense on hermes. refresh-where-are-we-on-end
 # leaves the next session's ledger current; telegram-session-end is the
-# operator-reaching relay. Both are enqueue-and-exit through the HIMMEL-2004
+# operator-reaching relay. Both are enqueue-and-exit through the
 # Stop queue, so neither does real work inside the hook's timeout. Deliberately
 # NOT here: end-session-wiki (self-guards off on Windows and its config path is
 # Claude-scoped), jira-nudge-on-end (its window is a Claude session's commits)

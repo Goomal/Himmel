@@ -298,6 +298,50 @@ assert_rc "swap recovers a stale lock" 0 "$rc"
 if [ ! -e "$LOCK.reclaim" ]; then pass "the reclaim guard is released"; else fail "the reclaim guard is released"; fi
 if [ ! -e "$LOCK" ]; then pass "the recovered lock is released again"; else fail "the recovered lock is released again"; fi
 
+echo "== jina gate on config writes"
+new_home 6
+printf 'collections:\n  luna:\n    path: /x\n  salus:\n    path: /s\nmodels:\n  embed: %s\n  rerank: openai:jina-reranker-v2-base-multilingual\n  openai_base_url: https://api.jina.ai/v1\n' "$GEMMA" >"$(CFG)"
+before=$(cat "$(CFG)")
+rc=0; out=$(run env FAKE_VRAM=24564 bash "$SCRIPT" set qwen --force 2>&1) || rc=$?
+assert_rc "set refuses a Jina index that holds salus" 2 "$rc"
+if [ "$(cat "$(CFG)")" = "$before" ]; then pass "the refused write leaves the config untouched"; else fail "the refused write leaves the config untouched"; fi
+if ls "$H"/.config/qmd/index.yml.tmp.* >/dev/null 2>&1; then fail "no temp file is left behind"; else pass "no temp file is left behind"; fi
+
+new_home 7
+printf 'collections:\n  luna:\n    path: /x\nmodels:\n  embed: %s\n  rerank: openai:jina-reranker-v2-base-multilingual\n  openai_base_url: https://api.jina.ai/v1\n' "$GEMMA" >"$(CFG)"
+rc=0; out=$(run env FAKE_VRAM=24564 bash "$SCRIPT" set qwen --force 2>&1) || rc=$?
+assert_rc "set writes a Jina index with no salus collection" 0 "$rc"
+assert_contains "the new model is written" "embed: $QWEN" "$(cat "$(CFG)")"
+
+# the index database counts: an active salus document refuses a remote model
+# even when the config lists no salus; swap refuses BEFORE the rename
+new_home 8
+make_index "$(IDX)" 768 "$GEMMA"
+make_index "$H/.cache/qmd/index.reembed-qwen.sqlite" 1024 "$QWEN"
+sqlite3 "$H/.cache/qmd/index.reembed-qwen.sqlite" "CREATE TABLE documents(collection TEXT, active INTEGER); INSERT INTO documents VALUES('himmel',1),('salus',1);"
+printf 'collections:\n  himmel:\n    path: /x\nmodels:\n  embed: %s\n  rerank: openai:jina-reranker-v2-base-multilingual\n  openai_base_url: https://api.jina.ai/v1\n' "$GEMMA" >"$(CFG)"
+before=$(cat "$(CFG)")
+rc=0; out=$(run bash "$SCRIPT" swap --copy "$H/.cache/qmd/index.reembed-qwen.sqlite" 2>&1) || rc=$?
+assert_rc "swap refuses a copy holding active salus documents under a remote model" 2 "$rc"
+if [ -f "$H/.cache/qmd/index.reembed-qwen.sqlite" ]; then pass "the refused swap leaves the copy in place"; else fail "the refused swap leaves the copy in place"; fi
+assert_contains "the live index still holds gemma" "$GEMMA" "$(sqlite3 "$(IDX)" 'select distinct model from content_vectors')"
+if [ "$(cat "$(CFG)")" = "$before" ]; then pass "the refused swap leaves the config untouched"; else fail "the refused swap leaves the config untouched"; fi
+
+# staging the live config for the gate must not fail silently: a failed copy
+# would let the gate judge an incomplete config
+new_home 14
+make_index "$(IDX)" 768 "$GEMMA"
+make_index "$H/.cache/qmd/index.reembed-qwen.sqlite" 1024 "$QWEN"
+printf 'models:\n  embed: %s\n  rerank: openai:jina-reranker-v2-base-multilingual\n  openai_base_url: https://api.jina.ai/v1\n' "$GEMMA" >"$(CFG)"
+REAL_CP="$(command -v cp)"
+mkdir -p "$TMP_ROOT/cpfail"
+printf '#!/bin/sh\ncase "$*" in *qmd-swap-gate*) exit 1 ;; esac\nexec %s "$@"\n' "$REAL_CP" >"$TMP_ROOT/cpfail/cp"
+chmod +x "$TMP_ROOT/cpfail/cp"
+rc=0; out=$(run env PATH="$TMP_ROOT/cpfail:$STUBS:$PATH" bash "$SCRIPT" swap --copy "$H/.cache/qmd/index.reembed-qwen.sqlite" 2>&1) || rc=$?
+assert_rc "swap aborts when the config cannot be staged for the gate" 5 "$rc"
+assert_contains "the abort names the staging failure" "could not stage the config" "$out"
+assert_contains "the live index still holds gemma after the abort" "$GEMMA" "$(sqlite3 "$(IDX)" 'select distinct model from content_vectors')"
+
 echo
 echo "===================================="
 echo "test summary: $PASS passed, $FAIL failed"

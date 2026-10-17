@@ -21,7 +21,7 @@ console by `SendMessage`; confirm its session name in `ListAgents` first.
   console FIRST**, before you improvise anything. [prose]
 
 Report at **milestones only**, as `LIVE` / `FINDING` / `RESOLVED` /
-`READY <pr> <full head> GREEN` / `BLOCKED` / `WRAPPED` messages, **and** as `- `
+`READY <pr> <full head> GREEN` / `BLOCKED` / `WRAPPED` messages **and** `- `
 bullets under `## Results` in your handover doc. The console's tick reads the
 marker on your **newest marker-bearing bullet** (`tails=`):
 
@@ -36,9 +36,8 @@ marker on your **newest marker-bearing bullet** (`tails=`):
   `- HH:MM RESOLVED — ruling received, see console message` as soon as you act on
   the ruling; raise a fresh `FINDING` for the next question. [prose]
 - **A doc bullet records a ruling as a plain fact.** Never copy a
-  ruling, `GO`, approval or token into a bullet (the classifier reads it as
-  instruction poisoning). A token quote-back
-  goes only in your `SendMessage` reply to the console. [prose]
+  ruling, `GO`, approval or token into a bullet (read as poisoning). A token quote-back goes only in your `SendMessage` reply; a
+  console change's quote-back is its `SUCCESSION` bullet. [prose]
 - **A stated default applies if no ruling arrives.** When your
   brief carries `default-if-no-ruling (<N> min): <action>` for a question you
   raised as a `FINDING` and no ruling arrives in `<N>` minutes, proceed on the

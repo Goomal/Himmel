@@ -372,6 +372,13 @@ else
     bad "nftables.conf is still a deny list: $(printf '%s' "$nftconf" | grep -E 'policy|allowed')"
 fi
 if printf '%s\n' "$nftconf" | grep -q 'set allowed4' && printf '%s\n' "$nftconf" | grep -q 'set allowed6'; then ok "nftables.conf declares both sets"; else bad "nftables.conf has no allowed4/allowed6 set"; fi
+chain_rules=$(printf '%s\n' "$nftconf" | sed -n '/chain output/,/^    }/p' | grep -vE '^[[:space:]]*(chain output|type filter|\}|$)')
+if [ "$(printf '%s\n' "$chain_rules" | tail -n 1 | sed 's/^[[:space:]]*//')" = "counter reject" ]; then ok "the output chain ends in the catch-all counter reject"; else bad "the output chain does not end in counter reject: $(printf '%s' "$chain_rules" | tail -n 1)"; fi
+stray=$(printf '%s\n' "$chain_rules" | grep 'accept' | grep -vE '^[[:space:]]+(oifname "lo" accept|ct state established,related accept|ip daddr 10\.0\.2\.3 (udp|tcp) dport 53 accept|ip6? daddr @allowed[46] accept)')  # leak-allow: private-lan-ip egress filter ranges
+if [ -z "$stray" ]; then ok "every accept is lo, conntrack, NAT DNS or an allowed set"; else bad "a rule accepts beyond lo/ct/DNS/allowed sets: $stray"; fi
+rej_line=$(printf '%s\n' "$chain_rules" | grep -n '10\.0\.0\.0/8.*reject' | head -n 1 | cut -d: -f1)  # leak-allow: private-lan-ip egress filter ranges
+acc_line=$(printf '%s\n' "$chain_rules" | grep -n '@allowed4 accept' | head -n 1 | cut -d: -f1)
+if [ -n "$rej_line" ] && [ -n "$acc_line" ] && [ "$rej_line" -lt "$acc_line" ]; then ok "the private-range reject comes before the allowed4 accept"; else bad "private reject (line ${rej_line:-none}) is not before allowed4 accept (line ${acc_line:-none})"; fi
 
 reset_log
 GH_KILL=on run_loop run --once >"$TMP/out" 2>&1
@@ -379,6 +386,23 @@ refresh_line=$(grep -n 'himmel-ci-egress-refresh' "$TMP/log/ssh.argv" 2>/dev/nul
 check_line=$(grep -n 'nft list table inet himmel_egress' "$TMP/log/ssh.argv" 2>/dev/null | head -n 1 | cut -d: -f1)
 if [ -n "$refresh_line" ] && [ -n "$check_line" ] && [ "$refresh_line" -lt "$check_line" ]; then ok "the loop refreshes the allow-list before it checks the table"; else bad "refresh before check (refresh=$refresh_line check=$check_line)"; fi
 if grep -q "policy drop" "$TMP/log/ssh.argv" 2>/dev/null && grep -q "allowed4" "$TMP/log/ssh.argv" 2>/dev/null; then ok "the per-boot check requires policy drop and a filled allowed4 set"; else bad "per-boot check ignores policy drop / allowed4"; fi
+if grep -q "nft list chain inet himmel_egress output" "$TMP/log/ssh.argv" 2>/dev/null && grep -qF "counter( packets [0-9]+ bytes [0-9]+)? reject" "$TMP/log/ssh.argv" 2>/dev/null; then ok "the per-boot check requires the output chain to end in counter reject"; else bad "per-boot check never inspects the last rule of the output chain"; fi
+# Run the recorded last-rule probe against nft listings: a trailing bare accept
+# (or any rule after the reject) must fail it, a chain ending in the reject must pass.
+lastrule=$(sed -n 's/.*\(sudo nft list chain inet himmel_egress output [^&]*\).*/\1/p' "$TMP/log/ssh.argv" | head -n 1)
+mkdir -p "$TMP/nftbin"
+printf '#!/usr/bin/env bash\nexec "$@"\n' > "$TMP/nftbin/sudo"
+# shellcheck disable=SC2016 # the stub body must expand STUB_NFT_LISTING at run time
+printf '#!/usr/bin/env bash\ncat "$STUB_NFT_LISTING"\n' > "$TMP/nftbin/nft"
+chmod +x "$TMP/nftbin/sudo" "$TMP/nftbin/nft"
+printf 'table inet himmel_egress {\n\tchain output {\n\t\ttype filter hook output priority filter; policy drop;\n\t\toifname "lo" accept\n\t\tip daddr @allowed4 accept\n\t\tcounter packets 0 bytes 0 reject\n\t}\n}\n' > "$TMP/listing-good"
+printf 'table inet himmel_egress {\n\tchain output {\n\t\ttype filter hook output priority filter; policy drop;\n\t\toifname "lo" accept\n\t\tcounter packets 0 bytes 0 reject\n\t\taccept\n\t}\n}\n' > "$TMP/listing-bare-accept"
+printf 'table inet himmel_egress {\n\tchain output {\n\t\ttype filter hook output priority filter; policy drop;\n\t\toifname "lo" accept\n\t\tcounter packets 0 bytes 0 reject\n\t\tip daddr @allowed4 accept\n\t}\n}\n' > "$TMP/listing-accept-after"
+if [ -n "$lastrule" ] && STUB_NFT_LISTING="$TMP/listing-good" PATH="$TMP/nftbin:$PATH" bash -c "$lastrule"; then ok "the last-rule probe passes a chain that ends in counter reject"; else bad "last-rule probe rejects a good chain: $lastrule"; fi
+printf 'table inet himmel_egress {\n\tchain output {\n\t\ttype filter hook output priority filter; policy drop;\n\t\toifname "lo" accept\n\t\tcounter packets 0 bytes 0 ip daddr 203.0.113.1 reject\n\t}\n}\n' > "$TMP/listing-conditional-reject"
+for l in listing-bare-accept listing-accept-after listing-conditional-reject; do
+    if [ -n "$lastrule" ] && ! STUB_NFT_LISTING="$TMP/$l" PATH="$TMP/nftbin:$PATH" bash -c "$lastrule"; then ok "the last-rule probe fails $l"; else bad "last-rule probe passes $l"; fi
+done
 
 reset_log
 STUB_NO_REFRESH=1 GH_KILL=on run_loop run --once >"$TMP/out" 2>&1
@@ -423,6 +447,7 @@ cat > "$TMP/rbin/getent" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$2" >> "$STUB_LOG/getent.hosts"
 [ "$2" != "${STUB_NO_RESOLVE:-}" ] || exit 2
+[ "$2" != "${STUB_EMPTY_RESOLVE:-}" ] || exit 0
 case "$2" in
     api.github.com) printf '%s STREAM api.github.com\n' 140.82.112.5 ;;
     archive.ubuntu.com) printf '%s STREAM archive.ubuntu.com\n%s STREAM archive.ubuntu.com\n' 185.125.190.82 2620:2d:4000:1::1a ;;
@@ -465,6 +490,18 @@ reset_log
 STUB_NO_RESOLVE=pypi.org run_refresh >"$TMP/out" 2>&1
 rc=$?
 if [ "$rc" -ne 0 ]; then ok "a mirror host that does not resolve fails closed (rc=$rc)"; else bad "unresolvable mirror host exited 0"; fi
+reset_log
+STUB_EMPTY_RESOLVE=pypi.org run_refresh >"$TMP/out" 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then ok "a mirror host that resolves to no addresses fails closed (rc=$rc)"; else bad "mirror host with empty addresses exited 0"; fi
+reset_log
+STUB_NO_RESOLVE=api.github.com run_refresh >"$TMP/out" 2>&1
+rc=$?
+if [ "$rc" -ne 0 ] && ! grep -q . "$TMP/log/curl.argv" 2>/dev/null; then ok "an unresolvable bootstrap host fails closed before /meta is fetched (rc=$rc)"; else bad "bootstrap resolve failure: rc=$rc, curl=$(cat "$TMP/log/curl.argv" 2>/dev/null)"; fi
+reset_log
+STUB_EMPTY_RESOLVE=api.github.com run_refresh >"$TMP/out" 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then ok "a bootstrap host with no addresses fails closed (rc=$rc)"; else bad "bootstrap host with empty addresses exited 0"; fi
 printf 'not json' > "$TMP/bad-meta.json"
 reset_log
 META="$TMP/bad-meta.json" run_refresh >"$TMP/out" 2>&1

@@ -236,6 +236,29 @@ check_bump_required() {
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     local manifest="$rel/$name/.claude-plugin/plugin.json"
+    # A plugin removed whole needs no bump: nothing is tracked at its path on
+    # the new side (no trailing slash, so a symlink swapped in still counts)
+    # AND marketplace.json no longer lists it (a move out stays listed).
+    local remaining mjson listed
+    if [ -n "$base_ref" ]; then
+      remaining="$(git ls-tree -r --name-only HEAD -- "$rel/$name")"
+      mjson="$(git show "HEAD:marketplace/.claude-plugin/marketplace.json" 2>/dev/null)"
+    else
+      remaining="$(git ls-files -- "$rel/$name")"
+      mjson="$(git show ":marketplace/.claude-plugin/marketplace.json" 2>/dev/null)"
+    fi
+    # Unreadable or unparsable marketplace.json counts as listed: fail closed.
+    listed="$(printf '%s' "$mjson" | python3 -c 'import json,sys
+n=sys.argv[1]
+try:
+    ps=json.load(sys.stdin)["plugins"]
+    print("1" if any(p.get("name")==n or str(p.get("source","")).rstrip("/").endswith("/"+n) for p in ps) else "0")
+except Exception:
+    print("1")' "$name" 2>/dev/null)"
+    if [ -z "$remaining" ] && [ "$listed" = "0" ]; then
+      echo "check-plugin-drift --bump-required: $name removed — no version bump needed"
+      continue
+    fi
     if ! printf '%s\n' "$changed" | grep -qx "$manifest"; then
       echo "ERR check-plugin-drift --bump-required: $name changed under $rel/$name/ but $manifest was not bumped (HIMMEL-3551)" >&2
       bad=1

@@ -12,6 +12,9 @@
 #   vm-runner.sh status          units up/idle/busy, current job, last error
 #   vm-runner.sh status --tick   the one tick token (tick.sh's vmrun= field):
 #                                off | ok:<up>/<want>,busy=<n> | DEAD | STUCK | FAILING
+#                                | DISAGREE:<up>/<want>,online=0 (a unit has a
+#                                registered, unfinished runner but GitHub shows
+#                                no himmel-vm runner online)
 #   vm-runner.sh doctor          `<OK|WARN|FAIL><TAB><id><TAB><message>` rows
 #                                for himmel-doctor's C64 check
 #
@@ -217,22 +220,28 @@ unit_failing() {
     [ -n "$last" ] && ! printf '%s\n' "$last" | grep -qE 'registered on|done \(rc=0|deregistered'
 }
 
-# runners_busy — how many himmel-vm runners GitHub reports busy, cached.
-runners_busy() {
-    local f="$STATE_DIR/tick-vmrun-cache" now ts val
+# runner_counts — "<busy> <online>" from ONE gh call, cached: the himmel-vm
+# runners GitHub reports busy, and the himmel-vm runners it reports online
+# (the ground truth the unit count is checked against; an unrelated runner
+# must not mask them). Prints nothing and caches nothing when GitHub is
+# unreadable, so the caller fails closed. One page of 100: the repo registers
+# at most MAX_VMS ephemeral himmel-vm runners, so a second page cannot hold them.
+runner_counts() {
+    local f="$STATE_DIR/tick-vmrun-cache" now ts busy online val
     now="$(date +%s)"
-    if [ -r "$f" ] && read -r ts val < "$f" 2>/dev/null && [ -n "$ts" ] && [ $((now - ts)) -lt "$CACHE_TTL" ]; then
-        printf '%s\n' "$val"; return
+    if [ -r "$f" ] && read -r ts busy online < "$f" 2>/dev/null && [ -n "$ts" ] && [ $((now - ts)) -lt "$CACHE_TTL" ]; then
+        case "$busy" in ''|*[!0-9]*) ;; *) case "$online" in ''|*[!0-9]*) ;; *) printf '%s %s\n' "$busy" "$online"; return ;; esac ;; esac
     fi
-    val="$(bounded gh api "repos/$REPO/actions/runners" --jq '[.runners[] | select(.busy and (.name | startswith("himmel-vm-")))] | length' 2>/dev/null)" || val=""
-    case "$val" in ''|*[!0-9]*) val=0 ;; esac
+    val="$(bounded gh api "repos/$REPO/actions/runners?per_page=100" --jq '"\([.runners[] | select(.busy and (.name | startswith("himmel-vm-")))] | length) \([.runners[] | select(.status == "online" and (.name | startswith("himmel-vm-")))] | length)"' 2>/dev/null)" || return 0
+    case "$val" in [0-9]*\ [0-9]*) ;; *) return 0 ;; esac
+    case "${val// /}" in *[!0-9]*) return 0 ;; esac
     { mkdir -p "$STATE_DIR" && printf '%s %s\n' "$now" "$val" > "$f"; } 2>/dev/null || true
     printf '%s\n' "$val"
 }
 
-# tick_token — off | ok:<up>/<want>,busy=<n> | DEAD | STUCK | FAILING
+# tick_token — off | ok:<up>/<want>,busy=<n> | DISAGREE:<up>/<want>,online=0 | DEAD | STUCK | FAILING
 tick_token() {
-    local var up=0 want i=1 stuck=0 failing=0 j
+    local var up=0 want i=1 stuck=0 failing=0 inflight=0 j counts busy online
     # Never set up on this station: no gh call, nothing to report.
     [ -e "$UNIT_DIR/$UNIT_PREFIX@.service" ] || { echo off; return; }
     var="$(vmrun_var)" || var=""
@@ -242,7 +251,7 @@ tick_token() {
             up=$((up + 1))
             ! unit_failing "$i" || failing=1
             j="$(unit_job "$i")"
-            case "$j" in idle) ;; *) [ "$j" -gt $((JOB_MAX + 600)) ] && stuck=1 ;; esac
+            case "$j" in idle) ;; *) inflight=1; [ "$j" -gt $((JOB_MAX + 600)) ] && stuck=1 ;; esac
         fi
         i=$((i + 1))
     done
@@ -259,7 +268,15 @@ tick_token() {
     if [ "$up" -eq 0 ]; then echo DEAD; return; fi
     if [ "$stuck" -eq 1 ]; then echo STUCK; return; fi
     if [ "$failing" -eq 1 ]; then echo FAILING; return; fi
-    echo "ok:$up/$want,busy=$(runners_busy)"
+    # The unit count is this station's claim; GitHub's online-runner count is
+    # the check. An unreadable count is never ok. A loop mints its JIT runner
+    # late and deletes it after each job, so zero online is normal between jobs:
+    # it disagrees only while a unit has a registered, unfinished runner.
+    counts="$(runner_counts)"
+    if [ -z "$counts" ]; then echo FAILING; return; fi
+    read -r busy online <<< "$counts"
+    if [ "$online" -eq 0 ] && [ "$inflight" -eq 1 ]; then echo "DISAGREE:$up/$want,online=0"; return; fi
+    echo "ok:$up/$want,busy=$busy"
 }
 
 cmd_status() {
@@ -314,7 +331,7 @@ cmd_doctor() {
     esac
     tok="$(tick_token)"
     case "$tok" in
-        DEAD|STUCK) printf 'FAIL\tC64-vm-runner\trunner %s (variable on): bash scripts/handover/console-kit/vm-runner.sh status\n' "$tok" ;;
+        DEAD|STUCK|FAILING|DISAGREE:*) printf 'FAIL\tC64-vm-runner\trunner %s (variable on): bash scripts/handover/console-kit/vm-runner.sh status\n' "$tok" ;;
         unknown) printf 'WARN\tC64-vm-runner\trunner state unknown: the %s variable is unreadable (gh) and no unit is up\n' "$VAR" ;;
         *) printf 'OK\tC64-vm-runner\trunner %s\n' "$tok" ;;
     esac

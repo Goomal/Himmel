@@ -679,6 +679,10 @@ case "\$1" in
         if [ "\$2" = "comment" ] && [ "\$4" = "--comment-file" ] && [ -f "\$5" ]; then
             sed 's/^/comment-body: /' "\$5" >> "\$JIRA_LOG"
         fi
+        if [ "\$2" = "get" ] && [ "\${STUB_JIRA_NO_FIXVERSIONS:-0}" = "1" ]; then
+            printf '{"fields":{"issuetype":{"name":"%s"},"status":{"name":"%s"}}}\n' "\${STUB_JIRA_ISSUE_TYPE:-Task}" "\${STUB_JIRA_STATUS-In Review}"
+            exit 0
+        fi
         if [ "\$2" = "get" ]; then
             printf '{"fields":{"issuetype":{"name":"%s"},"status":{"name":"%s"},"fixVersions":[%s]}}\n' "\${STUB_JIRA_ISSUE_TYPE:-Task}" "\${STUB_JIRA_STATUS-In Review}" "\${STUB_JIRA_FIXVERSIONS:-}"
             exit 0
@@ -689,6 +693,10 @@ case "\$1" in
         fi
         if [ "\${STUB_JIRA_TRANSITION_FAIL:-0}" = "1" ] && [ "\$2" = "transition" ]; then
             echo "jira transition failed" >&2
+            exit 1
+        fi
+        if [ "\${STUB_JIRA_FIX_FAIL:-0}" = "1" ] && [ "\$4" = "--fix-version" ]; then
+            echo "jira fix-version failed" >&2
             exit 1
         fi
         if [ "\${STUB_JIRA_ADD_FIX_FAIL:-0}" = "1" ] && [ "\$4" = "--add-fix-version" ]; then
@@ -3625,6 +3633,30 @@ assert_jira_log_lacks "jira: no fixVersion edit when already current" "edit "
 STUB_JIRA_BUILD=1 STUB_JIRA_FIXVERSIONS='{"name":"v1.1.2"}' STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" \
     run_mog 0 "jira: closed ticket in a released version is not edited" -- --jira-transition
 assert_jira_log_lacks "jira: no fixVersion edit for a released version" "edit "
+
+# A closed ticket with no fixVersion at all is stamped with the current version.
+STUB_JIRA_BUILD=1 STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" \
+    run_mog 0 "jira: closed unversioned ticket is stamped with the current version" -- --jira-transition
+assert_jira_log_has "jira: unversioned stamp sets the current unreleased version" "edit HIMMEL-374 --fix-version v1.1.3"
+assert_audit_has "jira: unversioned stamp is recorded on the audit line" "jira-transition=ok key=HIMMEL-374 status=Done fixversion=v1.1.3"
+
+STUB_JIRA_BUILD=1 STUB_JIRA_FIX_FAIL=1 STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" \
+    run_mog 0 "jira: a failed unversioned stamp is a WARN, the merge still succeeds" -- --jira-transition
+assert_audit_has "jira: failed unversioned stamp is recorded" "jira-transition=ok key=HIMMEL-374 status=Done fixversion=failed"
+
+STUB_JIRA_BUILD=1 STUB_JIRA_VERSIONS='v1.1.3\tfalse\t\nv1.1.4\tfalse\t\n' STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" \
+    run_mog 0 "jira: unversioned stamp with no dated version uses the first unreleased one" -- --jira-transition
+assert_jira_log_has "jira: undated unversioned stamp uses the first unreleased version" "edit HIMMEL-374 --fix-version v1.1.3"
+
+# A get reply with no fixVersions key is unknown, not empty: a full-replace
+# stamp could drop versions the ticket holds.
+STUB_JIRA_BUILD=1 STUB_JIRA_NO_FIXVERSIONS=1 STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" \
+    run_mog 0 "jira: a get reply without a fixVersions field is not stamped" -- --jira-transition
+assert_jira_log_lacks "jira: no fixVersion edit when the field is missing from the reply" "edit "
+
+STUB_JIRA_BUILD=1 STUB_JIRA_VERSIONS='v1.1.2\ttrue\t2026-10-11\n' STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" \
+    run_mog 0 "jira: an unversioned ticket with no unreleased version is not edited" -- --jira-transition
+assert_jira_log_lacks "jira: no fixVersion edit when no unreleased version exists" "edit "
 
 STUB_JIRA_BUILD=1 STUB_JIRA_FIXVERSIONS='{"name":"v1.1.4"}' STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" \
     run_mog 0 "jira: bare merge (no --jira-transition) never edits fixVersion"

@@ -2676,7 +2676,36 @@ never contains `>`. Heredocs are not a channel here, because the main path
 judges their body as raw text. The residuals are a file written by the
 Write/Edit tools (this is a Bash matcher) and text that never spells a target;
 the backstop's `ponytail:` names them. Running either matches no allow rule,
-so the classifier decides.
+so the classifier decides. One git exception: a single git command with no
+quotes, substitution or heredoc, with no word starting with `-`, whose words
+are pathspec-only and that redirects into a file not named like a target
+(`git show HEAD:<target> > /tmp/x`), is allowed: it writes only git's own
+output. Options are refused because `--format`/`--pretty` (`%xNN`),
+`--src-prefix`, `--dst-prefix` and `--line-prefix` put command bytes into
+that output.
+
+**Command position and the dispatcher (HIMMEL-6015).** Before the text scan,
+a command whose every command word provably runs no gate directly is allowed:
+an inert reader, an inert `sed`, a pathspec-only `git`, `echo`, `printf`
+without `-v`, `cd`, or
+`bash` running `scripts/handover/console-kit/himmel-gate.sh` by its exact
+anchored spelling (`bash "$HIMMEL_REPO/…/himmel-gate.sh" <name> <args>`, with
+`HIMMEL_REPO` absolute and every other `HIMMEL_REPO` reference refused). Such a
+command has no `VAR=` word, no substitution, `$'…'` or comment, no write
+redirect other than an fd dup or `/dev/null`, and a live `$` only as a plain
+`$NAME` reference. From a dispatcher run on, segments join only by `&&` or
+`|`, never `;`, `||`, `&` or a newline, and a pipe straight after the
+dispatcher needs a lone `--help` (an fd dup such as `1>&2` hides the pipe from
+the dispatcher's own check). So a target named in a commit message, `git grep`, `sed -n`
+or a `cat` heredoc no longer denies. A `python` command is not on that list:
+it goes to the text scan unchanged, and its body parse is HIMMEL-6014. The dispatcher runs a registered
+gate or ledger writer by name from the anchor. Before the exec it refuses an
+unknown name, a relative `HIMMEL_REPO`, an anchor off `refs/heads/main` or
+whose copy of the script, the dispatcher or `anchor-handoff.sh` differs from
+main's committed bytes, and so for what the script runs or sources (all of
+`scripts/cr/`, `scripts/guardrails/lib.sh` and `scripts/lib/load-dotenv.sh`
+for `pr-check-context` / `pr-check-env`; `go-gate.sh` and `handover-path.sh`
+for `go`, the set the guard holds them to), and a piped stdout (a lone `--help` is exempt).
 
 **Why the anchor, not a ref.** The compare base is the anchor's working-tree
 bytes, never `refs/remotes/origin/main`. Refs live in the common git dir, which

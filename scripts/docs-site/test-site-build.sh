@@ -155,7 +155,7 @@ check "criterion 4: mermaid loads on demand, not through a static import of the 
 check "criterion 4: the page script imports the renderer behind a diagram check" grep -q 'pre\.mermaid' "$page_js"
 check "criterion 4: the diagram theme follows data-theme" grep -q 'dataset\.theme' "$page_js"
 check "criterion 4: a data-theme change re-renders the diagrams" grep -q 'MutationObserver' "$page_js"
-for h in adoption-trail.html guide/installer-journey.html guide/loops-and-graphs.html; do
+for h in adoption-trail.html guide/installer-journey.html guide/loops-and-graphs.html guide/dev-graph.html guide/dev-graph/dev-graph.js guide/dev-graph/dev-graph.css guide/dev-graph/tokens.css guide/dev-graph/graph.json; do
   check "criterion 4: $h byte-identical" cmp "$repo/docs/$h" "$dist/$h"
 done
 

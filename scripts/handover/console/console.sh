@@ -18,7 +18,9 @@
 # CONSOLE_FILL_PERCENT, CONSOLE_TEMPLATE_DIR, CONSOLE_WORK_DIR (default:
 # $XDG_RUNTIME_DIR/himmel-console when set and owned by this uid, else
 # ${TMPDIR:-/tmp}/himmel-console-<uid>; an override is validated the same as
-# the default — see below), CONSOLE_HEADED_ARM,
+# the default — see below), CONSOLE_HEADED_ARM, ACTION_ZERO_SCRIPT (the
+# action-zero.sh that `next` pre-computes into the successor doc),
+# ACTION_ZERO_SECS (its bound, default 300),
 # CONSOLE_ARM_FOREGROUND (test seam: run the arm in the foreground instead of
 # detaching it).
 # Flag seams: --name (both commands; on next it selects which console
@@ -1596,6 +1598,36 @@ seed_live_fields() {
     mv "$doc.seed" "$doc"
 }
 
+# ACTION ZERO steps 2-6 run here, so the successor verifies their results
+# instead of spending turns on them. Read-only: the successor acquires its own
+# lock (step 8, --lock-only). The DOC section is dropped, the doc carries its
+# own Live state, and so is C29: it must see the successor's own session,
+# which does not exist yet. A failing run, or one cut at ACTION_ZERO_SECS
+# (default 300), leaves an unavailable line, never stops next.
+precompute_action_zero() {
+    local doc="$1" az="${ACTION_ZERO_SCRIPT:-$kit/action-zero.sh}" out arc=0 tb
+    tb="$(bash -c '. "$1" >/dev/null 2>&1; printf %s "$_TIMEOUT_BIN"' _ "$HERE/../../lib/timeout-bin.sh" 2>/dev/null)" # swallow-ok: no timeout binary = an unbounded run
+    out="$(${tb:+"$tb" -k 2 "${ACTION_ZERO_SECS:-300}"} bash "$az" --doc "$doc" --root "$root" --prefix "$prefix" --repo "$repo" 2>&1)" || arc=$?
+    out="$(printf '%s\n' "$out" | awk '/^== (DOC|C29)$/ { s = 1; next } /^== / { s = 0 } !s')"
+    [ "$arc" -eq 0 ] || out="$out
+unavailable (action-zero.sh exited $arc): run it yourself"
+    AZ_BLOCK="### Pre-computed by console.sh next at $(date -u +%Y-%m-%dT%H:%MZ)
+
+Steps 2–6 ran when \`next\` wrote this doc: verify these results, do not re-run them.
+Re-run action-zero.sh only if they are over 15 minutes old or a section reads
+unavailable. C29 is left out (it must see your own session): run it in the
+same batch as step 8, which is one call each:
+\`bash \"$repo/scripts/himmel-doctor.sh\" --only C29\`
+\`timeout 90 bash \"$kit/action-zero.sh\" --doc \"$doc\" --root \"$root\" --acquire --lock-only\`
+
+\`\`\`text
+$out
+\`\`\`" awk '{ print } !d && /^## ACTION ZERO/ { print ""; print ENVIRON["AZ_BLOCK"]; d = 1 }
+        END { if (!d) { print ""; print ENVIRON["AZ_BLOCK"] } }' "$doc" > "$doc.az" \
+        || { rm -f "$doc.az"; err "could not write the pre-computed ACTION ZERO into $doc"; return 0; }
+    mv "$doc.az" "$doc"
+}
+
 cmd_next() {
     [ -f "$console_template" ] || { err "missing template $console_template"; exit 2; }
     [ -f "$handoff_template" ] || { err "missing template $handoff_template"; exit 2; }
@@ -1778,6 +1810,7 @@ cmd_next() {
         MODEL "$model" \
         PROJECT "$project_doc_value"
     seed_live_fields "$doc" "$predecessor_live_state"
+    precompute_action_zero "$doc"
 
     echo "doc: $doc"
     echo "session: $session"

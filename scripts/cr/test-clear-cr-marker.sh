@@ -1842,6 +1842,7 @@ cmd=${cmd//<finding-id>/codex-1}
 cmd=${cmd//<TICKET>/HIMMEL-1327}
 cmd=${cmd//<escape|hardening|polish>/hardening}
 cmd=${cmd//<why it is out of scope here>/pre-existing}
+cmd="$cmd --set class=new:hint-fixture"
 _amend_rc=0
 _amend_out=$(cd "$tmp" && HIMMEL_REPO="$tmp" bash -c "$cmd" 2>&1) || _amend_rc=$?
 if [ "$_amend_rc" -eq 0 ]; then pass; else fail "printed amend hint runs end-to-end (rc=$_amend_rc): $_amend_out"; fi
@@ -2714,7 +2715,7 @@ rm -rf "$tmp"
 # with no branch stamp is exempt. Only r2 carries a record.
 sweep_fixture
 append_ledger "$tmp" "8l defer r1" amend --head "$_r1" --id r1 --set verdict=deferred \
-    --set deferred_to=HIMMEL-9 --set fu_class=hardening --set reason="out of scope" --reason "deferred after review"
+    --set deferred_to=HIMMEL-9 --set fu_class=hardening --set class=new:sweep-fixture --set reason="out of scope" --reason "deferred after review"
 printf '{"kind":"finding","head":"%s","model":"codex","finding_id":"legacy","severity":"imp","file":"a.sh","line":5,"verdict":"agreed"}\n' "$_r1" >> "$tmp/.git/cr-critic-scores.jsonl"
 write_sweeps "$tmp" "SWEEP [r2@$_tip] class=typo :: single-site search=git grep -n teh -- a.sh b.sh c.sh"
 run_clear "$tmp" 0 "8l deferred-after-agreed and legacy unstamped rows need no sweep -> exit 0"

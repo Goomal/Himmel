@@ -9,7 +9,7 @@ vi.mock('../breadcrumb.js', () => ({ writeJiraBreadcrumb: vi.fn() }));
 
 import { projectKey, request } from '../client.js';
 import { admissionBudget } from '../release/leaks.js';
-import { registerRelease, renderState } from './release.js';
+import { judgeEnv, parseDecisions, registerRelease, renderState } from './release.js';
 
 let out: string[];
 let root: string;
@@ -99,6 +99,35 @@ describe('jira release (HIMMEL-6796)', () => {
     vi.stubEnv('HIMMEL_CONSOLE_LEG', '1');
     await expect(run('operator', 'declare', 'R1', '--versions', 'v1', '--decision', '1', '--verbatim-file', join(root, 'verbatim.txt')))
       .rejects.toThrow(/console-spawned leg/);
+  });
+});
+
+describe('jira release rm-run (HIMMEL-7201)', () => {
+  it('prints nothing pending on an empty queue and makes no judge call', async () => {
+    await run('operator', 'declare', 'R1', '--versions', 'v1', '--decision', '1', '--verbatim-file', join(root, 'verbatim.txt'));
+    await run('rm-run', 'R1', '--mirror-root', join(root, 'no-mirror'));
+    expect(out.at(-1)).toBe('RM-RUN R1: nothing pending');
+  });
+
+  it('reads the decisions out of the claude JSON envelope and refuses a failed call', () => {
+    const d = { req: 'Q-R1-0001', outcome: 'ADMIT', op: 'add', from: null, to: 'v1', sector: 's', ground: 'g', reason: 'r' };
+    expect(parseDecisions(JSON.stringify({ is_error: false, result: '```json\n' + JSON.stringify([d]) + '\n```' }))).toEqual([d]);
+    expect(() => parseDecisions(JSON.stringify({ is_error: true, result: 'overloaded' }))).toThrow(/nothing ruled/);
+    expect(() => parseDecisions(JSON.stringify({ is_error: false, result: '{"req":"x"}' }))).toThrow();
+    expect(() => parseDecisions(JSON.stringify({ is_error: false, result: '[null]' }))).toThrow(/nothing ruled/);
+    for (const bad of [{ authority: 'foo' }, { op: 'grow' }, { sector: 3 }, { to: undefined }, { supersedes: 'R-1' }]) {
+      expect(() => parseDecisions(JSON.stringify({ is_error: false, result: JSON.stringify([{ ...d, ...bad }]) }))).toThrow(/nothing ruled/);
+    }
+    expect(parseDecisions(JSON.stringify({ is_error: false, result: JSON.stringify([{ ...d, authority: 'operator', ref: 'O-1', supersedes: ['R-1'] }]) })))
+      .toHaveLength(1);
+  });
+
+  it('the judge call does not inherit the calling session markers', () => {
+    expect(judgeEnv({
+      PATH: '/bin', CLAUDECODE: '1', CLAUDE_CODE_ENTRYPOINT: 'cli', AI_AGENT: 'x', HOME: '/h', CLAUDE_PROJECT_DIR: '/repo',
+      HIMMEL_CONSOLE_LEG: '1', HIMMEL_CONSOLE_DOC: '/d.md', HIMMEL_RELEASE_MANAGER: '1', HIMMEL_RM_DOC: '/r.md', HIMMEL_LEG_ID: 'N1', // old-term-ok: a sample of the env prefix judgeEnv drops
+      ANTHROPIC_API_KEY: 'k', anthropic_base_url: 'u', CLAUDE_CODE_USE_BEDROCK: '1', HIMMEL_RELEASE_STATE_DIR: '/s',
+    })).toEqual({ PATH: '/bin', HOME: '/h', HIMMEL_RELEASE_STATE_DIR: '/s' });
   });
 });
 

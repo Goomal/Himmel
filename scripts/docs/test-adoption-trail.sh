@@ -302,6 +302,68 @@ else
   bad "the page requests a third-party resource when opened (fonts.googleapis.com, gstatic, a CDN)" "$ext_loads"
 fi
 
+# --- 4. FIRST PROTECTED PROJECT ----------------------------------------------
+# The quickstart, the trial and the install guide are one sequence.
+# On a clean machine the install leaves its files untracked, so a worktree cut
+# before the install is committed lacks the hooks and the edit guard. The order
+# is pinned here, counts come from the install manifest, and no page promises
+# a wall-clock time nobody measured.
+GS="$ROOT/docs/getting-started.md"
+INST="$ROOT/docs/setup/install.md"
+MANIFEST="$ROOT/scripts/install/manifest.json"
+
+core_n="$(jq '[.items[] | select(.profiles | index("core"))] | length' "$MANIFEST")"
+all_n="$(jq '.items | length' "$MANIFEST")"
+if grep -q -E "\b${core_n} items\b" "$INST" && grep -q -E "all.{0,2} \(${all_n} items\)" "$INST"; then
+  ok "install.md profile counts match the manifest (core ${core_n}, all ${all_n})"
+else
+  bad "install.md profile counts drifted from scripts/install/manifest.json (core ${core_n}, all ${all_n})"
+fi
+
+# first line number of a pattern in a file, 0 when absent
+line_of() { grep -n -E -m1 -e "$1" "$2" | cut -d: -f1; }
+for pg in "$GS" "$PAGE"; do
+  name="$(basename "$pg")"
+  k="$(line_of 'git commit -m "chore: install himmel' "$pg")"
+  c="$(line_of 'git merge --ff-only' "$pg")"
+  w="$(line_of 'scripts/worktree\.sh feat/try-himmel' "$pg")"
+  if [ -n "$k" ] && [ -n "$c" ] && [ -n "$w" ] && [ "$k" -lt "$c" ] && [ "$c" -lt "$w" ]; then
+    ok "$name commits and merges the install before it creates the worktree"
+  else
+    bad "$name must commit, merge, then create the worktree (commit line '${k:-none}', merge line '${c:-none}', worktree line '${w:-none}')"
+  fi
+done
+
+for pg in "$GS" "$INST" "$PAGE"; do
+  name="$(basename "$pg")"
+  if grep -q -E 'uninstall --yes' "$pg"; then
+    ok "$name gives the non-interactive undo as uninstall --yes"
+  else
+    bad "$name never shows uninstall --yes (a bare uninstall aborts without a terminal)"
+  fi
+  if grep -q -E 'TICKET_ID_REQUIRED=0' "$pg"; then
+    ok "$name states the ticket-reference prerequisite and its opt-out"
+  else
+    bad "$name never says the installed commit gate wants a ticket reference (or TICKET_ID_REQUIRED=0)"
+  fi
+done
+
+time_re='≈ ?[0-9]+ ?min|about (\*\*)?15 minutes|~15 minutes|in about 15 minutes|15-minute walkthrough|First 5 minutes|first 5 minutes|[Ff]ive-minute'
+if ! printf 'about **15 minutes\n' | grep -q -E "$time_re"; then
+  bad "the time-promise matcher no longer matches its own positive control"
+fi
+if ! printf 'The setup takes about 15 minutes\n' | grep -q -E "$time_re"; then
+  bad "the time-promise matcher misses a plain-text about 15 minutes promise"
+fi
+promised="$(grep -n -E "$time_re" "$GS" "$PAGE")" && grep_rc=0 || grep_rc=$?
+if [ "$grep_rc" -gt 1 ]; then
+  bad "grep failed (rc=$grep_rc) while scanning for time promises"
+elif [ "$grep_rc" -eq 0 ]; then
+  bad "unmeasured time promises on first-run pages" "$(printf '%s\n' "$promised" | cut -c1-110)"
+else
+  ok "no first-run page promises an unmeasured elapsed time"
+fi
+
 echo
 printf '%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

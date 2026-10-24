@@ -112,9 +112,12 @@ bash ~/himmel/scripts/adopt.sh --profile core --scope project --dry-run   # prin
 2. Read the closing status table: each step reports `updated`, `up-to-date`,
    `skipped`, `failed` or `not-attempted`, and a **DRIFT** block names anything
    the installer could not converge, each with a remedy line.
-3. If the graphify pin sync skipped because a Claude session was live, run
+3. Read the `.env migration` block: it shows where each `.env` key would go
+   and asks `Move these keys now (backup first)? [y/N]`; after a move it names
+   the backup path and the restore command ([detail](#the-env-migration)).
+4. If the graphify pin sync skipped because a Claude session was live, run
    `bash ~/himmel/scripts/himmel-update.sh --graphify-only` once none is.
-4. **Project scope only:** from the project root, re-run the install without
+5. **Project scope only:** from the project root, re-run the install without
    `--dry-run`. Each copy it replaces is backed up under the install's
    provenance directory (`provenance-backups/`). Commit the result through a
    branch and PR, as you committed the install
@@ -124,7 +127,7 @@ bash ~/himmel/scripts/adopt.sh --profile core --scope project --dry-run   # prin
    bash ~/himmel/scripts/adopt.sh --profile core --scope project
    ```
 
-5. Read the release notes for the version you landed on: a one-time
+6. Read the release notes for the version you landed on: a one-time
    migration or a moved config field is carried there, not here.
 
 ## Verify
@@ -153,6 +156,16 @@ release yet reads `n/a` and does not change the exit code. Then:
   that step alone, then each later step that reported `not-attempted`, for example
   `bash ~/himmel/scripts/himmel-update.sh --only marketplace`
   ([the step names](#machine-local-catch-up)).
+- **The .env migration failed its check.** `.env` is unchanged: each
+  `MISMATCH <key> (<reader>)` line names a reader that sees a different value
+  after the move, or a value `~/.himmel` already holds that differs from
+  `.env`. Make them agree, then run
+  `bash ~/himmel/scripts/himmel-update.sh --only env_migration`.
+- **You want the old `.env` back.** Run the `restore:` command the migration
+  printed (`cp <backup> <your .env>`). After a move that passed its check,
+  the copies in `~/.himmel` can stay: they hold the same values. After a
+  `MISMATCH` on a value `~/.himmel` already held, restoring `.env` does not
+  change that value: make the two agree yourself.
 - **The pull refused a dirty tree.** Commit or stash, then re-run. To keep
   local tracked diffs on purpose, autostash them for one run:
   `HIMMEL_UPDATE_AUTOSTASH=1 bash ~/himmel/scripts/himmel-update.sh`. If the
@@ -313,6 +326,9 @@ non-zero. There is no rollback or atomicity: items that already succeeded
 before the failure are **not** undone; only the not-yet-attempted items are
 skipped.
 
+After a clean chain the **.env migration** runs; see
+[below](#the-env-migration).
+
 After the chain (win or lose, these never abort and always run,
 including on a chain failure), six **best-effort advisory
 steps** run: a codex plugin re-sync, a
@@ -327,6 +343,59 @@ block drift checks, and a **retired-plugin removal offer** (`scripts/machine-set
 response-compression plugin is absent; on a TTY it asks `Remove now? [Y/n]`
 with the default being remove; a non-interactive run prints the advisory and
 the two manual commands and removes nothing).
+
+### The .env migration
+
+`.env` holds secrets only; behaviour and policy keys live in `~/.himmel`
+([layer table](../internals/config-layers.md)). After a clean chain the update
+moves himmel's own `.env` items: the keys `.env.example` names (commented or
+not) and the behaviour and gate-policy keys. Any other key belongs to another
+tool and stays where it is. An update `--check` previews the step and
+`--only env_migration` runs it alone.
+
+The step is `scripts/setup/migrate-env.sh`;
+`bash ~/himmel/scripts/setup/migrate-env.sh --dry-run` prints the plan
+without the rest of the update. It prints key names only, never values.
+
+An apply, from the update or run by hand, always prints the plan and the
+backup path first, then asks `Move these keys now (backup first)? [y/N]`.
+Only `y` moves anything; any other answer, Enter included, skips the step and
+prints the command to run later. With no terminal to answer at (piped input,
+a cron job, a hook) it moves nothing, prints that command and exits 3.
+
+1. **Plan.** One line per `.env` key: a behaviour key goes to
+   `~/.himmel/himmel.conf`, a gate-policy key to `~/.himmel/config.json`
+   `.policy`, a himmel secret nothing in himmel reads to
+   `~/.config/secrets/himmel.env` (mode 600). A himmel secret a himmel file
+   still reads `stays (read by <file>)`; if the readers cannot be searched,
+   every himmel secret stays. Any other key reads
+   `stays (not himmel's, left in place)`.
+2. **Backup.** `.env` is copied to `~/.himmel/env-backups/env.<UTC time>.<pid>`,
+   mode 600, before anything else is written; the path is printed.
+3. **Copy.** Each key is copied to its new place. A key already set there is
+   left alone.
+4. **Check.** The real readers run twice, once with the keys only in `.env`
+   and once with them only in their new place: the shell `load_dotenv` and
+   `load_policy`, the Jira CLI's config, handover-root and release-state
+   readers, and the lanes resolver. Every gate-policy key is compared, moved
+   or not. Any difference, or a reader that fails, prints
+   `MISMATCH <key> (<reader>)` (or a `verify:` line) and no line is removed
+   from `.env`.
+5. **Remove.** Only after the check passes are the moved lines removed from
+   `.env`. Comments and the keys that stay are kept, and so is the file's mode.
+
+The report ends with the restore command (`cp <backup> <your .env>`) and an
+`rm` for the backup: remove it once you are happy, since it holds your secrets.
+
+- **Keep-list.** To keep a himmel secret in `.env` for a reader outside this checkout
+  (a station script, another tool), put its name in `~/.himmel/env-keep.txt`,
+  one per line; `#` starts a comment. Names only, never values. Behaviour and
+  gate-policy keys always move.
+- **Inside Claude Code** (`/himmel-update`), an agent may not write
+  `~/.himmel/config.json`, so the step prints the plan and the command to run
+  at your own prompt, writes nothing, and its status row reads `pending`.
+- The secrets store is one mode-600 file for now; a keyring store replaces it
+  once that ships.
 
 ### Release channels
 

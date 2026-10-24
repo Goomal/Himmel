@@ -127,8 +127,24 @@ seeded only when absent; your existing trust list is never overwritten. Until
 that list is on your default branch, the gate refuses every merge from a
 session that loads the new settings, including the adoption PR. The operator
 must merge that first adoption PR outside Claude, using the forge web UI or
-their own terminal; no agent session merges it. Afterward, any PR touching a
-listed trust path requires a trust-reviewed GO.
+their own terminal; no agent session merges it.
+
+A **trust path** is a file that decides whether other changes are safe: your
+merge gate, your hooks, your CI checks and the list itself. A change to one can
+switch a safety check off, so the agent that wrote it may not approve it. The
+list lives in `scripts/ci/ci-trust-paths.txt` on your default branch (the copy
+on a PR branch is never read); add any file that guards your project, such as
+deploy scripts or release config. Inside a Claude session, a PR touching a
+listed path needs a trust-reviewed GO, and a project that adopted himmel has no
+signer for that GO yet, so such a PR does not merge from a session: the
+operator merges it in the forge web UI or with a raw `gh pr merge`, which bypass `merge-on-green.sh`.
+
+These checks run only inside Claude sessions (the hooks) and in himmel's merge
+script (`merge-on-green.sh`) wherever it is run.
+A merge made another way, in the forge web UI or with a raw
+`gh pr merge`, bypasses them and is not checked. To enforce the list on the
+forge too, turn on the optional branch rules (CODEOWNERS and a required review
+for the listed paths; tracked in HIMMEL-3897).
 
 ## Verify
 

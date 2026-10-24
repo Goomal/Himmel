@@ -4530,12 +4530,21 @@ LIVEMSGS
     exit 2
   fi
 
-  if [ "$rc" -ne 0 ] && [ "$capped" -eq 0 ] && [ "$live_fail" -eq 0 ] && [ "$_attempt" -eq 1 ] && ! _suite_no_retry "$suite"; then
-    printf '[RETRY] %s failed (rc=%s); re-running it once\n' "$suite" "$rc"
+  # A cap overrun is retried too: on a loaded runner it is as likely slowness as
+  # a defect, and one rerun in the same job costs less than a red main.
+  if [ "$rc" -ne 0 ] && [ "$live_fail" -eq 0 ] && [ "$_attempt" -eq 1 ] && ! _suite_no_retry "$suite"; then
+    if [ "$capped" -eq 1 ]; then
+      # The rerun counts it again if it overruns again: one suite, one TIMED OUT.
+      timed_out=$((timed_out - 1))
+      printf '[RETRY] %s exceeded its %ss cap; re-running it once\n' "$suite" "$suite_timeout"
+    else
+      printf '[RETRY] %s failed (rc=%s); re-running it once\n' "$suite" "$rc"
+    fi
     echo '----- first attempt, last 40 lines -----'
     tail -n 40 "$log" | sed 's/^/    /'
     echo '--------------------------'
     first_rc=$rc
+    first_capped=$capped
     first_log="$log"
     _attempt=2
     continue
@@ -4550,6 +4559,10 @@ LIVEMSGS
   if [ "$rc" -eq 0 ] && [ "$_attempt" -eq 2 ] && _log_has_skip_line "$log"; then
     printf '[RETRY-SKIP] %s retry exited 0 only through a SKIP line; keeping the first failure (rc=%s)\n' "$suite" "$first_rc"
     rc=$first_rc
+    if [ "$first_capped" -eq 1 ]; then
+      capped=1
+      timed_out=$((timed_out + 1))
+    fi
   fi
   ran=$((ran + 1))
   manifest_add "ran $rc ${mf_rel:-}"

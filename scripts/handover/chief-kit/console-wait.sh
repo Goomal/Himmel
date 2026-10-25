@@ -69,6 +69,8 @@
 #                               back; the block carries succession-tracker.sh's table
 #                               and the printed append-results.sh line for the LIVE
 #                               bullet. Once, and it prints only: nothing is sent.
+#                               An informational tally: LIVE follows the predecessor's
+#                               `RELAYED <n> of <m>`, not this wake.
 #   WAKE succession partial <k/n> silent <T> min   the tally stayed short for
 #   <tracker output>            --silent-min T minutes (default 20); the table names
 #                               the legs still out. Once. CHIEF_WAIT_SUCCESSION_SEC
@@ -199,8 +201,10 @@
 #   <inbox>.relay-on-live  (`console.sh next --relay-on-live`; needs --doc) line 1 the
 #                        successor session, line 2 its doc. When that doc's queue lock
 #                        is held fresh the waiter prints one `WAKE relay-on-live
-#                        successor=<s>` block (relay-batch.sh's output), removes the
-#                        marker and exits 0. It works in handover mode. Seams:
+#                        successor=<s>` block (relay-batch.sh's output, ending with
+#                        `RELAYED <n> of <m>`: n counts the SENDMESSAGE lines, so the
+#                        console sends those first, then RELAYED to the successor,
+#                        whose LIVE follows it), removes the marker and exits 0. It works in handover mode. Seams:
 #                        CHIEF_WAIT_LOCK_STATUS, CHIEF_WAIT_RELAY (tests).
 #
 # Exit: 0 = a WAKE block was printed; 1 = the inbox could not be drained;

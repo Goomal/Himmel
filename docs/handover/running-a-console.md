@@ -523,14 +523,21 @@ notice record prints only `BUS-RELAY-FAIL`: that worker already has its inbox re
 worker in the fleet manifest but missing from Live state prints `NOT-IN-LIVE-STATE` when
 its record fails, when the chief has no bus identity, when it is a claudex worker, or
 when its session does not resolve: relay it by hand if it is live. `SKIPPED`, `UNRESOLVED` and
-`UNRESOLVED-LANE` lines sent nothing: each needs a relay by hand. `BUS-RELAY <label> ok` means the bus stored the record, not that the
+`UNRESOLVED-LANE` lines sent nothing: each needs a relay by hand. So does a `FAILED-INBOX` line (its claudex inbox send
+failed). `BUS-RELAY <label> ok` means the bus stored the record, not that the
 worker saw it: delivery needs the worker's `HIMMEL_BUS_NAME` hooks, so the
 successor's `WAKE succession partial` is the backstop for one that never quotes back. The worker
 session's quote-back is the `SUCCESSION accepted` Results bullet in its own doc (the successor's
 waiter tallies it); it sends a `SendMessage` only on a timeout or a decline. That run is the
 relay: never re-run it (a retry resends the claudex inbox relays). It never carries a fresh
 token, and a relay with none is complete (the worker keeps its own): native and claudex
-workers are not rotated on a bus succession.
+workers are not rotated on a bus succession. It prints `RELAYED <n> of <m>` last, and n
+counts its `SENDMESSAGE` lines: send those relays first, then that line to the successor,
+naming every worker still unrelayed (n alone does not say which). A batch that fails or
+times out (`WAKE relay-on-live ... relay-failed rc=<n>`) prints its partial output and no
+`RELAYED` line. On `relay-failed`, relay by hand every worker with no `BUS-RELAY <label> ok` or `SENT-INBOX` line,
+then send `RELAYED <n> of <m>` yourself, n the delivered lines.
+The quote-backs are the successor's to tally; you do not wait for them.
 A successor that arrives after you have left can prove itself only with the
 two-token chain form; a worker that cannot verify that is stranded (it keeps
 working and can still be merged, but cannot be re-scoped). The successor's
@@ -539,10 +546,14 @@ accepted` bullet names the successor (`RELAYED:<leg>`, a relay that kept the
 worker's token, is valid) or the worker has rotated.
 
 **Release your lock only after the successor reports `LIVE`.** It sends that
-only after the quote-backs (or with the workers that did not quote back named,
-and why: ACTION ZERO step 9), and it is the only evidence the arm actually fired
+once your `RELAYED` line arrives (naming the workers you could not relay, and
+why: ACTION ZERO step 9), and it is the only evidence the arm actually fired
 and the successor completed ACTION ZERO; releasing on the `touch` alone leaves
-an unattended fleet if the launch failed.
+an unattended fleet if the launch failed. Relay each worker it names as not relayed by
+hand before you wrap. A relay delivered is enough: a worker
+drains it at its next tool round whether you are live or gone (S1), so you wrap
+without waiting for the quote-backs; workers that did not quote back are named
+on the successor's informational `WAKE succession partial`.
 
 **Wrap only with no subagent still running**. An in-process
 subagent, a judge subagent above all, dies with its parent session and its verdict

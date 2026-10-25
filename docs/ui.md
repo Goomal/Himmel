@@ -11,8 +11,8 @@ they almost always mean the first one.
 | Surface | What it is | Start it | Needs |
 |---|---|---|---|
 | Config UI | One local web app: Settings, Setup, Health, Tool health, Fleet, Roadmap pages and the AG-UI run view | `node scripts/himmelctl/bin.js ui` | `bun`, a terminal outside Claude |
-| Chief's board | One generated HTML page: the fleet, each worker's phase, what needs the chief | `node scripts/handover/console-kit/board.mjs --doc <console doc> --changed` | a running himmel chief |
-| Roadmap tracker | One generated HTML page: release panels and a kanban by version | `python3 scripts/handover/console-kit/tracker.py --plan-dir <dir> --out <file>` | `python3`, the Jira mirror |
+| Chief's board | One generated HTML page: the fleet, each worker's phase, what needs the chief | `node scripts/handover/chief-kit/board.mjs --doc <console doc> --changed` | a running himmel chief |
+| Roadmap tracker | One generated HTML page: release panels and a kanban by version | `python3 scripts/handover/chief-kit/tracker.py --plan-dir <dir> --out <file>` | `python3`, the Jira mirror |
 
 ## The config UI (`himmelctl ui`)
 

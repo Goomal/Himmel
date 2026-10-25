@@ -4,7 +4,7 @@ The document a chief writes to dispatch one worker (see
 [`../glossary.md`](../glossary.md)). File it in the chief's bucket as
 `<TICKET>-N<k>-<slug>-<date>-RESUME.md` (e.g.
 `HIMMEL-3269-N191-scorecard-discovery-2026-09-20-RESUME.md`), and hand its path
-to `console-kit/headed-arm-leg.sh` as the worker's handover doc with the session
+to `chief-kit/headed-arm-leg.sh` as the worker's handover doc with the session
 name `<TICKET>-N<k>-<slug>` — the doc name minus `-<date>-RESUME.md`. The worker's
 **label** is `N<k>`: it is what a chief writes in its `## Live state`
 `legs:` line and what `tick.sh` prints. One derivation owns the mapping between
@@ -34,7 +34,7 @@ profiles cannot be members. A worker that needs a skill outside its fixed profil
 asks its chief for a read-only consult instead (`CONSULT <list> :: <question>
 :: read: <paths>`, see `worker-preface.md`); the chief launches it with
 `headed-arm-leg.sh --consult --profile <list> --console <name> …` and relays the
-answer back with `console-kit/consult-relay.sh <consult-doc> <asker>`.
+answer back with `chief-kit/consult-relay.sh <consult-doc> <asker>`.
 Claudex briefs no longer paste the coordination paragraph: `--lane claudex`
 always appends [`leg-preface-claudex.md`](leg-preface-claudex.md).
 
@@ -136,7 +136,7 @@ template_version: 3
 
 > **Contract:**
 > 1. LIVE; paste `git log -1 --format=%H` and the base-ancestor check. Write
->    the bullet with `scripts/handover/console-kit/append-results.sh <doc>
+>    the bullet with `scripts/handover/chief-kit/append-results.sh <doc>
 >    "LIVE ..."` (worker-preface.md), never the Edit tool. A bullet never
 >    contains `>`; write `→` or `to`. The LIVE bullet moves the
 >    ticket to In Progress and the PR open to In Review, by script
@@ -175,7 +175,7 @@ template_version: 3
 >    (a review-evidence append was refused as Instruction Poisoning and the
 >    worker sat BLOCKED for an hour, HIMMEL-4097), so `gen-briefs.py` ends its
 >    Ship step at `READY <pr> <head> GREEN`. The chief merges
->    (`console-sections/merges.md`) and sends `MERGED #<pr> → <sha>`; the worker
+>    (`chief-sections/merges.md`) and sends `MERGED #<pr> → <sha>`; the worker
 >    then `cd`s out and wraps. `completes-ticket:` still decides the chief's
 >    `--jira-transition`. A hand-written claudex brief says the same.
 >    **The PR body carries a `## Ticket coverage` section**: one list line per ask of each cited ticket, each ending
@@ -242,7 +242,7 @@ template_version: 3
 | Explicit do-nots | Scope widens into a neighbouring worker's files and the fan-out collides. |
 | `description:` line (required) | A worker is named everywhere by its label and ticket (`N1452`, `PROJ-123`), which says nothing about what it is doing, least of all with no tracker or forge to fetch a title from. The front-matter line is the one plain-language description a surface shows NEXT TO the label (never instead: tooling keys on the label); `leg_description` in `scripts/lib/leg-identity.sh` is its only reader. `brief-lint.sh` fails a fresh brief with no line or the `<placeholder>`, and `headed-arm-leg.sh` refuses the launch (no flag skips it). A doc whose `## Results` already holds a bullet has run, so it resumes without one. |
 | Prior art line (required) | In the 7 days to 2026-10-06 the qmd query tool was called 93 times, 85 of them by 16 of 565 workers and none by a chief or judge: nothing in the brief asked for retrieval, so work was re-derived or duplicated (audit; graphify non-adoption was measured before). The chief runs the retrieval once at dispatch and every worker inherits it. `brief-lint.sh` fails a missing, empty, placeholder or bare `none` line (`none found (<query>)` passes) and `headed-arm-leg.sh` refuses the launch unless `--no-prior-art-check` is passed. |
-| Exemplar line (optional) | A worker told only to "add a gate" copies the nearest older gate, which may be the stale shape. Naming the one file that shows the paved path (e.g. `scripts/hooks/check-unchecked-mktemp.sh`, `scripts/handover/console-kit/test-ready-check.sh`) makes the worker imitate that. Instructional only, no validator: judge it by drift before anyone gates it. |
+| Exemplar line (optional) | A worker told only to "add a gate" copies the nearest older gate, which may be the stale shape. Naming the one file that shows the paved path (e.g. `scripts/hooks/check-unchecked-mktemp.sh`, `scripts/handover/chief-kit/test-ready-check.sh`) makes the worker imitate that. Instructional only, no validator: judge it by drift before anyone gates it. |
 | The standing preface | Every rule the brief no longer repeats — reporting, RETASK asymmetry, RED-first, trailers in the first commit, GO-gated merge, the fill ceiling. It is injected by `--profile`, so a brief that omits it AND uses `--no-profile` is a worker running on vibes (a launch with neither is refused). |
 | `completes-ticket:` line | `merge-on-green.sh` closes the ticket only on `--jira-transition` (opt-in, because a default closes multi-PR tickets early). Without the line every worker guesses whether its PR finishes the ticket: in one shift six bare merges did not close their tickets and five were closed by hand (HIMMEL-3271). It is a per-brief decision, never a default. |
 | Pre-granted follow-ups block (optional) | A mid-flight ruling that widens scope reads to an auto-mode classifier as instruction poisoning: claudex workers refused five token-quoting expansions on 2026-10-02 (HIMMEL-4097). A ruling that only selects scope the dispatch already wrote down widens nothing, so the worker can verify it against its own system prompt. |

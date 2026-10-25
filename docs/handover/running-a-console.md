@@ -121,7 +121,7 @@ and tells its predecessor it is live.
 
 It also opens a **Telegram inbox**: it creates
 `<bridge root>/consoles/<session>.md` and watches it with its one event waiter,
-`console-kit/console-wait.sh`, run with Bash `run_in_background` (no `Monitor` re-arm loop, so an idle chief takes no turns; a persisted read
+`chief-kit/console-wait.sh`, run with Bash `run_in_background` (no `Monitor` re-arm loop, so an idle chief takes no turns; a persisted read
 cursor means a line appended while no waiter ran is delivered on the next
 start; at-least-once, so a waiter killed mid-emit can repeat one line), so
 the operator's `/console <session> <text>` from
@@ -135,7 +135,7 @@ The same waiter **pages the operator** when a worker's classifier
 denials reach `SHIP-STEP` or `PAUSE-RISK`: one Telegram message with the worker
 label, count and class, and nothing else. A paged worker is then **refused** on
 re-dispatch (`headed-arm-leg.sh` exits 14) until someone has looked and run
-`bash scripts/handover/console-kit/ack-denial.sh <leg-label-or-doc>`;
+`bash scripts/handover/chief-kit/ack-denial.sh <leg-label-or-doc>`;
 `--ignore-denials` overrides. Detail:
 [`../internals/enforcement.md`](../internals/enforcement.md#log-classifier-denialsh--classifier-denial-tap-himmel-3724).
 
@@ -164,7 +164,7 @@ The chief writes a brief from
 [`worker-brief-template.md`](worker-brief-template.md) and launches it headed:
 
 ```bash
-setsid nohup bash scripts/handover/console-kit/headed-arm-leg.sh --profile leg-impl \
+setsid nohup bash scripts/handover/chief-kit/headed-arm-leg.sh --profile leg-impl \
   <session-name> <brief> <signal-file> <deadline-epoch> <log> <model> \
   >/dev/null 2>&1 &
 ```
@@ -242,11 +242,11 @@ and `capacity=`. On `capacity=UNDERFILLED:<slack>` (live below cap and no worker
 launched for `TICK_UNDERFILL_MIN` minutes, default 10), pull dispatchable work
 from the Jira backlog, not only the held queue, and launch up to `<slack>` workers.
 `console-wait.sh` wakes on it once per streak (`WAKE underfilled`) and prints
-`console-kit/next-dispatchable.sh --priority-pool-only`'s ranked, collision-checked
+`chief-kit/next-dispatchable.sh --priority-pool-only`'s ranked, collision-checked
 list (free slots fill from the priority pool; it ends with `# pool=<rows>/<slack>`, `,LOW`
 when short; `POOL-EMPTY` lists the tier-4 `NEXT-TIER` rows and means unblock
 collisions, draft specs for the next priority items, else idle);
-`console-kit/gen-briefs.py` writes the briefs and launchers (nothing launches
+`chief-kit/gen-briefs.py` writes the briefs and launchers (nothing launches
 itself). A bare `--bucket himmel` resolves to `<handover-root>/<user>/himmel`;
 `--no-worktree` refuses a worker whose worktree does not exist and prints the
 `worktree.sh new` line to run.
@@ -282,10 +282,10 @@ both the same way: `ListAgents`, then `SendMessage` the worker its lock command
 (`queue-lock.sh acquire <its doc>`), your chief name and its RETASK
 token; if it is gone, relaunch it.
 `tick.sh --legs-from <manifest>` reads the same absolute docs
-from a fleet manifest that `console-kit/fleet-manifest.sh add|remove` keeps,
+from a fleet manifest that `chief-kit/fleet-manifest.sh add|remove` keeps,
 re-read every sample, so a dispatch or wrap needs no waiter re-start.
 Pass `--fleet <manifest>` before the positional arguments to
-`console-kit/headed-arm-leg.sh` and `console-kit/close-wrapped-leg.sh` to keep
+`chief-kit/headed-arm-leg.sh` and `chief-kit/close-wrapped-leg.sh` to keep
 that manifest updated automatically: launch adds its doc only after a successful
 handoff; close removes its doc only on a successful close (including benign
 prune skips). Failed/refused launches and closes leave the manifest unchanged.
@@ -295,9 +295,9 @@ the launch/close already happened; it does not undo it. Nonces remain chief-only
 inputs to `live-state.sh --nonce`, never sourced from the manifest.
 
 A worker's `MERGED` or `WRAPPED` message is one call, not a turn sequence:
-`console-kit/leg-event.sh --doc <console doc> --fleet <manifest> <message-file>`
-routes it to `console-kit/wrap-merged.sh` and prints `HANDLED` or `ESCALATE
-<reason>`; a judge verdict is one `console-kit/verdict-go.sh` call. Chiefs that
+`chief-kit/leg-event.sh --doc <console doc> --fleet <manifest> <message-file>`
+routes it to `chief-kit/wrap-merged.sh` and prints `HANDLED` or `ESCALATE
+<reason>`; a judge verdict is one `chief-kit/verdict-go.sh` call. Chiefs that
 ran the hand sequences spent most of their input tokens on them
 (HIMMEL-5592 inventory: `scripts/eval/console-load-inventory.py`).
 
@@ -352,7 +352,7 @@ the chief's exact session name.
 
 Inbox delivery is **tool-call-gated**. Before ending a turn at BLOCKED,
 READY, PR-READY, or a blocking question/PROBE ask, the worker arms ONE bounded
-Monitor on `bash scripts/handover/console-kit/inbox-follow.sh --wake
+Monitor on `bash scripts/handover/chief-kit/inbox-follow.sh --wake
 <handover-root>/inbox/<session>.md`, with `timeout_ms: 1800000`. Resolve the
 root through `handover_root()` and use only the worker's own exact session name.
 The supported API has no persistent flag. The worker re-arms on expiry for at
@@ -394,7 +394,7 @@ A ruling sent to the wrong name is never delivered and raises no error, so run
 
 **A PR parked at the round-3 review cap gets one more review round from the chief,
 never from the worker**. Run
-`scripts/handover/console-kit/grant-round.sh <pr> <new-head> <qid>`. It grants
+`scripts/handover/chief-kit/grant-round.sh <pr> <new-head> <qid>`. It grants
 only on a signed judge record for that exact head, a PR that has reached the
 cap, a head that is still the PR's live head, and a qid no earlier grant
 consumed; one record buys one round. A worker or a relay is refused (exit 3). A
@@ -418,7 +418,7 @@ PRs) → it omits it. After `MERGED`, re-read the ticket: the flag closes only t
 first `[KEY]` of the PR title, so a multi-key PR needs its other ticket checked
 by hand.
 
-`scripts/handover/console-kit/ready-check.sh <pr> <full-40-hex-head-sha>`
+`scripts/handover/chief-kit/ready-check.sh <pr> <full-40-hex-head-sha>`
 mechanizes that independent verification: it re-runs checks
 1-6 (head match + clean merge state, statusCheckRollup all green, zero
 unresolved review threads, an automated review ledger row for that head, attestation
@@ -430,7 +430,7 @@ PR that is already `MERGED`, GitHub reports `mergeStateStatus: UNKNOWN`
 permanently, so check 1 always fails there; that is expected, not a bug, and
 the script's domain is a PR that has not yet merged.
 
-`scripts/handover/console-kit/ready-go.sh [--to <leg> --token <nonce>] [--ledger <console doc>] <pr> <sha>`
+`scripts/handover/chief-kit/ready-go.sh [--to <leg> --token <nonce>] [--ledger <console doc>] <pr> <sha>`
 is the whole mechanical READY turn in one call: the `ready-check.sh` output, the coverage line, the trust-path result, the ticket state and the exact GO line to send. It is read-only (no GO file, no message): `go.sh` and the SendMessage stay yours.
 
 The automated review ledger is keyed by head sha, so **every push needs its own review
@@ -448,7 +448,7 @@ found is not READY; for the general `GATE ... <status> <date>` shape (every
 ticket except 2973), a found line whose status is not PASS is also not READY.
 The chief pulls the primary and the worker wraps (closing its ticket only if the
 brief's `completes-ticket: yes` says the PR completes it).
-The chief sends the GO file (merge approval) by first running `bash scripts/handover/console-kit/go.sh
+The chief sends the GO file (merge approval) by first running `bash scripts/handover/chief-kit/go.sh
 <pr> <full head sha>`. The file IS the GO; the SendMessage is the
 notification: a worker launched by `headed-arm-leg.sh` carries
 `HIMMEL_CONSOLE_LEG=1`, and `merge-on-green.sh` refuses it (exit 17) without a
@@ -470,7 +470,7 @@ true in `scripts/guardrails/himmel-adapters.json` (read from the default branch,
 so a worktree edit cannot widen it) and the PR targets that entry's
 `himmel_branch`. Run the judge, then, from the primary checkout:
 
-1. `bash <anchor>/scripts/handover/console-kit/go.sh --repo <owner/repo> --trust-reviewed <judge-qid> <pr> <head>`
+1. `bash <anchor>/scripts/handover/chief-kit/go.sh --repo <owner/repo> --trust-reviewed <judge-qid> <pr> <head>`
    (exit 6 not allowlisted or the harness repo itself, 7 PR not OPEN, CLEAN and on the adapter branch at that head
    or a review thread still open, 5 no signed judge GO).
 2. `bash <anchor>/scripts/handover/merge-fork-pr.sh <owner/repo> <pr> <head>`
@@ -513,7 +513,7 @@ that `next --arm` printed and hand your live workers over by name.
 worker's brief names *you* as its chief, and a successor is a different session
 on a different socket: the successor names itself to you during its ACTION ZERO,
 you relay each worker to it from your own session, never by hand: `next` leaves a
-chief with a bus identity a `WAKE relay-on-live` (or run `console-kit/relay-batch.sh <this doc>
+chief with a bus identity a `WAKE relay-on-live` (or run `chief-kit/relay-batch.sh <this doc>
 --successor <it>`). That run sends each native worker one himmel-bus relay record naming
 the successor (the bus proves you sent it, so the record carries no token), and each claudex
 worker its inbox relay plus the bus record its `bus adopt` needs. A native record that
@@ -548,7 +548,7 @@ an unattended fleet if the launch failed.
 subagent, a judge subagent above all, dies with its parent session and its verdict
 with it. Wrap with `console.sh wrap <your doc> <release-token> '<line>'`: it
 writes `WRAPPED` and releases the lock, and refuses (exit 4, nothing written)
-while `console-kit/live-subagents.sh` finds a running child of this session or
+while `chief-kit/live-subagents.sh` finds a running child of this session or
 cannot tell. The successor's `close-wrapped-leg.sh --console` holds the same
 line from the outside: exit 7 means the predecessor still has a live subagent;
 retry once it finishes. Every judge subagent persists its verdict with
@@ -655,10 +655,10 @@ shell-unit shards. The chief drives them with one script, each form a bare
 relative literal pre-approved in `.claude/settings.json`:
 
 ```
-bash scripts/handover/console-kit/vm-runner.sh on            # both VMs
-bash scripts/handover/console-kit/vm-runner.sh on --vms 1    # or --vms 2
-bash scripts/handover/console-kit/vm-runner.sh off           # kill switch
-bash scripts/handover/console-kit/vm-runner.sh status
+bash scripts/handover/chief-kit/vm-runner.sh on            # both VMs
+bash scripts/handover/chief-kit/vm-runner.sh on --vms 1    # or --vms 2
+bash scripts/handover/chief-kit/vm-runner.sh off           # kill switch
+bash scripts/handover/chief-kit/vm-runner.sh status
 ```
 
 - `on` refuses (rc 3) unless the repo's fork-PR approval policy is

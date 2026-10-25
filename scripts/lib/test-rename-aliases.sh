@@ -105,7 +105,7 @@ while IFS= read -r want; do
 done <<EOF
 $V3_ROWS
 EOF
-LEFT="$(printf '%s\n' "$ROWS" | awk -F'\t' 'toupper($2) ~ /OVERNIGHT/ && $6 != "V3" { print $2 }' | tr '\n' ' ')"
+LEFT="$(printf '%s\n' "$ROWS" | awk -F'\t' 'toupper($2) ~ /OVERNIGHT/ && $6 != "V3" && $4 != "directory" { print $2 }' | tr '\n' ' ')"
 check "no overnight name left outside slice V3 ($LEFT)" "" "$LEFT"
 
 # --- slice V1a: every old name of the lift family names its usage successor ---
@@ -199,7 +199,7 @@ trap 'rm -rf "$FT"' EXIT
 forwards() {  # forwards <runner> <dir> <old> <new> <stub source>
   local runner="$1" dir="$2" old="$3" new="$4" src="$5" d out rc err
   d="$FT/$old"
-  [ "$old" = headed-arm-leg.sh ] && d="$FT/$old/handover/console-kit"
+  [ "$old" = headed-arm-leg.sh ] && d="$FT/$old/handover/chief-kit"
   mkdir -p "$d"
   check "$dir/$new exists" "yes" "$([ -f "$ROOT/$dir/$new" ] && echo yes || echo no)"
   cp "$ROOT/$dir/$old" "$d/$old" 2>/dev/null || { check "$dir/$old exists" "yes" "no"; return; }
@@ -323,7 +323,7 @@ while IFS= read -r want; do
 done <<EOF
 $V5A_ROWS
 EOF
-forwards bash scripts/handover/console console.sh chief.sh "$SH_STUB"
+forwards bash scripts/handover/chief console.sh chief.sh "$SH_STUB"
 # The launchers and the arm tests still source the old lib path, so it loads
 # the new file and stays silent.
 d="$FT/v5a-lib"
@@ -360,12 +360,12 @@ while IFS= read -r want; do
 done <<EOF
 $V4B_ROWS
 EOF
-forwards bash scripts/handover/console-kit headed-arm-leg.sh headed-arm-worker.sh "$SH_STUB"
-forwards bash scripts/handover/console-kit close-wrapped-leg.sh close-wrapped-worker.sh "$SH_STUB"
-forwards bash scripts/handover/console-kit leg-digest-step.sh worker-digest-step.sh "$SH_STUB"
-forwards bash scripts/handover/console-kit leg-event.sh worker-event.sh "$SH_STUB"
-forwards bash scripts/handover/console-kit leg-jira-status.sh worker-jira-status.sh "$SH_STUB"
-forwards bash scripts/handover/console-kit leg-pretrust.sh worker-pretrust.sh "$SH_STUB"
+forwards bash scripts/handover/chief-kit headed-arm-leg.sh headed-arm-worker.sh "$SH_STUB"
+forwards bash scripts/handover/chief-kit close-wrapped-leg.sh close-wrapped-worker.sh "$SH_STUB"
+forwards bash scripts/handover/chief-kit leg-digest-step.sh worker-digest-step.sh "$SH_STUB"
+forwards bash scripts/handover/chief-kit leg-event.sh worker-event.sh "$SH_STUB"
+forwards bash scripts/handover/chief-kit leg-jira-status.sh worker-jira-status.sh "$SH_STUB"
+forwards bash scripts/handover/chief-kit leg-pretrust.sh worker-pretrust.sh "$SH_STUB"
 forwards bash scripts/graphify leg-graph.sh worker-graph.sh "$SH_STUB"
 # The three sourced libraries load the new file from any cwd and stay silent.
 sources_alias() {  # sources_alias <dir> <old> <new>
@@ -381,12 +381,12 @@ sources_alias() {  # sources_alias <dir> <old> <new>
   check "$old prints nothing when sourced" "" "$(cat "$d/err")"
 }
 sources_alias scripts/lib leg-identity.sh worker-identity.sh
-sources_alias scripts/handover/console-kit leg-doc-lock.sh worker-doc-lock.sh
-sources_alias scripts/handover/console-kit leg-transcripts.sh worker-transcripts.sh
+sources_alias scripts/handover/chief-kit leg-doc-lock.sh worker-doc-lock.sh
+sources_alias scripts/handover/chief-kit leg-transcripts.sh worker-transcripts.sh
 stub marketplace/plugins/himmel-ops/commands/supervisor-session.md marketplace/plugins/himmel-ops/commands/chief.md
 stub marketplace/plugins/himmel-ops/commands/console.md marketplace/plugins/himmel-ops/commands/chief.md
 for a in supervisor-session console; do
-  check ".claude/commands/$a.md runs chief.sh" "yes" "$(grep -qxF -- "bash scripts/handover/console/chief.sh \$ARGUMENTS" "$ROOT/.claude/commands/$a.md" && [ -f "$ROOT/scripts/handover/console/chief.sh" ] && echo yes || echo no)"
+  check ".claude/commands/$a.md runs chief.sh" "yes" "$(grep -qxF -- "bash scripts/handover/chief/chief.sh \$ARGUMENTS" "$ROOT/.claude/commands/$a.md" && [ -f "$ROOT/scripts/handover/chief/chief.sh" ] && echo yes || echo no)"
   check "himmel-ops $a.md runs /himmel-ops:chief" "yes" "$(grep -qF -- "\`/himmel-ops:chief \$ARGUMENTS\`" "$ROOT/marketplace/plugins/himmel-ops/commands/$a.md" && echo yes || echo no)"
 done
 
@@ -649,9 +649,9 @@ if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     ':!*.md' \
     ':!scripts/lib/rename-aliases.tsv' ':!scripts/lib/test-rename-aliases.sh' \
     ':!scripts/docs/check-old-terms.sh' ':!scripts/docs/test-check-old-terms.sh' \
-    ':!scripts/handover/console-kit/test-headed-arm-leg-worker-env.sh' \
+    ':!scripts/handover/chief-kit/test-headed-arm-leg-worker-env.sh' \
     ':!scripts/hooks/test-guard-leg-context-handoff.sh' \
-    ':!scripts/handover/console-kit/fixtures/*' \
+    ':!scripts/handover/chief-kit/fixtures/*' \
     ':!scripts/lib/chief-context.sh' ':!scripts/lib/override-env.sh' ':!scripts/lib/test-override-env.sh' \
     ':!scripts/himmelctl/lib/bypass-flags.json' 2>/dev/null | awk -F'\t' -v map="$V4A_MAP" '
     BEGIN { while ((getline l < map) > 0) { split(l, p, "\t"); nw[p[1]] = p[2] } }

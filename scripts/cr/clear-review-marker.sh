@@ -67,7 +67,7 @@
 #      the gate are exempt (reason=missing-preflight).
 #   4f. A lane=full marker whose diff changes a non-test guard or gate file
 #      (scripts/hooks/, scripts/ci/check-*, clear-cr-marker.sh,
-#      clear-review-marker.sh, scripts/testing/check-*, console-kit
+#      clear-review-marker.sh, scripts/testing/check-*, chief-kit
 #      ready-check.sh) needs a `blast` row stamped with this branch at any
 #      head: the blast-radius pass ran, or an `off` row with a reason (audited
 #      as blast=off on the CLEARED line). As in 4e, a branch with no `score`
@@ -1519,7 +1519,7 @@ if [ "$marker_lane" = "full" ]; then
         blast_verdict=$(LEDGER="$ledger" BRANCH="$branch" DIFF="$_blastdiff" MARKER_TS="$_marker_ts" BLAST_GATE_SINCE="2026-10-26T00:00:00Z" node -e '
           const fs = require("fs"), e = process.env;
           const scope = [/^scripts\/hooks\//, /^scripts\/ci\/check-/, /^scripts\/cr\/clear-(cr|review)-marker\.sh$/,
-                         /^scripts\/testing\/check-/, /^scripts\/handover\/console-kit\/ready-check\.sh$/];
+                         /^scripts\/testing\/check-/, /^scripts\/handover\/chief-kit\/ready-check\.sh$/];
           const inScope = (p) => scope.some((r) => r.test(p)) && !/(^|\/)test-[^\/]*$/.test(p) && !/\/fixtures\//.test(p);
           const touched = fs.readFileSync(e.DIFF, "utf8").split("\0").some(inScope);
           const rows = fs.existsSync(e.LEDGER)

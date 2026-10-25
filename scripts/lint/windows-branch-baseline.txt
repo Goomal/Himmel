@@ -11,8 +11,8 @@ scripts/graphify/graph-refresh.sh
 scripts/graphify/refresh-graph-map.sh
 scripts/graphify/test-refresh-graph-map.sh
 scripts/handover/arm-resume.sh
-scripts/handover/console-kit/headed-arm-worker.sh
-scripts/handover/console/chief.sh
+scripts/handover/chief-kit/headed-arm-worker.sh
+scripts/handover/chief/chief.sh
 scripts/handover/headed-arm.sh
 scripts/handover/hop.sh
 scripts/handover/konsole-macos.sh

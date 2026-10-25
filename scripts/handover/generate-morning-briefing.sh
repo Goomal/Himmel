@@ -605,12 +605,12 @@ EOF_WIP
     # one level so it nests under this section. Only where the cadence ships: the
     # shared state dir may hold another project's digest.
     failure_review="${HIMMEL_FAILURE_REVIEW_DIR:-$HOME/.himmel/state/failure-review}/failure-review-$today.md"
-    if [ -f "$SCRIPT_DIR/../eval/leg-digest/failure-review-cadence.sh" ]; then
+    if [ -f "$SCRIPT_DIR/../eval/worker-digest/failure-review-cadence.sh" ]; then
         printf '\n## 🧯 Failure review\n\n'
         if [ -f "$failure_review" ]; then
             sed -e '/^## Failure review$/d' -e 's/^### /#### /' "$failure_review" | sed '/./,$!d'
         else
-            printf '_No failure review digest for %s (scripts/eval/leg-digest/failure-review-cadence.sh)._\n' "$today"
+            printf '_No failure review digest for %s (scripts/eval/worker-digest/failure-review-cadence.sh)._\n' "$today"
         fi
     fi
 

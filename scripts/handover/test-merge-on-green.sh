@@ -3779,6 +3779,34 @@ else
     fail "jira: comment precedes transition (comment@${jira_comment_ln:-none} transition@${jira_transition_ln:-none})"
 fi
 
+# A status the merge wrote marks the console's FOCUS page dirty (focus-state
+# dirty=, plus focus-state.again); a failing mark changes neither the exit nor the result.
+HIMMEL_CONSOLE_DOC=/nonexistent/console.md STUB_JIRA_BUILD=1 STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" \
+    run_mog 0 "focus: a failing mark-dirty never fails the merge" -- --jira-transition
+assert_audit_has "focus: the transition is still recorded ok" "jira-transition=ok key=HIMMEL-374 status=Done"
+MOG_FOCUS_DOC="$MOG_SUITE_TMP/focus-console/console.md"
+mkdir -p "${MOG_FOCUS_DOC%/*}"; printf '# console\nfocus-version: v1.1.3\n' > "$MOG_FOCUS_DOC"
+printf 'status=ok\ngen=1\ndirty=\n' > "${MOG_FOCUS_DOC%/*}/focus-state"
+# The mark follows the fixVersion fold, so a rebuild it starts sees the folded version:
+# the stub CLI records whether the page was already dirty when the fold ran.
+# shellcheck disable=SC2016 # $JIRA_LOG, $* and $@ must reach the stub FILE unexpanded
+mog_focus_order_stub() {
+    mv "$1/bin/node" "$1/bin/node.real"
+    printf '#!/usr/bin/env bash\ncase "$*" in *" edit HIMMEL-374 --fix-version"*) grep -q "^dirty=." "%s" && echo "fold: dirty" >> "$JIRA_LOG" ;; esac\nexec "%s" "$@"\n' \
+        "${MOG_FOCUS_DOC%/*}/focus-state" "$1/bin/node.real" > "$1/bin/node"
+    chmod +x "$1/bin/node"
+}
+HIMMEL_CONSOLE_DOC="$MOG_FOCUS_DOC" MOG_ANCHOR_SETUP=mog_focus_order_stub STUB_JIRA_BUILD=1 STUB_JIRA_FIXVERSIONS='{"name":"v1.1.4"}' \
+    STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" run_mog 0 "focus: a merge that folds the fixVersion" -- --jira-transition
+if grep -q '^dirty=[0-9]' "${MOG_FOCUS_DOC%/*}/focus-state" && grep -q '^status=ok$' "${MOG_FOCUS_DOC%/*}/focus-state" \
+    && [ -s "${MOG_FOCUS_DOC%/*}/focus-state.again" ]; then pass
+else fail "focus: the transition marks the FOCUS page dirty ($(tr '\n' '|' < "${MOG_FOCUS_DOC%/*}/focus-state"))"; fi
+if grep -q 'index.js edit HIMMEL-374 --fix-version' "$LAST_JIRA_LOG" && ! grep -q '^fold: dirty$' "$LAST_JIRA_LOG"; then pass
+else fail "focus: the mark follows the fixVersion fold ($(grep -E 'fold: dirty|index\.js edit HIMMEL-374 ' "$LAST_JIRA_LOG" | tr '\n' '|'))"; fi
+STUB_JIRA_BUILD=1 STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" \
+    run_mog 0 "focus: a merge with no console doc" -- --jira-transition
+if [ -n "$(find "$LAST_TMP" -name 'focus-state*' 2>/dev/null)" ]; then fail "focus: with no console doc nothing is marked"; else pass; fi
+
 # A failing Jira transition must never fail the merge itself (best-effort),
 # even when opted in.
 STUB_JIRA_BUILD=1 STUB_JIRA_TRANSITION_FAIL=1 STUB_PR_TITLE="feat(jira): [HIMMEL-374] reconciler" \

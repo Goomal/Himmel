@@ -17,6 +17,26 @@
 #      this PR (go_trust_verdict, the check go.sh makes for a trust-reviewed GO).
 # Exit 0 recorded (or already there); 2 refused or unreadable.
 #
+#   dependabot-go.sh <pr> <head-sha> --check
+#
+# runs checks 1 and 2 only (no verdict, no row): exit 0 when the PR is a
+# dependency-only Dependabot PR at that head.
+#
+#   dependabot-go.sh --sweep
+#
+# lands every open Dependabot PR with no chief turn; tick.sh runs
+# it when DEPENDABOT_AUTOLAND=on. A PR is squash-merged at once with
+# --match-head-commit at its head, never left on auto-merge (that would also
+# merge a later, unjudged head), only when ALL hold, in this order:
+#   a. --check passes (the allowlist, before any judge spend);
+#   b. GitHub reports it CLEAN at that head and every required check `pass`;
+#   c. a judge call (DEPENDABOT_JUDGE_CALL, default scripts/api-lane/judge-call.sh:
+#      sonnet, 0.50 USD) records a signed GO at that head, under qid
+#      dbot-<pr>-<head12>; one call per head, a NO-GO or failed call included;
+#   d. the record path above appends the dependabot-go row and the row is there.
+# A PR already on auto-merge is left alone. Prints one line per PR, then
+# `dependabot-go sweep: merged=<n> skipped=<n>`; exit 2 only when the list is unreadable.
+#
 # ponytail: the row is unsigned like a judge-go row (the ledger is same-uid
 # writable, and the merge gate re-reads the PR author), upgrade: a go_msg_mac on
 # the row, as cr-disposition.sh signs its rows.
@@ -24,14 +44,23 @@
 # Platform guard (gitbash-only): POSIX bash 3.2+.
 set -u
 
-usage() { echo "usage: dependabot-go.sh <pr> <head-sha> --judge <qid>" >&2; exit 2; }
+usage() { echo "usage: dependabot-go.sh <pr> <head-sha> --judge <qid> | <pr> <head-sha> --check | --sweep" >&2; exit 2; }
 
-PR="${1:-}"; SHA="${2:-}"
-[ "$#" -eq 4 ] && [ "${3:-}" = --judge ] || usage
-QID="$4"
-case "$PR" in ''|0*|*[!0123456789]*) usage ;; esac
-case "$SHA" in *[!0123456789abcdef]*) usage ;; esac
-[ "${#SHA}" -eq 40 ] || usage
+MODE=record PR="" SHA="" QID=""
+if [ "$#" -eq 1 ] && [ "$1" = --sweep ]; then
+    MODE=sweep
+else
+    PR="${1:-}"; SHA="${2:-}"
+    if [ "$#" -eq 3 ] && [ "$3" = --check ]; then
+        MODE=check
+    else
+        [ "$#" -eq 4 ] && [ "${3:-}" = --judge ] || usage
+        QID="$4"
+    fi
+    case "$PR" in ''|0*|*[!0123456789]*) usage ;; esac
+    case "$SHA" in *[!0123456789abcdef]*) usage ;; esac
+    [ "${#SHA}" -eq 40 ] || usage
+fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ANCHOR="$(cd "$HERE/../.." && pwd)"
@@ -49,6 +78,82 @@ fi
 . "$ANCHOR/scripts/lib/git-clean.sh" 2>/dev/null && git_env_scrub
 common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=""  # swallow-ok: empty fails closed on the next line
 [ -n "$common" ] || { echo "dependabot-go: not in a git repo, so there is no CR ledger" >&2; exit 2; }
+
+# sweep_one <pr> <head> <auto-merge on: true|false> - merge when every guard holds; 0 = merged
+sweep_one() {
+    local pr="$1" sha="$2" qid q jout state buckets now row gate grc=0 judged="$common/dependabot-judged"
+    skip() { echo "dependabot-go sweep: #$pr skipped - $*"; }
+    case "$pr" in ''|0*|*[!0123456789]*) skip "not a PR number"; return 1 ;; esac
+    [ "$3" = false ] || { skip "auto-merge is already on"; return 1; }
+    bash "$0" "$pr" "$sha" --check || { skip "not a dependency-only Dependabot PR at $sha"; return 1; }
+    state=$("$GH" pr view "$pr" --json mergeStateStatus,headRefOid 2>/dev/null | jq -r '"\(.mergeStateStatus) \(.headRefOid)"' 2>/dev/null) || state=""  # swallow-ok: empty fails the equality below
+    [ "$state" = "CLEAN $sha" ] || { skip "GitHub reports '${state:-unreadable}', not CLEAN at $sha"; return 1; }
+    # gh exits 1 on a failed check and 8 on a pending one: only exit 0 with every bucket pass arms
+    buckets=$("$GH" pr checks "$pr" --required --json bucket --jq '.[].bucket' 2>/dev/null) || { skip "a required check is not pass"; return 1; }  # swallow-ok: a failed read refuses here, never a value
+    if [ -z "$buckets" ] || grep -qvx pass <<<"$buckets"; then
+        skip "a required check is not pass"; return 1
+    fi
+    qid="dbot-$pr-$(printf '%.12s' "$sha")"
+    if [ ! -d "$judged/$qid" ]; then
+        q=$(mktemp "${TMPDIR:-/tmp}/dependabot-judge.XXXXXX") || { skip "mktemp failed"; return 1; }
+        {
+            printf 'Dependabot PR #%s at head %s changes only dependency manifests and lockfiles (the allowlist was checked). Its full diff follows.\n' "$pr" "$sha"
+            printf 'Rule GO only if the diff is a plain version bump: changed versions, hashes, integrity and resolved URLs on the same registry. Rule NO-GO for a new or changed install script or lifecycle hook, a git, URL, file or tarball dependency, a new registry or index URL, a new package that is not a transitive of the bumped one, or anything you cannot account for.\n\n'
+            "$GH" pr diff "$pr" 2>/dev/null || echo "DIFF-UNREADABLE"
+        } > "$q"
+        # the diff is read from the PR, not the head: a head that moved since is not the head judged
+        now=$("$GH" pr view "$pr" --json headRefOid 2>/dev/null | jq -r '.headRefOid // empty' 2>/dev/null) || now=""  # swallow-ok: empty fails the equality below
+        [ "$now" = "$sha" ] || { rm -f "$q"; skip "the head moved to '${now:-unknown}' while its diff was read"; return 1; }
+        if grep -qx DIFF-UNREADABLE "$q" || [ "$(wc -c < "$q")" -gt 60000 ]; then
+            rm -f "$q"; skip "the diff is unreadable or too big for one judge question"; return 1
+        fi
+        # claimed before the call by one atomic mkdir, so sweeps sharing this ledger pay one judge
+        # spend per head; a call that records no verdict releases the claim once, so a lane that is
+        # down for one sweep does not park the head, and one that keeps failing is not paid every tick
+        { mkdir -p "$judged" && mkdir "$judged/$qid"; } 2>/dev/null || { rm -f "$q"; skip "the head is claimed by another sweep or the claim cannot be made"; return 1; }  # swallow-ok: a failed claim refuses here
+        if ! jout=$(bash "${DEPENDABOT_JUDGE_CALL:-$ANCHOR/scripts/api-lane/judge-call.sh}" --qid "$qid" --pr "$pr" --head "$sha" --question-file "$q" \
+            --model claude-sonnet-5-5 --max-budget-usd 0.50 --effort medium --timeout 600 --judge dbot-judge 2>&1); then
+            rm -f "$q"
+            if { mkdir "$judged/$qid.failed" && rmdir "$judged/$qid"; } 2>/dev/null; then  # swallow-ok: a held claim is the safe side
+                skip "the judge call recorded no verdict, released for one retry: ${jout##*$'\n'}"
+            else
+                skip "the judge call recorded no verdict on its retry too, so the head stays claimed: ${jout##*$'\n'}"
+            fi
+            return 1
+        fi
+        rm -f "$q"
+    fi
+    bash "$0" "$pr" "$sha" --judge "$qid" || { skip "no dependabot-go row (judge $qid)"; return 1; }
+    row=$(jq -cR --arg h "$sha" --argjson p "$pr" 'fromjson? | select(.kind == "dependabot-go" and .head == $h and .pr == $p and .status == "ok")' "$common/cr-critic-scores.jsonl" 2>/dev/null) || row=""  # swallow-ok: an unreadable ledger reads as no row and refuses below
+    [ -n "$row" ] || { skip "the dependabot-go row is not in the ledger"; return 1; }
+    # the CR merge gate every other merge passes: it reads the row above for the hard reviewers,
+    # and holds on an open CodeRabbit thread or outside-diff finding; unattended, only rc 0 merges
+    gate=$(cr_merge_gate "$pr") || grc=$?
+    [ "$grc" -eq 0 ] || { skip "the CR merge gate did not allow the merge (rc=$grc): ${gate%%$'\n'*}"; return 1; }
+    "$GH" pr merge "$pr" --squash --match-head-commit "$sha" >/dev/null 2>&1 || { skip "GitHub refused the merge"; return 1; }
+    echo "dependabot-go sweep: #$pr merged at $sha (judge:$qid)"
+}
+
+if [ "$MODE" = sweep ]; then
+    # shellcheck source=scripts/lib/review-merge-gate.sh
+    # shellcheck disable=SC1091
+    if ! . "$ANCHOR/scripts/lib/review-merge-gate.sh" 2>/dev/null || ! declare -F cr_merge_gate >/dev/null 2>&1; then
+        echo "dependabot-go sweep: cannot load scripts/lib/review-merge-gate.sh" >&2
+        exit 2
+    fi
+    list=$("$GH" pr list --author app/dependabot --state open --limit 100 --json number,headRefOid,autoMergeRequest \
+        --jq '.[] | "\(.number) \(.headRefOid) \(.autoMergeRequest != null)"' 2>/dev/null) || { echo "dependabot-go sweep: cannot list the open Dependabot PRs" >&2; exit 2; }
+    merged=0 skipped=0
+    while read -r n h a; do
+        [ -n "$n" ] || continue
+        # stdin is the PR list: a judge that reads stdin (claude -p does) would swallow the rest
+        if sweep_one "$n" "$h" "$a" 2>&1 </dev/null; then merged=$((merged + 1)); else skipped=$((skipped + 1)); fi
+    done <<EOF
+$list
+EOF
+    echo "dependabot-go sweep: merged=$merged skipped=$skipped"
+    exit 0
+fi
 
 pr_json=$("$GH" pr view "$PR" --json author,headRefName,headRefOid,state,changedFiles 2>/dev/null) || refuse "cannot read PR #$PR"  # swallow-ok: rc is checked, an unreadable PR refuses
 author=$(printf '%s' "$pr_json" | jq -r '.author.login // empty' 2>/dev/null) || author=""  # swallow-ok: empty fails the author check
@@ -74,6 +179,7 @@ $prev"
 if bad=$(printf '%s\n' "$names" | grep -Ev '(^|/)(package\.json|package-lock\.json|bun\.lock|requirements[A-Za-z0-9._-]*\.txt)$'); then
     refuse "PR #$PR changes a file that is not a dependency manifest or lockfile: $(printf '%s' "$bad" | head -n 1)"
 fi
+[ "$MODE" = record ] || { echo "dependabot-go: PR #$PR at $SHA is a dependency-only Dependabot PR"; exit 0; }
 
 ROOT=""
 # shellcheck source=scripts/lib/handover-path.sh

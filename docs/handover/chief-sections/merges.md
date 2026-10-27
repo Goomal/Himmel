@@ -55,6 +55,26 @@ reviewed merge, the worker sends `BLOCKED`; do not run the denied merge for it
 (that launders the denial) and do not loosen any rule. The fallback is the
 claudex path above, tracked as a follow-up.
 
+**A red main and the merge gate.** `merge-on-green.sh` exits 22 while the
+newest `CI` run on main is red, and a run that is being re-run counts as red
+until its new attempt completes. It prints `main-red: <class> (<suites>)` on
+every red it classifies. A red whose every failed suite hit the runner's cap
+timeout with assertions passing (`cap-only`), in suites the PR does not reach
+(`scripts/cr/impacted-suites.sh`), passes on its own: no FIX-GO. For the PR
+that fixes the red, with no `Fixes-main-red:` line, you still write a FIX-GO
+with `chief-kit/go.sh --fix-main-red <red-run-id> <pr> <head>` (beside the
+ordinary GO) whenever the gate prints another class: `assertion` (a suite
+failed an assertion), `cap-overlap` (a cap-timed-out suite is one the PR
+reaches), `cap-unverified` (the gate could not read the PR's reach) or
+`unclassified` (a red job that is not a shell-unit job, a shard that failed
+for more than its suite rows such as a honeytoken leak or a shard with no
+rows, a job that never ran or was cancelled so its log is empty, or a log or
+job list the gate could not parse). After a merge on the declared-fix or fix-GO path the script
+dispatches one `ci.yml` run on main and prints `MAIN-RECHECK dispatched
+run=<id>` (`run=unknown` when the new run is not listed yet; a failed dispatch
+is a WARN, the merge stands): read that run's `headSha` and `conclusion` before
+you lift a HOLD, and do not dispatch a second one.
+
 **Merge order for a chain (flag `chain_merge_plan`, default off).** Without the
 flag the queue is first READY, first GO. With `HIMMEL_FLAG_CHAIN_MERGE_PLAN=1` in
 your launching shell, plan the open PRs on every merge event:

@@ -263,6 +263,15 @@ probe reads the last cached value, else ?. The value (a failure too) is cached
 TICK_STALL_TTL_MIN minutes (default 5, 0 = off) in TICK_STALL_CACHE. chief-wait.sh wakes once
 per new conflict or no-ci token and keeps its saved set on ?.
 
+doctor=<id>[,<id>...] (HIMMEL-7849) is the WARN and FAIL check ids of `himmel-doctor.sh --json`,
+sorted. Absent when the doctor is clean, TICK_DOCTOR_TTL_MIN is 0 or the doctor script
+(TICK_DOCTOR_CMD, default $REPO/scripts/himmel-doctor.sh) is missing. The doctor is slow, so the
+ids are cached TICK_DOCTOR_TTL_MIN minutes (default 30) in TICK_DOCTOR_CACHE, a failed run too: it
+reads the last cached ids, else ?. A cold run outlasts the 120 s a tick gets, so it runs detached:
+a tick waits up to TICK_DOCTOR_WAIT_SEC (default 3) for it, else answers from the cache and the
+next tick folds the finished run in. chief-wait.sh wakes once per id new to its marker and keeps its
+saved set on ?.
+
 crfirst=#<pr>:<reason>:<age>[,...] is the non-fork PR heads whose heavy-CI `ci:go`
 label the reviewer gate has not released, with the hold reason, plus `#<pr>:manual-release` for
 a head labelled by hand. The tick calls scripts/lib/cr-first-release.sh once per unreleased head
@@ -2180,6 +2189,68 @@ if [ "$prs" != none ] && { [ -n "${TICK_STALL_PROBE:-}" ] || [ "$pr_repo" = "$RE
     fi
     case "$stall_val" in ""|*[!0-9a-z:,?-]*) ;; *) stall_tail=" stall=$stall_val" ;; esac
 fi
+# doctor=<id>[,<id>...]: the WARN and FAIL check ids of himmel-doctor --json, sorted.
+# ABSENT when the doctor is clean, TICK_DOCTOR_TTL_MIN is 0, or the doctor script is missing. The run
+# is slow (about 10 s warm), so the id list is cached TICK_DOCTOR_TTL_MIN minutes (default 30) in
+# TICK_DOCTOR_CACHE, a failure too: a failed run reads the last cached ids, else `?` (unknown,
+# never "clean"): the waiter keeps its saved set on `?`.
+doctor_tail=""
+doctor_cmd="${TICK_DOCTOR_CMD:-$REPO/scripts/himmel-doctor.sh}"
+doctor_cache="${TICK_DOCTOR_CACHE:-${TICK_STATE_DIR:-${HOME:-/tmp}/.himmel/state}/tick-doctor.cache}"
+case "${TICK_DOCTOR_TTL_MIN:-30}" in ""|*[!0-9]*) doctor_ttl=30 ;; *) doctor_ttl=$((10#${TICK_DOCTOR_TTL_MIN:-30})) ;; esac
+if [ "$doctor_ttl" -gt 0 ] && [ -f "$doctor_cmd" ] && command -v jq >/dev/null 2>&1; then
+    doctor_val="?"
+    # swallow-ok: an unreadable cache reads as unknown
+    [ -f "$doctor_cache" ] && doctor_val="$(cat "$doctor_cache" 2>/dev/null)"
+    doctor_fresh=""
+    # swallow-ok: an unreadable cache reads as stale and the doctor runs
+    [ -f "$doctor_cache" ] && [ -n "$(find "$doctor_cache" -mmin "-$doctor_ttl" 2>/dev/null)" ] && doctor_fresh=1
+    # The run is detached (a full cold run outlasts the 120 s the waiter gives a tick): it writes
+    # $doctor_cache.out, then .rc last. A tick folds a finished run into the cache and, when the cache
+    # is stale and no run is live, starts one and waits up to TICK_DOCTOR_WAIT_SEC for it.
+    # Two ticks share the cache, so a run is claimed by an atomic mkdir of $doctor_cache.run and a finished
+    # run by an atomic rename of its .rc: one tick starts it, one tick folds it in.
+    doctor_harvest() {
+        local doctor_claim="$doctor_cache.rc.$$"
+        mv "$doctor_cache.rc" "$doctor_claim" 2>/dev/null || return 0  # swallow-ok: no finished run, or another tick claimed it
+        doctor_rc="$(cat "$doctor_claim" 2>/dev/null)"  # swallow-ok: an unreadable rc reads as a failed run
+        rm -f "$doctor_claim"
+        # The doctor exits 1 when a FAIL row exists; that run still answered. Any other code, or no rows, did not.
+        # --json still prints a banner and a Summary line around the one-object-per-line rows: keep the object lines only.
+        doctor_rows="$(sed -n '/^{/p' "$doctor_cache.out" 2>/dev/null)"  # swallow-ok: a missing output reads as no rows
+        case "$doctor_rc" in
+            0|1) if [ -n "$doctor_rows" ] && doctor_ids="$(printf '%s\n' "$doctor_rows" | jq -r 'select(type == "object" and (.sev == "WARN" or .sev == "FAIL")) | .id' 2>/dev/null)"; then  # swallow-ok: unparsable rows keep the last cached value
+                     doctor_val="$(printf '%s\n' "$doctor_ids" | sed '/^$/d' | LC_ALL=C sort -u | paste -sd, -)"
+                 fi ;;
+        esac
+        # swallow-ok: a cache that cannot be written only costs the next tick a doctor run
+        { mkdir -p "${doctor_cache%/*}" && printf '%s' "$doctor_val" > "$doctor_cache.$$" && mv "$doctor_cache.$$" "$doctor_cache"; } 2>/dev/null || true
+        rm -f "$doctor_cache.out"
+        doctor_fresh=1
+    }
+    if [ -z "$doctor_fresh" ]; then
+        doctor_harvest
+    fi
+    if [ -z "$doctor_fresh" ]; then
+        mkdir -p "${doctor_cache%/*}" 2>/dev/null  # swallow-ok: an unwritable state dir leaves the value unknown
+        # A run directory older than 15 min is a lost run (the run itself is capped at 10 min): clear it.
+        [ -z "$(find "$doctor_cache.run" -maxdepth 0 -mmin +15 2>/dev/null)" ] || rmdir "$doctor_cache.run" 2>/dev/null  # swallow-ok: a run directory that cannot be cleared only keeps the old value
+        if mkdir "$doctor_cache.run" 2>/dev/null; then  # swallow-ok: a taken run directory means a run is live
+            rm -f "$doctor_cache.rc"
+            # gnu-ok: console kit is Linux-only (setsid, timeout -k)
+            # shellcheck disable=SC2016  # $1 and $2 expand in the inner shell, not here
+            setsid bash -c 'timeout -k 5 600 bash "$1" --json --no-color </dev/null >"$2.out" 2>/dev/null; echo $? >"$2.rc"; rmdir "$2.run"' _ "$doctor_cmd" "$doctor_cache" </dev/null >/dev/null 2>&1 &
+        fi
+        case "${TICK_DOCTOR_WAIT_SEC:-3}" in ""|*[!0-9]*) doctor_wait=3 ;; *) doctor_wait=$((10#${TICK_DOCTOR_WAIT_SEC:-3})) ;; esac
+        doctor_polls=0
+        while [ ! -f "$doctor_cache.rc" ] && [ -d "$doctor_cache.run" ] && [ "$doctor_polls" -lt $((doctor_wait * 5)) ]; do
+            sleep 0.2  # gnu-ok: fractional sleep on the Linux-only console kit
+            doctor_polls=$((doctor_polls + 1))
+        done
+        doctor_harvest
+    fi
+    case "$doctor_val" in ""|*[!0-9A-Za-z_,?.-]*) ;; *) doctor_tail=" doctor=$doctor_val" ;; esac
+fi
 # crfirst=#<pr>:<reason>:<age>[,...]: non-fork heads whose `ci:go` the
 # reviewer gate has not released yet, with the reason it holds, and `#<pr>:manual-release`
 # for a head labelled by hand. This is event point 5 of the CI release: the tick calls
@@ -2752,6 +2823,7 @@ if [ "$verbose" -eq 1 ]; then
     printf 'orphans-wip: %s\n' "$orphans_wip"
     printf 'pool-closed: %s\n' "$pool_closed"
     [ -z "$stall_tail" ] || printf 'stall: %s\n' "${stall_tail# stall=}"
+    [ -z "$doctor_tail" ] || printf 'doctor: %s\n' "${doctor_tail# doctor=}"
     [ -z "$crfirst_tail" ] || printf 'crfirst: %s\n' "${crfirst_tail# crfirst=}"
     [ -z "$station_tail" ] || printf 'station: %s\n' "${station_tail# station=}"
     [ -z "$alertfail_tail" ] || printf 'alert-fail: %s\n' "${alertfail_tail# alert-fail=}"
@@ -2824,7 +2896,7 @@ else
     compact_field wt-ceiling "$wtc_summary"
     compact_field focus "$focus_summary"
     compact_field sdrift "$sdrift_summary"
-    printf '%s\n' "$flakes_tail$ready_tail$parked_tail$closable_tail$deadwin_tail$busedge_tail$wakerstate_tail$stall_tail$crfirst_tail$station_tail$alertfail_tail$tmp_tail$spare_tail"
+    printf '%s\n' "$flakes_tail$ready_tail$parked_tail$closable_tail$deadwin_tail$busedge_tail$wakerstate_tail$stall_tail$doctor_tail$crfirst_tail$station_tail$alertfail_tail$tmp_tail$spare_tail"
     while IFS= read -r crfirst_line; do
         [ -n "$crfirst_line" ] || continue
         printf 'ACTION cr-first %s\n' "$crfirst_line"

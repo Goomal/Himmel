@@ -225,6 +225,8 @@ export REPO="$W/repo"
 export TICK_TMPDIR="$W"
 # no stall probe by default: a real pr-stall.sh against the stub gh would add stall=? to every line
 export TICK_STALL_PROBE="$W/no-stall-probe" TICK_STALL_CACHE="$W/stall.cache"
+# doctor= runs this command; the default is a missing one, never the real doctor.
+export TICK_DOCTOR_CMD="$W/no-doctor" TICK_DOCTOR_CACHE="$W/doctor.cache"
 # station= reads this state file; never the real ~/.himmel one.
 export TICK_STATION_STATE="$W/station-sync.state"
 # alert-fail= reads this marker; never the real ~/.himmel one.
@@ -2856,6 +2858,60 @@ rm -f "$st6049/count" "$st6049/cache"
 ST_COUNT="$st6049/count" TICK_STALL_PROBE="$st6049/probe" TICK_STALL_CACHE="$st6049/cache" TICK_STALL_TTL_MIN=60 bash "$SUT" >/dev/null 2>&1
 ST_COUNT="$st6049/count" TICK_STALL_PROBE="$st6049/probe" TICK_STALL_CACHE="$st6049/cache" TICK_STALL_TTL_MIN=60 bash "$SUT" >/dev/null 2>&1
 same 'two ticks inside the TTL run the probe once (HIMMEL-6049)' "$(wc -l < "$st6049/count" | tr -d ' ')" '1'
+
+# --- doctor=<id>[,<id>...]: the WARN/FAIL check ids of himmel-doctor --json,
+# read on a slow cache (TICK_DOCTOR_TTL_MIN, default 30, 0 = off). Absent when the doctor is
+# clean or the probe is missing; a failed probe reads the last cached value, else ?. The stub
+# stands in for the doctor: no suite ever runs the real one. RED control (pre-change tick.sh):
+# the line never carries doctor=.
+dr7849="$W/doctor7849"
+mkdir -p "$dr7849"
+# shellcheck disable=SC2016  # the stub's own $vars expand when it runs, not here
+printf '%s\n' '#!/bin/sh' 'echo run >> "$DR_COUNT"' '[ -n "$DR_SLEEP" ] && sleep "$DR_SLEEP"' 'if [ -n "$DR_FAIL" ]; then echo "doctor crashed" >&2; exit 3; fi' \
+    'echo "himmel-doctor — Linux — checkout: /x"; echo' \
+    'if [ -n "$DR_CLEAN" ]; then echo "{\"sev\":\"OK\",\"id\":\"C1\",\"msg\":\"fine\",\"remedy\":\"\"}"; echo; echo "Summary: 0 FAIL  0 WARN  0 INFO"; exit 0; fi' \
+    'echo "{\"sev\":\"OK\",\"id\":\"C1-guardrail\",\"msg\":\"fine\",\"remedy\":\"\"}"' \
+    'echo "{\"sev\":\"WARN\",\"id\":\"C77-bridge-stale\",\"msg\":\"stale\",\"remedy\":\"restart\"}"' \
+    'echo "{\"sev\":\"INFO\",\"id\":\"C45-qmd-daemon\",\"msg\":\"note\",\"remedy\":\"\"}"' \
+    'echo "{\"sev\":\"FAIL\",\"id\":\"C16-hooks\",\"msg\":\"missing\",\"remedy\":\"setup\"}"' \
+    'echo; echo "Summary: 1 FAIL  1 WARN  1 INFO"; exit 1' > "$dr7849/doctor"
+chmod +x "$dr7849/doctor"
+t7849() { rm -f "$dr7849/cache"; DR_COUNT="$dr7849/count" TICK_DOCTOR_CMD="$dr7849/doctor" TICK_DOCTOR_CACHE="$dr7849/cache" TICK_DOCTOR_TTL_MIN="${TTL7849:-30}" bash "$SUT" "$@" 2>/dev/null; }
+doctor_of() { sed -nE 's/.* doctor=([^ ]*).*/\1/p'; }
+same 'doctor= lists the WARN and FAIL ids, sorted, and leaves OK and INFO out (HIMMEL-7849)' "$(t7849 | doctor_of)" 'C16-hooks,C77-bridge-stale'
+contains 'verbose labels the doctor field (HIMMEL-7849)' "$(t7849 --verbose)" 'doctor: C16-hooks,C77-bridge-stale'
+same 'a clean doctor leaves doctor= off the line (HIMMEL-7849)' "$(DR_CLEAN=1 t7849 | doctor_of)" ''
+same 'a failing doctor with nothing cached reads doctor=? (HIMMEL-7849)' "$(DR_FAIL=1 t7849 | doctor_of)" '?'
+same 'TTL 0 turns the doctor probe off (HIMMEL-7849)' "$(TTL7849=0 t7849 | doctor_of)" ''
+rm -f "$dr7849/count" "$dr7849/cache"
+DR_COUNT="$dr7849/count" TICK_DOCTOR_CMD="$dr7849/doctor" TICK_DOCTOR_CACHE="$dr7849/cache" bash "$SUT" >/dev/null 2>&1
+same 'the second tick inside the TTL serves the cached ids (HIMMEL-7849)' "$(DR_FAIL=1 DR_COUNT="$dr7849/count" TICK_DOCTOR_CMD="$dr7849/doctor" TICK_DOCTOR_CACHE="$dr7849/cache" bash "$SUT" 2>/dev/null | doctor_of)" 'C16-hooks,C77-bridge-stale'
+same 'two ticks inside the TTL run the doctor once (HIMMEL-7849)' "$(wc -l < "$dr7849/count" | tr -d ' ')" '1'
+touch -d '3 hours ago' "$dr7849/cache"
+same 'a failing doctor after the TTL emits the last cached ids (HIMMEL-7849)' "$(DR_FAIL=1 DR_COUNT="$dr7849/count" TICK_DOCTOR_CMD="$dr7849/doctor" TICK_DOCTOR_CACHE="$dr7849/cache" bash "$SUT" 2>/dev/null | doctor_of)" 'C16-hooks,C77-bridge-stale'
+same 'a missing doctor script leaves doctor= off the line (HIMMEL-7849)' "$(TICK_DOCTOR_CMD="$dr7849/no-such-doctor" TICK_DOCTOR_CACHE="$dr7849/none" bash "$SUT" 2>/dev/null | doctor_of)" ''
+# A doctor slower than the tick's wait budget runs detached: the tick answers `?` at once, the
+# run finishes on its own, and the next tick folds the finished rows in without a second run.
+rm -f "$dr7849/count" "$dr7849/slow".*
+DR_SLEEP=3 DR_COUNT="$dr7849/count" TICK_DOCTOR_WAIT_SEC=1 TICK_DOCTOR_CMD="$dr7849/doctor" TICK_DOCTOR_CACHE="$dr7849/slow" bash "$SUT" > "$dr7849/slow-line" 2>/dev/null
+same 'a doctor slower than the wait budget reads doctor=? on that tick (HIMMEL-7849)' "$(doctor_of < "$dr7849/slow-line")" '?'
+sleep 5
+same 'the next tick folds in the finished slow run (HIMMEL-7849)' "$(DR_COUNT="$dr7849/count" TICK_DOCTOR_WAIT_SEC=1 TICK_DOCTOR_CMD="$dr7849/doctor" TICK_DOCTOR_CACHE="$dr7849/slow" bash "$SUT" 2>/dev/null | doctor_of)" 'C16-hooks,C77-bridge-stale'
+same 'the slow run was started once, not once per tick (HIMMEL-7849)' "$(wc -l < "$dr7849/count" | tr -d ' ')" '1'
+# The default wait is short (3 s): a 5 s doctor does not hold the tick, so the tick reads `?`.
+rm -f "$dr7849/dflt" "$dr7849/dflt".*
+DR_SLEEP=5 DR_COUNT="$dr7849/dflt-count" TICK_DOCTOR_CMD="$dr7849/doctor" TICK_DOCTOR_CACHE="$dr7849/dflt" bash "$SUT" > "$dr7849/dflt-line" 2>/dev/null
+same 'the default wait does not hold the tick for a 5 s doctor (HIMMEL-7849)' "$(doctor_of < "$dr7849/dflt-line")" '?'
+# Two ticks share one cache: a live run holds the run directory and a tick that finds it starts no
+# second run; a run directory older than 15 minutes is a lost run and the next tick starts a new one.
+rm -rf "$dr7849/count" "$dr7849/held".*
+mkdir "$dr7849/held.cache.run"
+DR_COUNT="$dr7849/count" TICK_DOCTOR_WAIT_SEC=1 TICK_DOCTOR_CMD="$dr7849/doctor" TICK_DOCTOR_CACHE="$dr7849/held.cache" bash "$SUT" > "$dr7849/held-line" 2>/dev/null
+same 'a live run directory keeps a second tick from starting a run (HIMMEL-7849)' "$(cat "$dr7849/count" 2>/dev/null | wc -l | tr -d ' ')" '0'
+same 'a tick waiting on a run another tick holds reads doctor=? (HIMMEL-7849)' "$(doctor_of < "$dr7849/held-line")" '?'
+touch -d '20 minutes ago' "$dr7849/held.cache.run"
+DR_COUNT="$dr7849/count" TICK_DOCTOR_CMD="$dr7849/doctor" TICK_DOCTOR_CACHE="$dr7849/held.cache" bash "$SUT" > "$dr7849/lost-line" 2>/dev/null
+same 'a run directory older than 15 minutes is a lost run and a new one starts (HIMMEL-7849)' "$(doctor_of < "$dr7849/lost-line")" 'C16-hooks,C77-bridge-stale'
 
 # --- parked=<worker>:<age>m: a worker on an unanswered permission prompt -----
 # Absent unless a worker's newest trust-ledger row is a permission prompt older than

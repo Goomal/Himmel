@@ -58,8 +58,9 @@ churn inside the vault:
   (the graph path must be the `--graph` flag — a positional directory is
   silently ignored and the query runs against the current directory's
   graph), or the graphify MCP tools when connected, always passing
-  `project_path: ~/.local/share/himmel/graphify/luna` as an absolute path
-  (without it they read the current directory's graph). The curated entry
+  `project_path` set to `~/.local/share/himmel/graphify/luna` with the `~`
+  expanded to your home directory (the tools do not expand it, and without
+  `project_path` they read the current directory's graph). The curated entry
   point is the graphify map note in `60-Maps/` (written by the graph
   refresh).
 - A **search miss is not evidence of absence** — structural connections

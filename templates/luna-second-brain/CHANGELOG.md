@@ -8,6 +8,15 @@ Version history for the luna-second-brain vault template (published as
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.104] — 2026-11-06
+
+### Fixed
+- `_CLAUDE.md` Retrieval Routing points the CLI and the MCP tools at the live
+  graph outside the vault. It sent sessions to `<vault-root>/graphify-out/`,
+  which no longer updates, so a vault that kept that folder read a stale graph
+  with no warning. To clear an old folder, run `luna-index-hygiene.sh
+  --offload-root`.
+
 ## [0.4.103] — 2026-11-03
 
 ### Changed

@@ -2475,11 +2475,11 @@ const { runProbe } = require('$probes_lib_w');
 const manifest = JSON.parse(require('fs').readFileSync('$manifest_w', 'utf8'));
 const item = manifest.items.find((i) => i.id === 'telegram-bridge');
 const ctx = { repoRoot: '$(winpath "$work/pj-target")', targetPath: '$(winpath "$work/pj-target")', scope: 'project',
-  env: Object.assign({}, process.env, { HOME: '$(winpath "$pj_home")' }) };
+  env: Object.assign({}, process.env, { TELEGRAM_ACCESS_PATH: '', TELEGRAM_ENV: '', HOME: '$(winpath "$pj_home")' }) };
 console.log(JSON.stringify(runProbe(item, ctx)));
 ")
 echo "$outPJaccess" | jq -e '.actual == "present"' >/dev/null \
-  || fail "telegram-access: project scope with bridge.envPath should read access.json beside the env file, not under the target: (got: $outPJaccess)"
+  || fail "telegram-access: project scope with bridge.envPath should read access.json from the home default where the bridge reads it, not under the target: (got: $outPJaccess)"
 echo "ok: telegram-access — project scope reads access.json from the home default"
 
 pj_acc_dir="$work/pj-acc-elsewhere"; mkdir -p "$pj_acc_dir" "$work/pj-home2/.claude/channels/telegram"
@@ -3046,7 +3046,7 @@ outDTcollision=$("$node_bin" -e "
 const { runProbe } = require('$probes_lib_w');
 const item = { id: 'telegram-distinct-tokens', probe: { type: 'distinct-tokens', envFileA: '.claude/channels/telegram/.env', tokenKeyA: 'TELEGRAM_BOT_TOKEN', envFileB: '.env', tokenKeyB: 'TELEGRAM_BOT_TOKEN' } };
 const ctx = { repoRoot: '$(winpath "$dt_collision")', targetPath: '$repo_root_w', scope: 'user',
-  env: Object.assign({}, process.env, { HOME: '$(winpath "$dt_collision")' }) };
+  env: Object.assign({}, process.env, { TELEGRAM_ACCESS_PATH: '', TELEGRAM_ENV: '', HOME: '$(winpath "$dt_collision")' }) };
 console.log(JSON.stringify(runProbe(item, ctx)));
 ")
 echo "$outDTcollision" | jq -e '.actual == "degraded"' >/dev/null \
@@ -3060,7 +3060,7 @@ outPJdt=$("$node_bin" -e "
 const { runProbe } = require('$probes_lib_w');
 const item = { id: 'telegram-distinct-tokens', probe: { type: 'distinct-tokens', envFileA: '.claude/channels/telegram/.env', tokenKeyA: 'TELEGRAM_BOT_TOKEN', envFileB: '.env', tokenKeyB: 'TELEGRAM_BOT_TOKEN' } };
 const ctx = { repoRoot: '$(winpath "$work/pj-target")', targetPath: '$(winpath "$work/pj-target")', scope: 'project',
-  env: Object.assign({}, process.env, { HOME: '$(winpath "$pj_home")', HIMMEL_LUNA_CONFIG_PATH: '$(winpath "$pj_cfg")' }) };
+  env: Object.assign({}, process.env, { TELEGRAM_ACCESS_PATH: '', TELEGRAM_ENV: '', HOME: '$(winpath "$pj_home")', HIMMEL_LUNA_CONFIG_PATH: '$(winpath "$pj_cfg")' }) };
 console.log(JSON.stringify(runProbe(item, ctx)));
 ")
 echo "$outPJdt" | jq -e '.actual == "present" and (has("cleanAbsence") | not) and (.detail | test("nothing to collide") | not)' >/dev/null \

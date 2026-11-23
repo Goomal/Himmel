@@ -810,8 +810,8 @@ echo "$outI3a" | jq -e '.items[0].desired == true and .items[0].actual == "prese
   || fail "case i3: distinct-tokens with no main bot token should read severity n/a with an opt-in hint, never green (got: $outI3a)"
 echo "$outI3a" | jq -e '.summary.na == 1 and .summary.green == 0' >/dev/null \
   || fail "case i3: the n/a distinct-tokens row must count toward summary.na, not summary.green (got: $(echo "$outI3a" | jq -c '.summary'))"
-mkdir -p "$caseI_dir/.claude/channels/telegram"
-printf 'TELEGRAM_BOT_TOKEN=AAA111\n' > "$caseI_dir/.claude/channels/telegram/.env"
+mkdir -p "$homeI/x"
+printf 'TELEGRAM_BOT_TOKEN=AAA111\n' > "$homeI/x/.env"
 outI3b=$(run_case_i "$cfgIdisabled" env MANIFEST_I_PATH="$(winpath "$manifestI3")")
 echo "$outI3b" | jq -e '.items[0].severity == "green"' >/dev/null \
   || fail "case i3: distinct-tokens with a main bot token should read green (got: $outI3b)"

@@ -1030,7 +1030,9 @@ function probeTelegramAccess(item, ctx) {
     return { actual: 'absent', detail: `missing/empty key '${item.probe.tokenKey}' in ${envFilePath}` };
   }
 
-  const accessFilePath = resolveConfigFile(item.probe.accessFile, ctx);
+  const accessFilePath = path.dirname(item.probe.accessFile) === path.dirname(item.probe.envFile)
+    ? path.join(path.dirname(envFilePath), path.basename(item.probe.accessFile))
+    : resolveConfigFile(item.probe.accessFile, ctx);
   let accessRaw;
   try {
     accessRaw = fs.readFileSync(accessFilePath, 'utf8');
@@ -2791,8 +2793,12 @@ function probePythonInterpreter(item, ctx) {
 // being unconfigured is fine (nothing to collide with), and distinct values
 // are fine; only an identical, non-empty pair is ever a problem.
 function probeDistinctTokens(item, ctx) {
-  const readToken = (fileField, tokenKey) => {
-    const filePath = resolveConfigFile(fileField, ctx);
+  const resolvedA = resolveBridgeEnvFilePath({ probe: { envFile: item.probe.envFileA } }, ctx);
+  if (resolvedA.configError) {
+    return { actual: 'degraded', detail: `cannot read luna config: ${resolvedA.configError.message}` };
+  }
+  const readToken = (fileField, tokenKey, resolvedPath) => {
+    const filePath = resolvedPath || resolveConfigFile(fileField, ctx);
     let raw;
     try {
       raw = fs.readFileSync(filePath, 'utf8');
@@ -2801,7 +2807,7 @@ function probeDistinctTokens(item, ctx) {
     }
     return { value: parseDotEnv(raw)[tokenKey], filePath };
   };
-  const a = readToken(item.probe.envFileA, item.probe.tokenKeyA);
+  const a = readToken(item.probe.envFileA, item.probe.tokenKeyA, resolvedA.path);
   const b = readToken(item.probe.envFileB, item.probe.tokenKeyB);
   if (nonEmpty(a.value) && nonEmpty(b.value) && a.value === b.value) {
     return {

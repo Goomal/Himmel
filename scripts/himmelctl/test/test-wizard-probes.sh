@@ -2463,6 +2463,25 @@ echo "$outTBschemaOk" | jq -e '.actual == "present"' >/dev/null \
   || fail "telegram-access schema: a schema-clean groups-only access.json should still read present: (got: $outTBschemaOk)"
 echo "ok: telegram-access — a schema-clean access.json is unaffected by the new formal check"
 
+pj_home="$work/pj-home"; mkdir -p "$pj_home/.claude/channels/telegram" "$work/pj-target"
+printf 'TELEGRAM_BOT_TOKEN=MAINFIXTURE111\n' > "$pj_home/.claude/channels/telegram/.env"
+printf '{"allowFrom":["123"]}\n' > "$pj_home/.claude/channels/telegram/access.json"
+pj_cfg="$work/pj-config.json"
+cat > "$pj_cfg" <<JSON
+{"version":1,"luna":{"vaultPath":"/x","cadence":{"enabled":false,"schedules":{"fetchHealth":{"time":"01:30"},"harvest":{"time":"02:00"},"synthesize":{"time":"03:00"},"health":{"time":"04:00","day":"SUN"}},"models":{"harvest":"sonnet","synthesize":"sonnet","health":"haiku"}},"phi":{"declared":false}},"bridge":{"enabled":true,"envPath":"$(winpath "$pj_home")/.claude/channels/telegram/.env","whisper":{"cli":null,"model":"m.bin"}}}
+JSON
+outPJaccess=$(HIMMEL_LUNA_CONFIG_PATH="$(winpath "$pj_cfg")" "$node_bin" -e "
+const { runProbe } = require('$probes_lib_w');
+const manifest = JSON.parse(require('fs').readFileSync('$manifest_w', 'utf8'));
+const item = manifest.items.find((i) => i.id === 'telegram-bridge');
+const ctx = { repoRoot: '$(winpath "$work/pj-target")', targetPath: '$(winpath "$work/pj-target")', scope: 'project',
+  env: Object.assign({}, process.env, { HOME: '$(winpath "$pj_home")' }) };
+console.log(JSON.stringify(runProbe(item, ctx)));
+")
+echo "$outPJaccess" | jq -e '.actual == "present"' >/dev/null \
+  || fail "telegram-access: project scope with bridge.envPath should read access.json beside the env file, not under the target: (got: $outPJaccess)"
+echo "ok: telegram-access — project scope reads access.json from the bridge env directory"
+
 # ── cmd:telegram_getme ─────────────────────────────────
 # no token at all -> absent, bun never even invoked.
 gm_no_token=$(telegramHome "gm-no-token")
@@ -3020,6 +3039,18 @@ echo "$outDTcollision" | jq -e '.actual == "degraded"' >/dev/null \
 echo "$outDTcollision" | jq -e '.detail | test("IDENTICAL")' >/dev/null \
   || fail "distinct-tokens: degraded detail should call out the collision (got: $outDTcollision)"
 echo "ok: distinct-tokens — two identical non-empty tokens (bridge vs jira-nudge relay) reads degraded"
+
+printf 'TELEGRAM_BOT_TOKEN=RELAYFIXTURE222\n' > "$work/pj-target/.env"
+outPJdt=$("$node_bin" -e "
+const { runProbe } = require('$probes_lib_w');
+const item = { id: 'telegram-distinct-tokens', probe: { type: 'distinct-tokens', envFileA: '.claude/channels/telegram/.env', tokenKeyA: 'TELEGRAM_BOT_TOKEN', envFileB: '.env', tokenKeyB: 'TELEGRAM_BOT_TOKEN' } };
+const ctx = { repoRoot: '$(winpath "$work/pj-target")', targetPath: '$(winpath "$work/pj-target")', scope: 'project',
+  env: Object.assign({}, process.env, { HOME: '$(winpath "$pj_home")', HIMMEL_LUNA_CONFIG_PATH: '$(winpath "$pj_cfg")' }) };
+console.log(JSON.stringify(runProbe(item, ctx)));
+")
+echo "$outPJdt" | jq -e '.actual == "present" and (has("cleanAbsence") | not) and (.detail | test("nothing to collide") | not)' >/dev/null \
+  || fail "distinct-tokens: project scope should read the main token via the bridge env path, not report clean absence: (got: $outPJdt)"
+echo "ok: distinct-tokens — project scope resolves the main token via the bridge env path"
 
 # ── luna-sources ───────────────────────────────────────
 # Stub `python`: dispatches on the LAST argv (the --probe SOURCE value),
@@ -6367,6 +6398,7 @@ ENV
 cat > "$pb_home/.claude/channels/telegram/access.json" <<'JSON'
 {"allowFrom": ["1"]}
 JSON
+cp "$pb_home/.claude/channels/telegram/access.json" "$pb_configured_env_dir/access.json"
 # NOTE: the manifest default envFile ('.claude/channels/telegram/.env' under
 # $pb_home) is deliberately left EMPTY/absent: only the CONFIGURED path
 # carries a token, so a pass here proves resolution actually followed the
@@ -6394,6 +6426,7 @@ pb_override_env_dir="$work/pb-override-env"; mkdir -p "$pb_override_env_dir"
 cat > "$pb_override_env_dir/override.env" <<'ENV'
 TELEGRAM_BOT_TOKEN=env-override-token-marker
 ENV
+cp "$pb_home/.claude/channels/telegram/access.json" "$pb_override_env_dir/access.json"
 outPB10=$(HIMMEL_LUNA_CONFIG_PATH="$(winpath "$pb_cfg_envpath")" "$node_bin" -e "
 const { runProbe } = require('$probes_lib_w');
 const manifest = JSON.parse(require('fs').readFileSync('$manifest_w', 'utf8'));
@@ -6417,6 +6450,7 @@ pb_tilde_env_dir="$pb_home/tilde-env-dir"; mkdir -p "$pb_tilde_env_dir"
 cat > "$pb_tilde_env_dir/tilde.env" <<'ENV'
 TELEGRAM_BOT_TOKEN=tilde-slash-override-token-marker
 ENV
+cp "$pb_home/.claude/channels/telegram/access.json" "$pb_tilde_env_dir/access.json"
 outPB10b=$(HIMMEL_LUNA_CONFIG_PATH="$(winpath "$pb_cfg_envpath")" "$node_bin" -e "
 const { runProbe } = require('$probes_lib_w');
 const manifest = JSON.parse(require('fs').readFileSync('$manifest_w', 'utf8'));

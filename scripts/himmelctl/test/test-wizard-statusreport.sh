@@ -749,6 +749,44 @@ echo "$outI2" | jq -e '.summary.degraded == 1 and .summary.na == 0' >/dev/null \
   || fail "case i2: a genuine bridge-persistence warn must count toward summary.degraded, not summary.na (got: $(echo "$outI2" | jq -c '.summary'))"
 echo "ok: case i2 — bridge-persistence with bridge.enabled=true and persistence missing stays severity degraded, never silently swallowed to n/a"
 
+manifestI4="$work/manifestI4.json"
+cat > "$manifestI4" <<'JSON'
+{
+  "schemaVersion": 2,
+  "harness": "claude",
+  "items": [
+    { "id": "distinct-tokens", "kind": "lane", "scopes": ["user"], "profiles": ["core", "all"], "deps": [], "probe": { "type": "file-exists", "path": "missing.txt" } },
+    { "id": "remote-peer", "kind": "lane", "scopes": ["user"], "profiles": ["core", "luna", "all"], "deps": [], "probe": { "type": "file-exists", "path": "missing.txt" } }
+  ]
+}
+JSON
+MANIFEST_I4_PATH="$(winpath "$manifestI4")"
+export MANIFEST_I4_PATH
+caseI4_dir="$work/caseI4-target"; mkdir -p "$caseI4_dir"
+homeI4="$work/homeI4"; mkdir -p "$homeI4"
+cacheI4="$work/cacheI4"; mkdir -p "$cacheI4"
+run_case_i4() {
+  ( cd "$caseI4_dir" && HOME="$homeI4" USERPROFILE="$(winpath "$homeI4")" HIMMELCTL_CACHE_DIR="$(winpath "$cacheI4")" HIMMEL_LUNA_CONFIG_PATH="$(winpath "$1")" "$node_bin" -e "
+const { statusReport } = require(process.env.STATUS_REPORT_LIB);
+const manifest = JSON.parse(require('fs').readFileSync(process.env.MANIFEST_I4_PATH, 'utf8'));
+const answers = {
+  role: 'adopter', tier: 'standard', scope: 'project',
+  vault: { mode: 'default-template', path: '' },
+  handover: { mode: 'none', path: '' },
+  pluginSet: 'lean', lanes: [], alwaysOn: false,
+};
+const report = statusReport({ manifest, scope: 'project', targetPath: process.cwd(), answers });
+console.log(JSON.stringify(report));
+" )
+}
+outI4on=$(run_case_i4 "$cfgIenabled")
+echo "$outI4on" | jq -e '[.items[] | .desired] == [true, true]' >/dev/null \
+  || fail "case i4: with bridge.enabled=true, distinct-tokens and remote-peer must be desired on a project-scope target (got: $outI4on)"
+outI4off=$(run_case_i4 "$cfgIdisabled")
+echo "$outI4off" | jq -e '[.items[] | .desired] == [false, false]' >/dev/null \
+  || fail "case i4: with bridge.enabled=false, distinct-tokens and remote-peer stay not enabled on a project-scope target (got: $outI4off)"
+echo "ok: case i4 — bridge.enabled makes distinct-tokens and remote-peer desired on a project-scope target"
+
 # ── case i3: distinct-tokens reads n/a while no main bot token exists (nothing to compare), green once one does ──
 manifestI3="$work/manifestI3.json"
 cat > "$manifestI3" <<'JSON'

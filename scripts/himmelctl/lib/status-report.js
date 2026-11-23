@@ -169,15 +169,16 @@ function configDesiredOverride(itemId, configDoc) {
   // "additive OR" bridge-health already gets, so the two never disagree on
   // whether the bridge subsystem is opted into.
   if (itemId === 'bridge-persistence') return Boolean(configDoc.bridge && configDoc.bridge.enabled);
+  if (itemId === 'distinct-tokens' || itemId === 'remote-peer') return Boolean(configDoc.bridge && configDoc.bridge.enabled);
   return false;
 }
 
-// The three items configDesiredOverride() names above, the ONLY items whose
+// The items configDesiredOverride() names above, the ONLY items whose
 // desired-state this module derives from ~/.himmel/config.json. A malformed
 // config makes desired-state for ALL of them fundamentally unknowable (see
-// statusReport()'s configLoadError handling below), so all three are named
+// statusReport()'s configLoadError handling below), so all of them are named
 // here once rather than duplicating the id list.
-const CONFIG_OVERRIDE_ITEM_IDS = new Set(['cadence-armed', 'bridge-health', 'bridge-persistence']);
+const CONFIG_OVERRIDE_ITEM_IDS = new Set(['cadence-armed', 'bridge-health', 'bridge-persistence', 'distinct-tokens', 'remote-peer']);
 
 function statusReport({ manifest, scope, targetPath, answers, itemIds, state: passedState }) {
   let items = manifest.items;

@@ -3613,7 +3613,7 @@ function pollerLineIsThisCheckout(line, thisCheckoutAnchor) {
 // Prefers `systemctl --user show telegram-bridge.service` (MainPID +
 // ActiveState + LoadState) when systemd is present and knows the unit;
 // otherwise (no systemctl on PATH, or LoadState=not-found: genuinely no
-// unit registered) falls back to `pgrep -f <resolved poller path>`, per the
+// unit registered) falls back to `pgrep -f poller.ts` (POLLER_SWEEP_PATTERN), per the
 // ticket's explicit adopters-running-the-bridge-by-hand case (e).
 //
 // Child enumeration: `/proc/<pid>/task/*/children` on Linux (walking every
@@ -3931,10 +3931,9 @@ function probeBridgePollerCountPosix(ctx) {
         // tree-scoped count by construction. Sweep system-wide via
         // pgrep -f (same anchor verification as the no-unit fallback
         // below) and union by verified pid, mirroring the Windows CIM
-        // branch's system-wide scope. Matched on POLLER_SWEEP_PATTERN, NOT
-        // the resolved pollerPath used by the no-unit fallback below, see
-        // that constant's comment for why the sweep needs the broader,
-        // unanchored pattern.
+        // branch's system-wide scope. Matched on POLLER_SWEEP_PATTERN, as
+        // the no-unit fallback below is, see that constant's comment for
+        // why the sweep needs the broader, unanchored pattern.
         if (pollerPath) {
           const sweep = posixVerifiedPgrepMatches(POLLER_SWEEP_PATTERN, procRoot, env, thisCheckoutAnchor, ctx.repoRoot);
           if (sweep.error) {
@@ -3965,7 +3964,7 @@ function probeBridgePollerCountPosix(ctx) {
   if (!pollerPath) {
     return { actual: 'degraded', detail: 'poller-count check needs ctx.repoRoot to anchor pgrep -f, none provided' };
   }
-  const fallback = posixVerifiedPgrepMatches(pollerPath, procRoot, env, thisCheckoutAnchor, ctx.repoRoot);
+  const fallback = posixVerifiedPgrepMatches(POLLER_SWEEP_PATTERN, procRoot, env, thisCheckoutAnchor, ctx.repoRoot);
   if (fallback.error) {
     return { actual: 'degraded', detail: `pgrep poller-count query failed: ${fallback.error.message}` };
   }

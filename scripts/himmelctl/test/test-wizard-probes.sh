@@ -5270,7 +5270,7 @@ echo "ok: bridge-health — a platform with no poller-count implementation at al
 # systemd knows the unit, walking MainPID's children via a fixture
 # `/proc`-shaped tree (ctx.procRoot, a test-only seam: a real hermetic test
 # cannot fabricate genuine PIDs); LoadState=not-found (systemd genuinely
-# doesn't know this unit) falls back to `pgrep -f <resolved poller path>`.
+# doesn't know this unit) falls back to `pgrep -f poller.ts`.
 # Same stub-log SKIP-gate convention as the bridge-persistence Linux block
 # above (bp_stub_log_has). A real Linux/macOS host runs every assertion for
 # real; a host where an extensionless bash-shebang stub can't spawn SKIPs
@@ -5605,22 +5605,23 @@ else
   echo "SKIP: bridge-health (Linux) case (h): no evidence in the stub log that systemctl actually spawned on this host"
 fi
 
-# ── case (i): pgrep -f fallback ERE-escapes metacharacters in the resolved
-# poller path before use -- an unescaped repoRoot
-# containing '.', '+', '(' would otherwise be interpreted as regex syntax by
-# pgrep -f rather than literal path characters ──────────────────────────────
+# ── case (i): the no-unit pgrep -f fallback matches on the escaped basename
+# 'poller\.ts', never the resolved poller path: supervisor.ts spawns
+# `bun poller.ts` with no path in its argv, so a path pattern matches nothing
+# on a host with no systemd unit (macOS) ────────────────────────────────────
 erepath_dir="$work/erepath+dot.paren(1)"
-poller_path_i="$erepath_dir/scripts/telegram/poller.ts"
-escaped_poller_path_i="$(escape_ere "$poller_path_i")"
 rm -f "$bh_posix_log"; : > "$bh_posix_state/no-unit"
 BH_PGREP_N=0 run_bh_posix "$erepath_dir" >/dev/null
 if bh_posix_log_has "pgrep -f"; then
-  bh_posix_log_has "pgrep -f $escaped_poller_path_i" \
-    || fail "bridge-health (Linux): pgrep -f fallback must ERE-escape metacharacters in the resolved poller path (expected escaped '$escaped_poller_path_i' in log: $(cat "$bh_posix_log" 2>/dev/null))"
-  echo "ok: bridge-health (Linux) — pgrep -f fallback ERE-escapes metacharacters ('.', '+', '(', ')') in the resolved poller path"
+  bh_posix_log_has 'pgrep -f poller\.ts' \
+    || fail "bridge-health (Linux): the no-unit pgrep -f fallback must match on the escaped basename 'poller\.ts' (log: $(cat "$bh_posix_log" 2>/dev/null))"
+  bh_posix_log_has "pgrep -f $(escape_ere "$erepath_dir")" \
+    && fail "bridge-health (Linux): the no-unit pgrep -f fallback must not match on the resolved poller path (log: $(cat "$bh_posix_log" 2>/dev/null))"
+  echo "ok: bridge-health (Linux) — the no-unit pgrep -f fallback matches on the escaped basename, not the resolved path"
 else
   echo "SKIP: bridge-health (Linux) case (i): no evidence in the stub log that pgrep actually spawned on this host"
 fi
+rm -f "$bh_posix_state/no-unit"
 
 # ── case (j): pgrep -f fallback verifies EACH matched pid's cmdline through
 # the existing checkout-anchor helper instead of trusting pgrep's raw match
@@ -5920,6 +5921,9 @@ cat > "$bh_darwin_stub/pgrep" <<'STUB'
 echo "pgrep $*" >> "$BH_STUB_LOG"
 n="${BH_PGREP_N:-0}"
 if [ "$n" -le 0 ]; then exit 1; fi
+# Like a real pgrep -f, match the pattern against the cmdline the ps stub
+# reports: supervisor.ts spawns `bun poller.ts` with no path in its argv.
+if [ "$1" = -f ] && ! [[ "bun poller.ts" =~ $2 ]]; then exit 1; fi
 i=1
 while [ "$i" -le "$n" ]; do echo "$((9200 + i))"; i=$((i + 1)); done
 exit 0

@@ -2480,7 +2480,22 @@ console.log(JSON.stringify(runProbe(item, ctx)));
 ")
 echo "$outPJaccess" | jq -e '.actual == "present"' >/dev/null \
   || fail "telegram-access: project scope with bridge.envPath should read access.json beside the env file, not under the target: (got: $outPJaccess)"
-echo "ok: telegram-access — project scope reads access.json from the bridge env directory"
+echo "ok: telegram-access — project scope reads access.json from the home default"
+
+pj_acc_dir="$work/pj-acc-elsewhere"; mkdir -p "$pj_acc_dir" "$work/pj-home2/.claude/channels/telegram"
+printf 'TELEGRAM_BOT_TOKEN=MAINFIXTURE111\n' > "$work/pj-home2/.claude/channels/telegram/.env"
+printf '{"allowFrom":["123"]}\n' > "$pj_acc_dir/access.json"
+outPJacc=$(HIMMEL_LUNA_CONFIG_PATH="$(winpath "$work/pj-nonexistent.json")" "$node_bin" -e "
+const { runProbe } = require('$probes_lib_w');
+const manifest = JSON.parse(require('fs').readFileSync('$manifest_w', 'utf8'));
+const item = manifest.items.find((i) => i.id === 'telegram-bridge');
+const ctx = { repoRoot: '$(winpath "$work/pj-target")', targetPath: '$(winpath "$work/pj-target")', scope: 'project',
+  env: Object.assign({}, process.env, { HOME: '$(winpath "$work/pj-home2")', TELEGRAM_ENV: '$(winpath "$work/pj-home2/.claude/channels/telegram/.env")', TELEGRAM_ACCESS_PATH: '$(winpath "$pj_acc_dir/access.json")' }) };
+console.log(JSON.stringify(runProbe(item, ctx)));
+")
+echo "$outPJacc" | jq -e '.actual == "present"' >/dev/null \
+  || fail "telegram-access: TELEGRAM_ACCESS_PATH should be honored like the bridge does: (got: $outPJacc)"
+echo "ok: telegram-access — TELEGRAM_ACCESS_PATH overrides the default access.json location"
 
 # ── cmd:telegram_getme ─────────────────────────────────
 # no token at all -> absent, bun never even invoked.
@@ -5262,6 +5277,8 @@ ENV
 cat > "$bh_dir/.claude/channels/telegram/access.json" <<'JSON'
 {"allowFrom": ["111"]}
 JSON
+mkdir -p "$work/home/.claude/channels/telegram"
+cp "$bh_dir/.claude/channels/telegram/access.json" "$work/home/.claude/channels/telegram/access.json"
 
 bh_stub="$work/bh-stub"; mkdir -p "$bh_stub"
 cat > "$bh_stub/bun" <<'STUB'
@@ -6398,7 +6415,6 @@ ENV
 cat > "$pb_home/.claude/channels/telegram/access.json" <<'JSON'
 {"allowFrom": ["1"]}
 JSON
-cp "$pb_home/.claude/channels/telegram/access.json" "$pb_configured_env_dir/access.json"
 # NOTE: the manifest default envFile ('.claude/channels/telegram/.env' under
 # $pb_home) is deliberately left EMPTY/absent: only the CONFIGURED path
 # carries a token, so a pass here proves resolution actually followed the
@@ -6426,7 +6442,6 @@ pb_override_env_dir="$work/pb-override-env"; mkdir -p "$pb_override_env_dir"
 cat > "$pb_override_env_dir/override.env" <<'ENV'
 TELEGRAM_BOT_TOKEN=env-override-token-marker
 ENV
-cp "$pb_home/.claude/channels/telegram/access.json" "$pb_override_env_dir/access.json"
 outPB10=$(HIMMEL_LUNA_CONFIG_PATH="$(winpath "$pb_cfg_envpath")" "$node_bin" -e "
 const { runProbe } = require('$probes_lib_w');
 const manifest = JSON.parse(require('fs').readFileSync('$manifest_w', 'utf8'));
@@ -6450,7 +6465,6 @@ pb_tilde_env_dir="$pb_home/tilde-env-dir"; mkdir -p "$pb_tilde_env_dir"
 cat > "$pb_tilde_env_dir/tilde.env" <<'ENV'
 TELEGRAM_BOT_TOKEN=tilde-slash-override-token-marker
 ENV
-cp "$pb_home/.claude/channels/telegram/access.json" "$pb_tilde_env_dir/access.json"
 outPB10b=$(HIMMEL_LUNA_CONFIG_PATH="$(winpath "$pb_cfg_envpath")" "$node_bin" -e "
 const { runProbe } = require('$probes_lib_w');
 const manifest = JSON.parse(require('fs').readFileSync('$manifest_w', 'utf8'));

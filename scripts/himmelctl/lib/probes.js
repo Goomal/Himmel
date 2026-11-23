@@ -1030,9 +1030,10 @@ function probeTelegramAccess(item, ctx) {
     return { actual: 'absent', detail: `missing/empty key '${item.probe.tokenKey}' in ${envFilePath}` };
   }
 
-  const accessFilePath = path.dirname(item.probe.accessFile) === path.dirname(item.probe.envFile)
-    ? path.join(path.dirname(envFilePath), path.basename(item.probe.accessFile))
-    : resolveConfigFile(item.probe.accessFile, ctx);
+  const accessEnv = ctx.env || process.env;
+  const accessFilePath = nonEmpty(accessEnv.TELEGRAM_ACCESS_PATH)
+    ? expandHomeForCtx(accessEnv.TELEGRAM_ACCESS_PATH, ctx)
+    : path.join(accessEnv.HOME || os.homedir(), item.probe.accessFile);
   let accessRaw;
   try {
     accessRaw = fs.readFileSync(accessFilePath, 'utf8');
@@ -3968,7 +3969,7 @@ function probeBridgePollerCountPosix(ctx) {
     };
   }
   if (!pollerPath) {
-    return { actual: 'degraded', detail: 'poller-count check needs ctx.repoRoot to anchor pgrep -f, none provided' };
+    return { actual: 'degraded', detail: 'poller-count check needs ctx.repoRoot to verify pgrep -f matches against this checkout, none provided' };
   }
   const fallback = posixVerifiedPgrepMatches(POLLER_SWEEP_PATTERN, procRoot, env, thisCheckoutAnchor, ctx.repoRoot);
   if (fallback.error) {
